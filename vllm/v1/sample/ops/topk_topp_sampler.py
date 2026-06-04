@@ -12,6 +12,11 @@ from vllm.platforms import CpuArchEnum, current_platform
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import HAS_TRITON
 
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+except Exception:
+    get_gfx_runtime = None
+
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import (
         _topk_topp,
@@ -247,6 +252,7 @@ class TopKTopPSampler(nn.Module):
             logprobs_mode not in PROCESSED_LOGPROBS_MODES
             and rocm_aiter_ops.is_enabled()
             and not _skip_aiter_sampler_on_gfx1250()  # TODO (JPVILLAM): Enable
+            and not (get_gfx_runtime is not None and get_gfx_runtime() == "gfx90a")
         ):
             self.aiter_ops = None
             self._aiter_ops_import_failed = False

@@ -7,6 +7,7 @@ import torch
 import vllm._custom_ops as ops
 import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.platforms.rocm import on_gfx90a
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.config import (
@@ -64,7 +65,7 @@ def vllm_topk_sigmoid(
 def dispatch_topk_softmax_func(
     use_rocm_aiter: bool = False,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
-    if use_rocm_aiter:
+    if use_rocm_aiter and not on_gfx90a():
         return rocm_aiter_ops.topk_softmax
     return vllm_topk_softmax
 
@@ -72,7 +73,7 @@ def dispatch_topk_softmax_func(
 def dispatch_topk_sigmoid_func(
     use_rocm_aiter: bool = False,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
-    if use_rocm_aiter:
+    if use_rocm_aiter and not on_gfx90a():
         return rocm_aiter_ops.topk_sigmoid
     return vllm_topk_sigmoid
 

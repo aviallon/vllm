@@ -216,9 +216,9 @@ def is_aiter_found_and_supported() -> bool:
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import get_cdna_version
+        from vllm.platforms.rocm import on_gfx9
 
-        return get_cdna_version() > 2
+        return on_gfx9()
     return False
 
 
@@ -2476,7 +2476,13 @@ class rocm_aiter_ops:
         used by GatedDeltaNetAttention's decode fast-path.  They may be absent
         in older aiter builds.
         """
-        return cls._AITER_ENABLED and cls._gdn_triton_kernels_importable()
+        from vllm.platforms.rocm import on_gfx90a
+
+        return (
+            cls._AITER_ENABLED
+            and not on_gfx90a()
+            and cls._gdn_triton_kernels_importable()
+        )
 
     @classmethod
     def is_rdna_gdn_triton_kernels_available(cls) -> bool:
