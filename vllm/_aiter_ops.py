@@ -151,6 +151,66 @@ def _rocm_aiter_fused_moe_impl(
     activation = ActivationType(activation_method)
     quant_type = QuantType(quant_method)
 
+    from vllm.platforms.rocm import on_gfx90a
+
+    if (
+        on_gfx90a()
+        and quant_type == QuantType.No
+        and activation == ActivationType.Silu
+        and expert_mask is None
+        and not doweight_stage1
+        and w1_scale is None
+        and w2_scale is None
+        and a1_scale is None
+        and a2_scale is None
+        and num_local_tokens is None
+        and bias1 is None
+        and bias2 is None
+    ):
+        from aiter.ops.triton.moe.moe_op_e2e import e2e_moe
+        from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        block_size_m = 64
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids.to(torch.int32), block_size_m, w1.shape[0]
+        )
+        top_k = topk_ids.shape[1]
+        out_dtype = hidden_states.dtype if output_dtype is None else output_dtype
+        per_route_output = torch.zeros(
+            (hidden_states.shape[0], top_k, hidden_states.shape[1]),
+            dtype=out_dtype,
+            device=hidden_states.device,
+        )
+        config = {
+            "BLOCK_SIZE_M": block_size_m,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 64,
+            "GROUP_SIZE_M": 2,
+        }
+        return e2e_moe(
+            hidden_states,
+            w1,
+            w2,
+            None,
+            per_route_output,
+            None,
+            None,
+            None,
+            topk_weight.to(torch.float32),
+            sorted_token_ids,
+            topk_ids.to(torch.int32),
+            expert_ids,
+            num_tokens_post_padded,
+            True,
+            top_k,
+            False,
+            False,
+            config,
+        ).sum(dim=1).to(out_dtype)
+
     return fused_moe(
         hidden_states,
         w1,

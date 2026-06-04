@@ -302,7 +302,12 @@ def convert_to_unquantized_kernel_format(
     w2_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if unquantized_backend == UnquantizedMoeBackend.AITER:
-        w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
+        from vllm.platforms.rocm import on_gfx90a
+
+        if not on_gfx90a():
+            w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(
+                w13_weight, w2_weight
+            )
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
         if layer.moe_config.is_act_and_mul:
