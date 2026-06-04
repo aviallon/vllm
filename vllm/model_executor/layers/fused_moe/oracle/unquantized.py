@@ -456,9 +456,14 @@ def convert_to_unquantized_kernel_format(
 
     if unquantized_backend == UnquantizedMoeBackend.AITER:
         _zero_intermediate_padding(moe_config, w13_weight, w2_weight)
-        w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
-        w13_weight.is_shuffled = True
-        w2_weight.is_shuffled = True
+        from vllm.platforms.rocm import on_gfx90a
+
+        if not on_gfx90a():
+            w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(
+                w13_weight, w2_weight
+            )
+            w13_weight.is_shuffled = True
+            w2_weight.is_shuffled = True
         return w13_weight, w2_weight
 
     elif unquantized_backend == UnquantizedMoeBackend.FLASHINFER_CUTLASS:
