@@ -13,6 +13,11 @@ from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
 
+try:
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+except Exception:
+    get_gfx_runtime = None
+
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
 
@@ -90,6 +95,7 @@ class TopKTopPSampler(nn.Module):
         elif (
             logprobs_mode not in ("processed_logits", "processed_logprobs")
             and rocm_aiter_ops.is_enabled()
+            and not (get_gfx_runtime is not None and get_gfx_runtime() == "gfx90a")
         ):
             try:
                 import aiter.ops.sampling  # noqa: F401

@@ -1018,6 +1018,8 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
         if (
+            GDN_AITER_TRITON_AVAILABLE
+            and
             attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0

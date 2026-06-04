@@ -735,6 +735,12 @@ class TritonAttentionImpl(AttentionImpl):
     def fused_rope_kvcache_supported(self):
         if self._is_per_token_head_quant:
             return False
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+            if get_gfx_runtime() == "gfx90a":
+                return False
+        except Exception:
+            pass
         return rocm_aiter_ops.is_enabled()
 
     def do_rope_and_kv_cache_update(

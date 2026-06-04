@@ -14,6 +14,7 @@ from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
     dispatch_topk_softmax_func,
 )
+from vllm.platforms.rocm import on_gfx90a
 
 
 class AiterSharedRoutedFusedMoERouter(BaseRouter):
@@ -85,7 +86,9 @@ class AiterSharedRoutedFusedMoERouter(BaseRouter):
             M, topk, dtype=torch.int32, device=hidden_states.device
         )
 
-        if rocm_aiter_ops.fuse_sigmoid_in_kernel(aiter_topK_meta_data):
+        if (not on_gfx90a()) and rocm_aiter_ops.fuse_sigmoid_in_kernel(
+            aiter_topK_meta_data
+        ):
             total_topk_weights, total_topk_ids = aiter_topK_meta_data  # type: ignore[misc]
             total_topk_weights_slice = total_topk_weights[:M]
             topk_ids_slice = total_topk_ids[:M, :topk]

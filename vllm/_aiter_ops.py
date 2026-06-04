@@ -80,9 +80,9 @@ def is_aiter_found_and_supported() -> bool:
     VLLM_ROCM_USE_AITER=0, while preventing unwanted JIT warnings for auto-discovery.
     """
     if current_platform.is_rocm() and IS_AITER_FOUND:
-        from vllm.platforms.rocm import on_mi3xx
+        from vllm.platforms.rocm import on_gfx9
 
-        return on_mi3xx()
+        return on_gfx9()
     return False
 
 
@@ -1476,6 +1476,10 @@ class rocm_aiter_ops:
         in older aiter builds.
         """
         if not cls._AITER_ENABLED:
+            return False
+        from vllm.platforms.rocm import on_gfx90a
+
+        if on_gfx90a():
             return False
         try:
             import aiter.ops.triton.causal_conv1d_update_single_token  # noqa: F401
