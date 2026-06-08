@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_MOE: bool = True
+    VLLM_ROCM_USE_AITER_NATIVE_MOE: bool = False
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
@@ -1014,6 +1015,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MOE": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MOE", "True").lower() in ("true", "1")
+    ),
+    # Whether to use native aiter fused_moe instead of vLLM's gfx90a Triton E2E
+    # fast path for unquantized SiLU MoE.
+    # By default is disabled.
+    "VLLM_ROCM_USE_AITER_NATIVE_MOE": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_NATIVE_MOE", "False").lower()
+        in ("true", "1")
     ),
     # use aiter rms norm op if aiter ops are enabled.
     "VLLM_ROCM_USE_AITER_RMSNORM": lambda: (

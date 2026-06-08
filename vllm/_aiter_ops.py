@@ -23,6 +23,55 @@ try:
 except ImportError:
     pd = PlaceholderModule("pandas")
 
+
+def _gfx90a_aiter_e2e_moe_config(num_tokens: int) -> dict[str, int]:
+    """Return tuned Triton E2E MoE config for gfx90a BF16 unquantized MoE.
+
+    These configs are empirically selected for Qwen3.6-35B-A3B-like shapes
+    (hidden=2048, intermediate=512, experts=256, topk=8) on MI210/gfx90a.
+    Keep the table small and conservative; unsupported shapes still run with
+    the same kernel semantics, only with a less specialized tile choice.
+    """
+    if num_tokens <= 1:
+        return {
+            "BLOCK_SIZE_M": 4,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 64,
+            "GROUP_SIZE_M": 1,
+        }
+    if num_tokens <= 4:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 128,
+            "GROUP_SIZE_M": 1,
+        }
+    if num_tokens <= 16:
+        return {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 128,
+            "GROUP_SIZE_M": 1,
+        }
+    if num_tokens <= 128:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_K1": 64,
+            "BLOCK_SIZE_K2": 128,
+            "GROUP_SIZE_M": 1,
+        }
+    return {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_N": 256,
+        "BLOCK_SIZE_K1": 64,
+        "BLOCK_SIZE_K2": 128,
+        "GROUP_SIZE_M": 2,
+    }
+
 # fp8_dtype is not cached.
 # on ROCm the fp8_dtype always calls is_fp8_fnuz
 # which is a host op, so we cache it once here.
@@ -155,6 +204,7 @@ def _rocm_aiter_fused_moe_impl(
 
     if (
         on_gfx90a()
+        and not rocm_aiter_ops.is_native_fused_moe_enabled()
         and quant_type == QuantType.No
         and activation == ActivationType.Silu
         and expert_mask is None
@@ -172,7 +222,8 @@ def _rocm_aiter_fused_moe_impl(
             moe_align_block_size,
         )
 
-        block_size_m = 64
+        config = _gfx90a_aiter_e2e_moe_config(hidden_states.shape[0])
+        block_size_m = config["BLOCK_SIZE_M"]
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids.to(torch.int32), block_size_m, w1.shape[0]
         )
@@ -183,13 +234,6 @@ def _rocm_aiter_fused_moe_impl(
             dtype=out_dtype,
             device=hidden_states.device,
         )
-        config = {
-            "BLOCK_SIZE_M": block_size_m,
-            "BLOCK_SIZE_N": 128,
-            "BLOCK_SIZE_K1": 64,
-            "BLOCK_SIZE_K2": 64,
-            "GROUP_SIZE_M": 2,
-        }
         return e2e_moe(
             hidden_states,
             w1,
@@ -1213,6 +1257,8 @@ class rocm_aiter_ops:
         VLLM_ROCM_USE_AITER_LINEAR: Controls GEMM and quantization ops.
         VLLM_ROCM_USE_AITER_RMSNORM: Controls RMSNorm operations.
         VLLM_ROCM_USE_AITER_MOE: Controls MoE (Mixture of Experts) ops.
+        VLLM_ROCM_USE_AITER_NATIVE_MOE: Uses native AITER fused_moe instead
+            of the gfx90a Triton E2E fast path for unquantized SiLU MoE.
         VLLM_ROCM_USE_AITER_MLA: Controls MLA (Multi-head Latent Attention) ops.
         VLLM_ROCM_USE_AITER_MHA: Controls MHA ops including flash_attn_varlen.
         VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: Controls Triton unified attention.
@@ -1262,6 +1308,7 @@ class rocm_aiter_ops:
     _AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
     _LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
     _FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
+    _NATIVE_FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_NATIVE_MOE
     _MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
     _MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
     _SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
@@ -1295,6 +1342,7 @@ class rocm_aiter_ops:
         cls._AITER_ENABLED = envs.VLLM_ROCM_USE_AITER
         cls._LINEAR_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR
         cls._FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_MOE
+        cls._NATIVE_FMOE_ENABLED = envs.VLLM_ROCM_USE_AITER_NATIVE_MOE
         cls._MLA_ENABLED = envs.VLLM_ROCM_USE_AITER_MLA
         cls._MHA_ENABLED = envs.VLLM_ROCM_USE_AITER_MHA
         cls._SHUFFLE_KV_CACHE_ENABLED = envs.VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT
@@ -1389,6 +1437,11 @@ class rocm_aiter_ops:
     @if_aiter_supported
     def is_fused_moe_enabled(cls) -> bool:
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
+
+    @classmethod
+    @if_aiter_supported
+    def is_native_fused_moe_enabled(cls) -> bool:
+        return cls._AITER_ENABLED and cls._FMOE_ENABLED and cls._NATIVE_FMOE_ENABLED
 
     @classmethod
     @if_aiter_supported
