@@ -1995,19 +1995,24 @@ class NixlConnectorWorker:
         """
         Send heartbeat notifications to remote engines, extending lease on KV blocks.
         """
-        for engine_id, hb_info in metadata.heartbeat_by_engine.items():
+        heartbeat_by_engine: dict[str, tuple[str, int, int, list[str]]] = {}
+        for meta in metadata.reqs_to_recv.values():
+            if meta.remote is None:
+                continue
+            hb_info = heartbeat_by_engine.setdefault(
+                meta.remote.engine_id,
+                (meta.remote.host, meta.remote.port, meta.tp_size, []),
+            )
+            hb_info[3].append(meta.remote.request_id)
+
+        for engine_id, (host, port, tp_size, req_ids) in heartbeat_by_engine.items():
             # Proactive handshake (this request may still be in waiting queue) so
             # the **next** heartbeat for this remote can go through.
-            if (
-                self._ensure_handshake(
-                    engine_id, hb_info.host, hb_info.port, hb_info.tp_size
-                )
-                is not None
-            ):
+            if self._ensure_handshake(engine_id, host, port, tp_size) is not None:
                 continue  # handshake is still pending
 
             # Build the heartbeat message: "HB:req1,req2,..."
-            hb_msg = ("HB:" + ",".join(hb_info.req_ids)).encode()
+            hb_msg = ("HB:" + ",".join(req_ids)).encode()
             for agent_name in self._remote_agents[engine_id].values():
                 try:
                     self.nixl_wrapper.send_notif(agent_name, notif_msg=hb_msg)
