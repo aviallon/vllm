@@ -249,12 +249,26 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
+    // NOTE(gfx90a/CDNA2): the RELAXED + DEVICE-scope pattern below relies on
+    // the strong fabric coherence of CDNA3 (MI300/MI350). On CDNA2 (MI210)
+    // over PCIe it is unsafe: a peer's input-buffer writes are not guaranteed
+    // visible when its flag is observed (-> stale reads -> NaN), and a
+    // device-scope load cannot observe a peer's P2P flag write at all. Use
+    // release/acquire + system scope there.
+#if defined(__gfx90a__)
+    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
+                            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
+                                  __ATOMIC_ACQUIRE,
+                                  __MEMORY_SCOPE_SYSTEM) < flag);
+#else
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                             flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
                                   __ATOMIC_RELAXED,
                                   __MEMORY_SCOPE_DEVICE) < flag);
+#endif
   }
   __syncthreads();
   // use one thread to update flag
@@ -268,6 +282,15 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
+#if defined(__gfx90a__)
+    // CDNA2: always use release/acquire + system scope (see barrier_at_start).
+    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
+                            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+    while (
+        __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                               __ATOMIC_ACQUIRE,
+                               __MEMORY_SCOPE_SYSTEM) < flag);
+#else
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                             flag,
                             final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
@@ -277,6 +300,7 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
                                __MEMORY_SCOPE_DEVICE) < flag);
+#endif
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag
