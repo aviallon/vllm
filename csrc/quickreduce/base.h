@@ -88,7 +88,10 @@ __quickreduce_device_inline__ static void buffer_store_dwordx4(
     int32_t aux) __asm("llvm.amdgcn.raw.buffer.store.v4i32");
 
 __quickreduce_device_inline__ static void set_fp16_ovfl(bool const value) {
-#if defined(__gfx942__)
+#if defined(__gfx942__) || defined(__gfx90a__)
+  // gfx90a (CDNA2) also supports the fp16-overflow MODE register (hwreg
+  // 0xdc1). Without it, bf16->fp16 casts of values >65504 become +/-inf
+  // and corrupt the packed-fp16 reductions.
   if (value) {
     asm volatile("s_setreg_imm32_b32 0xdc1, 1;" ::);
   } else {
