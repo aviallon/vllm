@@ -319,6 +319,17 @@ def rocm_aiter_fused_experts(
         elif quant_config.use_fp8_w8a8:
             # Currently only per tensor quantization method is enabled.
             quant_method = QuantMethod.PER_TENSOR.value
+        # int8 w8a8: dynamic per-token activation / per-channel weight uses
+        # PER_TOKEN; static per-tensor uses PER_TENSOR. Without this branch the
+        # int8 path silently falls through to QuantMethod.NO (a16w16), which
+        # dequantizes the int8 weights and runs a bf16/f16 GEMM (no integer
+        # MFMA) producing incorrect results.
+        elif quant_config.use_int8_w8a8 and (
+            quant_config.per_out_ch_quant or quant_config.per_act_token_quant
+        ):
+            quant_method = QuantMethod.PER_TOKEN.value
+        elif quant_config.use_int8_w8a8:
+            quant_method = QuantMethod.PER_TENSOR.value
 
         if apply_router_weight_on_input:
             assert topk_weights.dim() == 2, (

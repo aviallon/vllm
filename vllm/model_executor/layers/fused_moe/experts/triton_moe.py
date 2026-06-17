@@ -76,10 +76,18 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        # INT8 requires at least 7.5 (Turing).
-        device_supports_int8 = (
-            current_platform.is_cuda()
-            and current_platform.has_device_capability((7, 5))
+        # INT8 requires at least 7.5 (Turing) on CUDA. On ROCm, the CDNA
+        # gfx9 archs (gfx90a/gfx942/gfx950) support integer MFMA (v_mfma_i32).
+        p = current_platform
+        if p.is_rocm():
+            from vllm.platforms.rocm import on_gfx9
+
+            is_rocm_on_gfx9 = on_gfx9()
+        else:
+            is_rocm_on_gfx9 = False
+
+        device_supports_int8 = is_rocm_on_gfx9 or (
+            p.is_cuda() and p.has_device_capability((7, 5))
         )
 
         supported: list[tuple[QuantKey | None, QuantKey | None]] = [(None, None)]
@@ -179,6 +187,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             torch.bfloat16,
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
+            torch.int8,
         ]
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
