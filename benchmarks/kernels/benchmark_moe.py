@@ -104,6 +104,7 @@ def benchmark_config(
     use_fp8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool = False,
+    use_int8_w8a8: bool = False,
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
@@ -134,7 +135,7 @@ def benchmark_config(
             ),
             dtype=torch.uint8,
         )
-    elif use_int8_w8a16:
+    elif use_int8_w8a16 or use_int8_w8a8:
         w1 = torch.randint(
             -127,
             127,
@@ -182,10 +183,30 @@ def benchmark_config(
             dtype=dtype,
         )
     elif use_int8_w8a16:
-        w1_scale = torch.randn(
-            (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+        if block_quant_shape is not None:
+            # grouped int8 (GPTQ/AWQ wna16 gptq_awq kernel): 3D scales (E, N, K//gs)
+            group_size = block_quant_shape[1]
+            w1_scale = torch.rand(
+                (num_experts, shard_intermediate_size, hidden_size // group_size),
+                dtype=dtype,
+            )
+            w2_scale = torch.rand(
+                (num_experts, hidden_size, (shard_intermediate_size // 2) // group_size),
+                dtype=dtype,
+            )
+        else:
+            w1_scale = torch.randn(
+                (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
+            )
+            w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+    elif use_int8_w8a8:
+        # int8 W8A8: per-channel (per output channel) weight scales.
+        # Activations are dynamically per-token quantized inside the kernel,
+        # so a1_scale/a2_scale stay None.
+        w1_scale = torch.rand(
+            (num_experts, shard_intermediate_size), dtype=torch.float32
         )
-        w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
+        w2_scale = torch.rand((num_experts, hidden_size), dtype=torch.float32)
     if use_deep_gemm:
         # we use the default block shape for deepgemm
         block_quant_shape = [128, 128]
@@ -228,20 +249,44 @@ def benchmark_config(
 
         if use_fp8_w8a8:
             quant_dtype = torch.float8_e4m3fn
-        elif use_int8_w8a16:
+        elif use_int8_w8a16 or use_int8_w8a8:
             quant_dtype = torch.int8
         else:
             quant_dtype = None
 
-        quant_config = FusedMoEQuantConfig.make(
-            quant_dtype=quant_dtype,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            block_shape=block_quant_shape,
-            weight_dtype="int4" if use_int4_w4a16 else None,
-        )
+        if use_int8_w8a16:
+            # weight-only int8 (W8A16): do NOT quantize activations
+            from vllm.model_executor.layers.fused_moe.config import (
+                int8_w8a16_moe_quant_config,
+            )
+            quant_config = int8_w8a16_moe_quant_config(
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                w1_zp=None,
+                w2_zp=None,
+                block_shape=block_quant_shape,
+            )
+        elif use_int8_w8a8:
+            # int8 W8A8: per-channel weight + dynamic per-token activation
+            quant_config = FusedMoEQuantConfig.make(
+                quant_dtype=torch.int8,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=None,
+                a2_scale=None,
+                per_act_token_quant=True,
+                per_out_ch_quant=True,
+            )
+        else:
+            quant_config = FusedMoEQuantConfig.make(
+                quant_dtype=quant_dtype,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_shape=block_quant_shape,
+                weight_dtype="int4" if use_int4_w4a16 else None,
+            )
 
         deep_gemm_experts = None
         if use_deep_gemm:
@@ -541,6 +586,7 @@ class BenchmarkWorker:
         use_fp8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool = False,
+        use_int8_w8a8: bool = False,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
     ) -> tuple[dict[str, int], float]:
@@ -550,6 +596,7 @@ class BenchmarkWorker:
         dtype_str = _get_config_dtype_str(
             dtype,
             use_int8_w8a16=use_int8_w8a16,
+            use_int8_w8a8=use_int8_w8a8,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int4_w4a16=use_int4_w4a16,
         )
@@ -583,6 +630,7 @@ class BenchmarkWorker:
             use_fp8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a8=use_int8_w8a8,
             num_iters=100,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
@@ -603,6 +651,7 @@ class BenchmarkWorker:
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
+        use_int8_w8a8: bool = False,
     ) -> dict[str, int]:
         # local import to allow serialization by ray
         from vllm.platforms import current_platform
@@ -610,7 +659,9 @@ class BenchmarkWorker:
         best_config = None
         best_time = float("inf")
         if current_platform.is_rocm():
-            is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+            is_fp16 = not (
+                use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_int8_w8a8
+            )
             search_space = prune_rocm_search_space(
                 num_tokens,
                 shard_intermediate_size,
@@ -643,6 +694,7 @@ class BenchmarkWorker:
                         use_fp8_w8a8,
                         use_int8_w8a16,
                         use_int4_w4a16,
+                        use_int8_w8a8=use_int8_w8a8,
                         num_iters=20,
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
@@ -706,10 +758,12 @@ def save_configs(
     use_int4_w4a16: bool,
     block_quant_shape: list[int],
     save_dir: str,
+    use_int8_w8a8: bool = False,
 ) -> None:
     dtype_str = _get_config_dtype_str(
         dtype,
         use_int8_w8a16=use_int8_w8a16,
+        use_int8_w8a8=use_int8_w8a8,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int4_w4a16=use_int4_w4a16,
     )
@@ -888,6 +942,7 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
+    use_int8_w8a8 = args.dtype == "int8_w8a8"
     block_quant_shape = get_weight_block_size_safety(config)
     if use_int4_w4a16:
         group_size = get_quantization_group_size(config)
@@ -929,14 +984,25 @@ def main(args: argparse.Namespace):
     use_deep_gemm = bool(args.use_deep_gemm)
 
     if current_platform.is_rocm() and "HIP_VISIBLE_DEVICES" in os.environ:
-        # Ray will set ROCR_VISIBLE_DEVICES for device visibility
-        logger.warning(
-            "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
-            "Replacing HIP_VISIBLE_DEVICES with ROCR_VISIBLE_DEVICES."
-        )
-        val = os.environ["HIP_VISIBLE_DEVICES"]
-        os.environ["ROCR_VISIBLE_DEVICES"] = val
-        del os.environ["HIP_VISIBLE_DEVICES"]
+        # Older Ray expected ROCR_VISIBLE_DEVICES for device visibility, but
+        # recent Ray (>=2.5x) reads HIP_VISIBLE_DEVICES and rejects
+        # ROCR_VISIBLE_DEVICES. Only translate for Ray versions that still
+        # require ROCR; otherwise leave HIP_VISIBLE_DEVICES untouched.
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _ray_major_minor = tuple(int(x) for x in _pkg_version("ray").split(".")[:2])
+            _ray_uses_rocr = _ray_major_minor < (2, 45)
+        except Exception:
+            _ray_uses_rocr = True
+        if _ray_uses_rocr:
+            logger.warning(
+                "Ray uses ROCR_VISIBLE_DEVICES to control device accessibility."
+                "Replacing HIP_VISIBLE_DEVICES with ROCR_VISIBLE_DEVICES."
+            )
+            val = os.environ["HIP_VISIBLE_DEVICES"]
+            os.environ["ROCR_VISIBLE_DEVICES"] = val
+            del os.environ["HIP_VISIBLE_DEVICES"]
 
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
@@ -956,7 +1022,7 @@ def main(args: argparse.Namespace):
     if args.tune:
         # int4_w4a16 weights are uint8-packed, not fp16; treat like fp8 for
         # search space generation (no matrix_instr_nonkdim/kpack exploration).
-        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        is_fp16 = not (use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_int8_w8a8)
         # For int4_w4a16, the group_size constraint on BLOCK_SIZE_K does not
         # apply: the gptq_awq kernel handles arbitrary BLOCK_SIZE_K regardless
         # of group_size. Skip block_quant_shape filtering to keep the full
@@ -991,6 +1057,7 @@ def main(args: argparse.Namespace):
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
+                    use_int8_w8a8,
                 )
                 for batch_size in batch_sizes
             ],
@@ -1010,6 +1077,7 @@ def main(args: argparse.Namespace):
             use_int4_w4a16,
             block_quant_shape,
             args.save_dir,
+            use_int8_w8a8,
         )
         end = time.time()
         print(f"Tuning took {end - start:.2f} seconds")
@@ -1027,6 +1095,7 @@ def main(args: argparse.Namespace):
                     use_fp8_w8a8,
                     use_int8_w8a16,
                     use_int4_w4a16,
+                    use_int8_w8a8,
                     block_quant_shape,
                     use_deep_gemm,
                 )
@@ -1051,7 +1120,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int4_w4a16"],
+        choices=["auto", "fp8_w8a8", "int8_w8a8", "int8_w8a16", "int4_w4a16"],
         default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
