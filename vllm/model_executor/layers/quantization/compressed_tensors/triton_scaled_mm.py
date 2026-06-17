@@ -138,7 +138,7 @@ def scaled_mm_kernel(
 
 # input   - [M, K]
 # weight - [K, N]
-def triton_scaled_mm(
+def _triton_scaled_mm_impl(
     input: torch.Tensor,
     weight: torch.Tensor,
     scale_a: torch.Tensor,
@@ -222,3 +222,91 @@ def triton_scaled_mm(
     )
 
     return result.to(out_dtype)
+
+
+# ---------------------------------------------------------------------------
+# torch.compile-safe wrapper.
+#
+# `scaled_mm_kernel` is a raw `@triton.jit` kernel. When the int8 W8A8 linear
+# path is traced by torch.compile/inductor (e.g. on ROCm, where
+# cutlass_scaled_mm dispatches here), torch tries to introspect the raw kernel
+# via `identify_mutated_tensors` -> `generate_ttir`, which raises
+# `IndexError('Function argument index out of range')`. Torch then falls back
+# to "assuming every input is mutated", which poisons inductor's buffer
+# aliasing/functionalization and produces all-zero outputs (garbage tokens).
+#
+# Registering an opaque custom op (which mutates nothing and returns a fresh
+# tensor) prevents torch from introspecting the raw Triton kernel, fixing the
+# miscompilation while keeping eager behaviour identical.
+# ---------------------------------------------------------------------------
+def _triton_scaled_mm_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return _triton_scaled_mm_impl(input, weight, scale_a, scale_b, out_dtype, bias)
+
+
+def _triton_scaled_mm_op_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty(
+        (input.shape[0], weight.shape[1]), dtype=out_dtype, device=input.device
+    )
+
+
+try:
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="triton_scaled_mm",
+        op_func=_triton_scaled_mm_op,
+        mutates_args=[],
+        fake_impl=_triton_scaled_mm_op_fake,
+    )
+    _HAS_TRITON_SCALED_MM_OP = True
+except Exception:
+    # If registration fails (e.g. op already registered), fall back to the
+    # direct implementation. Eager correctness is unaffected either way.
+    _HAS_TRITON_SCALED_MM_OP = False
+
+
+def triton_scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: torch.Tensor | None = None,
+    block_size_m: int = 32,
+    block_size_n: int = 32,
+    block_size_k: int = 32,
+    use_heuristic=True,
+) -> torch.Tensor:
+    # Route through the opaque custom op so torch.compile does not introspect
+    # the raw Triton kernel (see note above). Only the default tuning params
+    # are used by the kernel, so non-default block sizes are not forwarded.
+    if _HAS_TRITON_SCALED_MM_OP:
+        return torch.ops.vllm.triton_scaled_mm(
+            input, weight, scale_a, scale_b, out_dtype, bias
+        )
+    return _triton_scaled_mm_impl(
+        input,
+        weight,
+        scale_a,
+        scale_b,
+        out_dtype,
+        bias,
+        block_size_m,
+        block_size_n,
+        block_size_k,
+        use_heuristic,
+    )
