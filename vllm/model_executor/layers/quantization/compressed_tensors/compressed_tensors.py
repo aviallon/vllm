@@ -487,6 +487,29 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
 
     @staticmethod
+    def _is_w4a4_int(
+        weight_quant: QuantizationArgs, input_quant: QuantizationArgs
+    ) -> bool:
+        """Detect integer W4A4 scheme: 4-bit weights, 4-bit activations."""
+        is_weight_4_bits = weight_quant.num_bits == 4
+        is_activation_4_bits = input_quant.num_bits == 4
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+        )
+        is_token = (
+            weight_strategy
+            and input_quant.strategy == QuantizationStrategy.TOKEN.value
+        )
+        is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+        return (
+            is_weight_4_bits
+            and is_activation_4_bits
+            and is_token
+            and weight_quant.symmetric
+            and is_dynamic
+        )
+
+    @staticmethod
     def _is_fp8_w8a8(
         weight_quant: QuantizationArgs, input_quant: QuantizationArgs
     ) -> bool:

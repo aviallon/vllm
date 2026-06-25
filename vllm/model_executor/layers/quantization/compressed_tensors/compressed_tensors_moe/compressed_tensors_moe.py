@@ -176,6 +176,15 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsW4A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
+        elif quant_config._is_w4a4_int(weight_quant, input_quant):
+            from .compressed_tensors_moe_w4a4_int import (
+                CompressedTensorsW4A4Int8MoEMethod,
+            )
+
+            logger.info_once("Using CompressedTensorsW4A4Int8MoEMethod")
+            return CompressedTensorsW4A4Int8MoEMethod(
+                weight_quant, input_quant, layer.moe_config, layer_name
+            )
         else:
             raise RuntimeError(
                 f"Unsupported FusedMoe scheme: {weight_quant}, {input_quant}"
