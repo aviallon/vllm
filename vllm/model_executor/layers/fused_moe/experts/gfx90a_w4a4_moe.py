@@ -98,8 +98,21 @@ class Gfx90aW4A4MoEExperts(mk.FusedMoEExpertsModular):
             global_num_experts = E
 
         # ── W1 (gate_up): [M, K] @ [E, N_w1, K/2] → [M*topk, N_w1] ──
+        # w1 is [E, N_w1, K/2] bits4x2, w1_scale is [E, N_w1] float32
+        # Scales are passed as part of the weight tensor — the experts
+        # class receives them via self.w1_scale/self.w2_scale which come
+        # from quant_config. Since we use FUSED_MOE_UNQUANTIZED_CONFIG,
+        # those are None. We need to pass scales separately.
+        #
+        # Actually, the experts apply() receives w1/w2 as the weight tensors
+        # from the modular kernel. The scales need to come from somewhere.
+        # In the standard path, self.w1_scale comes from quant_config.w1_scale.
+        # Since we use UNQUANTIZED config, we need to store scales ourselves.
+        w1_s = self._w1_scale  # set by process_weights_after_loading
+        w2_s = self._w2_scale
+
         cache1_flat = torch.ops.vllm.w4a4_gfx90a_moe_gemm(
-            hidden_states, w1, self.w1_scale.squeeze(-1), topk_ids,
+            hidden_states, w1, w1_s, topk_ids,
         )  # [M*topk, N_w1] BF16
 
         N_w1 = cache1_flat.shape[-1]
@@ -121,7 +134,7 @@ class Gfx90aW4A4MoEExperts(mk.FusedMoEExpertsModular):
         w2_topk_ids = topk_ids.view(-1, 1).to(torch.int32)  # [M*topk, 1]
 
         cache3_flat = torch.ops.vllm.w4a4_gfx90a_moe_gemm(
-            intermediate_cache2, w2, self.w2_scale.squeeze(-1), w2_topk_ids,
+            intermediate_cache2, w2, w2_s, w2_topk_ids,
         )  # [M*topk, K] BF16
 
         intermediate_cache3 = _resize_cache(

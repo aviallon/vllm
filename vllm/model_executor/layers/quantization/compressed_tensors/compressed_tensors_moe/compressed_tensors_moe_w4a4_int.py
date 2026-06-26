@@ -140,15 +140,11 @@ class CompressedTensorsW4A4Int8MoEMethod(CompressedTensorsMoEMethod):
         self._build_modular_kernel(layer)
 
         # Pre-load HIP module (before torch.compile captures)
-        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.w4a4_op import (
-            ensure_moe_loaded,
-        )
+        from w4a4_moe_op import ensure_moe_loaded
         ensure_moe_loaded()
 
     def _build_modular_kernel(self, layer: FusedMoE):
-        from vllm.model_executor.layers.fused_moe.experts.gfx90a_w4a4_moe import (
-            Gfx90aW4A4MoEExperts,
-        )
+        from gfx90a_w4a4_moe_experts import Gfx90aW4A4MoEExperts
         self.experts_cls = Gfx90aW4A4MoEExperts
 
         # Quant config — signals W4A4 to the experts
@@ -176,14 +172,20 @@ class CompressedTensorsW4A4Int8MoEMethod(CompressedTensorsMoEMethod):
             experts = self.experts_cls(
                 moe_config=self.moe, quant_config=self.moe_quant_config)
 
+        # Pass scales to experts (UNQUANTIZED config doesn't carry them)
+        experts._w1_scale = layer.w13_weight_scale.data
+        experts._w2_scale = layer.w2_weight_scale.data
+
         self.moe_kernel = mk.FusedMoEKernel(
             prepare_finalize, experts,
             shared_experts=layer.shared_experts,
             inplace=not self.moe.disable_inplace)
 
     def get_fused_moe_quant_config(self, layer) -> FusedMoEQuantConfig:
-        # Unquantized config — our experts handle quantization internally.
-        # The prepare step passes unquantized BF16 inputs (expects_unquantized_inputs=True).
+        # Unquantized config — our experts handle all quantization internally.
+        # The prepare step passes unquantized BF16 inputs.
+        # Scales are accessed via layer.w13_weight_scale / layer.w2_weight_scale
+        # in the experts apply(), not via quant_config.
         from vllm.model_executor.layers.fused_moe.config import (
             FUSED_MOE_UNQUANTIZED_CONFIG,
         )
