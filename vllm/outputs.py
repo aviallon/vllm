@@ -119,6 +119,7 @@ class RequestOutput:
         encoder_prompt: str | None = None,
         encoder_prompt_token_ids: list[int] | None = None,
         num_cached_tokens: int | None = None,
+        num_computed_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         prompt_routed_experts: np.ndarray | None = None,
@@ -141,6 +142,7 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.num_computed_tokens = num_computed_tokens
         self.kv_transfer_params = kv_transfer_params
         self.prompt_routed_experts = prompt_routed_experts
 
