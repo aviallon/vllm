@@ -3,14 +3,18 @@
 Routes small-batch (<=32 tokens) MoE through custom int8 MFMA kernels on gfx90a.
 Large batches fall back to vLLM's Triton fused_experts.
 
-The custom kernel is a 3-stage pipeline:
-  1. FC1: int8 X @ int8 W1 -> bf16 (raw dequant, no activation)
-  2. Activation: SwiGLU (g1u1) or SiLU (g1u0)
-  3. Re-quantize intermediate bf16 -> int8 (for FC2)
-  4. FC2: int8 @ int8 W2 -> f32 (weighted atomicAdd)
+Optimized pipeline (v2):
+  1. pertoken_quant: bf16 input -> int8 + scale (1 launch, AITER)
+  2. moe_sorting: sort tokens by expert (1 launch, AITER)
+  3. fused_fc1_act: FC1 + SwiGLU/SiLU -> bf16 intermediate (1 launch, custom)
+  4. quant_per_token: bf16 -> int8 + scale (1 launch, custom)
+  5. fc2: int8 GEMM + weighted scatter -> output (1 launch, custom)
 
-Input to FC1 is already int8 (pre-quantized weights + per-token input quant).
-The re-quantization in step 3 is ONLY for the FC1->FC2 intermediate.
+Total: 5 launches per MoE layer (down from 6 in v1).
+Key optimization: fused FC1+activation saves 1 launch and 1 global memory round-trip.
+
+The expert_ids computation is done with a vectorized PyTorch op instead of a
+Python for-loop, eliminating GPU sync points.
 
 Future: a hand-written ASM kernel can replace the .so without changing this interface.
 """
@@ -38,6 +42,15 @@ def _get_lib():
     else:
         raise RuntimeError("fmoe_int8_gfx90a.so not found")
 
+    # v2 fused kernel API
+    _lib.fused_fc1_act_launch.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_void_p
+    ]
+    _lib.fused_fc1_act_launch.restype = None
+    # v1 kernel API (fallback)
     _lib.fc1_int8_launch.argtypes = [ctypes.c_void_p]*7 + [ctypes.c_int]*5 + [ctypes.c_void_p]
     _lib.fc1_int8_launch.restype = None
     _lib.swiglu_launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
@@ -90,80 +103,69 @@ def apply_gfx90a_int8_moe(layer, x, topk_weights, topk_ids, moe_quant_config):
     M_sorted = sorted_ids.shape[0]
     M_padded = ((M_sorted + BM - 1) // BM) * BM
 
-    # Pad sorted arrays
+    # Pad sorted arrays (single allocation, no cat)
     if M_padded > M_sorted:
-        sorted_ids = torch.cat([sorted_ids, torch.full((M_padded - M_sorted,), num_tokens,
-            dtype=torch.int32, device=device)])
-        sorted_weights = torch.cat([sorted_weights, torch.zeros(M_padded - M_sorted,
-            dtype=torch.float32, device=device)])
+        pad_len = M_padded - M_sorted
+        sorted_ids_padded = torch.full((M_padded,), num_tokens, dtype=torch.int32, device=device)
+        sorted_ids_padded[:M_sorted] = sorted_ids
+        sorted_weights_padded = torch.zeros(M_padded, dtype=torch.float32, device=device)
+        sorted_weights_padded[:M_sorted] = sorted_weights
+    else:
+        sorted_ids_padded = sorted_ids
+        sorted_weights_padded = sorted_weights
 
-    # Create expert_ids (one per BM-block)
+    # Create expert_ids (vectorized — no Python loop, no .item() sync)
     num_blocks = M_padded // BM
-    expert_ids = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
-    for b in range(num_blocks):
-        start = b * BM
-        end = min(start + BM, M_sorted)
-        if end > start:
-            expert_ids[b] = sorted_expert_ids[start].item()
+    # Each block's expert = sorted_expert_ids[block_start], padded to num_blocks
+    if sorted_expert_ids.shape[0] >= num_blocks:
+        expert_ids = sorted_expert_ids[:num_blocks].contiguous()
+    else:
+        expert_ids = torch.full((num_blocks,), -1, dtype=torch.int32, device=device)
+        expert_ids[:sorted_expert_ids.shape[0]] = sorted_expert_ids
 
     # Gather input tokens in sorted order
-    safe_ids = sorted_ids[:M_padded].clamp(max=num_tokens - 1)
+    safe_ids = sorted_ids_padded.clamp(max=num_tokens - 1)
     x_gathered = x_int8[safe_ids]
     x_scale_gathered = x_scale[safe_ids]
 
-    # Step 3: FC1
-    inter_raw = torch.zeros(M_padded, N1, dtype=torch.bfloat16, device=device)
-    lib.fc1_int8_launch(
-        ctypes.c_void_p(inter_raw.data_ptr()),
+    # Step 3: Fused FC1 + activation -> bf16 intermediate
+    inter = torch.zeros(M_padded, inter_dim, dtype=torch.bfloat16, device=device)
+    lib.fused_fc1_act_launch(
+        ctypes.c_void_p(inter.data_ptr()),
         ctypes.c_void_p(x_gathered.data_ptr()),
         ctypes.c_void_p(layer.w13_weight.data_ptr()),
-        ctypes.c_void_p(sorted_ids[:M_padded].data_ptr()),
+        ctypes.c_void_p(sorted_ids_padded.data_ptr()),
         ctypes.c_void_p(expert_ids.data_ptr()),
         ctypes.c_void_p(x_scale_gathered.data_ptr()),
         ctypes.c_void_p(layer.w13_weight_scale.data_ptr()),
         ctypes.c_int(M_padded), ctypes.c_int(N1), ctypes.c_int(hidden),
-        ctypes.c_int(num_tokens), ctypes.c_int(is_g1u1),
+        ctypes.c_int(inter_dim), ctypes.c_int(num_tokens), ctypes.c_int(is_g1u1),
         ctypes.c_void_p(stream))
 
-    # Step 4: Activation
-    inter_act = torch.empty(M_padded, inter_dim, dtype=torch.bfloat16, device=device)
-    if is_g1u1:
-        lib.swiglu_launch(
-            ctypes.c_void_p(inter_act.data_ptr()),
-            ctypes.c_void_p(inter_raw.data_ptr()),
-            ctypes.c_int(M_padded), ctypes.c_int(inter_dim),
-            ctypes.c_void_p(stream))
-    else:
-        lib.silu_launch(
-            ctypes.c_void_p(inter_act.data_ptr()),
-            ctypes.c_void_p(inter_raw.data_ptr()),
-            ctypes.c_int(M_padded), ctypes.c_int(inter_dim),
-            ctypes.c_void_p(stream))
-
-    # Step 5: Re-quantize intermediate for FC2
+    # Step 4: Re-quantize intermediate for FC2
     inter_q = torch.empty(M_padded, inter_dim, dtype=torch.int8, device=device)
     inter_scale = torch.empty(M_padded, dtype=torch.float32, device=device)
     lib.quant_per_token_launch(
-        ctypes.c_void_p(inter_act.data_ptr()),
+        ctypes.c_void_p(inter.data_ptr()),
         ctypes.c_void_p(inter_q.data_ptr()),
         ctypes.c_void_p(inter_scale.data_ptr()),
         ctypes.c_int(M_padded), ctypes.c_int(inter_dim),
         ctypes.c_void_p(stream))
 
-    # Step 6: FC2
+    # Step 5: FC2 (int8 GEMM + weighted atomicAdd)
     out_f32 = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=device)
     lib.fc2_int8_launch(
         ctypes.c_void_p(out_f32.data_ptr()),
         ctypes.c_void_p(inter_q.data_ptr()),
         ctypes.c_void_p(layer.w2_weight.data_ptr()),
-        ctypes.c_void_p(sorted_ids[:M_padded].data_ptr()),
+        ctypes.c_void_p(sorted_ids_padded.data_ptr()),
         ctypes.c_void_p(expert_ids.data_ptr()),
         ctypes.c_void_p(inter_scale.data_ptr()),
         ctypes.c_void_p(layer.w2_weight_scale.data_ptr()),
-        ctypes.c_void_p(sorted_weights[:M_padded].data_ptr()),
+        ctypes.c_void_p(sorted_weights_padded.data_ptr()),
         ctypes.c_int(M_padded), ctypes.c_int(hidden), ctypes.c_int(inter_dim),
         ctypes.c_int(num_tokens), ctypes.c_void_p(stream))
 
-    result = out_f32.bfloat16()
-    moe_buf.copy_(result)
+    # Write result to moe_buf (avoid extra copy — write directly)
+    moe_buf.copy_(out_f32.view_as(moe_buf))
     return moe_buf
