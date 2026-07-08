@@ -59,6 +59,36 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 
+# gfx90a int8 W8A8 MoE kernel support
+try:
+    from vllm.platforms.rocm import on_gfx90a
+except ImportError:
+    on_gfx90a = lambda: False
+
+_gfx90a_int8_moe_loaded = False
+_gfx90a_int8_moe_fn = None
+GFX90A_INT8_MOE_MAX_TOKENS = 32
+
+def _get_gfx90a_int8_moe():
+    global _gfx90a_int8_moe_loaded, _gfx90a_int8_moe_fn
+    if not _gfx90a_int8_moe_loaded:
+        try:
+            from vllm.model_executor.layers.quantization.quark.gfx90a_int8_moe import (
+                apply_gfx90a_int8_moe as _fn)
+            _gfx90a_int8_moe_fn = _fn
+        except Exception as e:
+            logger.warning("Failed to load gfx90a int8 MoE kernel: %s", e)
+            _gfx90a_int8_moe_fn = None
+        _gfx90a_int8_moe_loaded = True
+    return _gfx90a_int8_moe_fn
+
+def apply_gfx90a_int8_moe(layer, x, topk_weights, topk_ids, moe_quant_config):
+    fn = _get_gfx90a_int8_moe()
+    if fn is None:
+        raise RuntimeError("gfx90a int8 MoE kernel not available")
+    return fn(layer, x, topk_weights, topk_ids, moe_quant_config)
+
+
 __all__ = [
     "QuarkMoEMethod",
     "QuarkOCP_MX_MoEMethod",
@@ -758,8 +788,13 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from vllm.model_executor.layers.fused_moe import fused_experts
+        # gfx90a: use custom int8 W8A8 MoE kernel for small batches (decode).
+        # Falls back to Triton fused_experts for larger batches (prefill).
+        if x.shape[0] <= GFX90A_INT8_MOE_MAX_TOKENS and on_gfx90a():
+            return apply_gfx90a_int8_moe(
+                layer, x, topk_weights, topk_ids, self.moe_quant_config)
 
+        from vllm.model_executor.layers.fused_moe import fused_experts
         return fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,

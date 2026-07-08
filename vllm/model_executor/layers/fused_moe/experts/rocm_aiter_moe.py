@@ -26,6 +26,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
+    kInt8StaticChannelSym,
     kMxfp4Static,
 )
 
@@ -409,6 +411,10 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             (kFp8StaticChannelSym, kFp8DynamicTokenSym),
             (kMxfp4Static, None),
         ]
+        # int8 W8A8 supported on gfx90a via custom kernel
+        from vllm.platforms.rocm import on_gfx90a
+        if on_gfx90a():
+            SUPPORTED_W_A.append((kInt8StaticChannelSym, kInt8DynamicTokenSym))
         if (weight_key, activation_key) not in SUPPORTED_W_A:
             return False
         # CK MXFP4 MoE kernels are only supported on gfx950.
