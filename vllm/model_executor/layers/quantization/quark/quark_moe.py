@@ -59,35 +59,6 @@ from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
 
-# gfx90a int8 W8A8 MoE kernel support
-try:
-    from vllm.platforms.rocm import on_gfx90a
-except ImportError:
-    on_gfx90a = lambda: False
-
-_gfx90a_int8_moe_loaded = False
-_gfx90a_int8_moe_fn = None
-GFX90A_INT8_MOE_MAX_TOKENS = 32
-
-def _get_gfx90a_int8_moe():
-    global _gfx90a_int8_moe_loaded, _gfx90a_int8_moe_fn
-    if not _gfx90a_int8_moe_loaded:
-        try:
-            from vllm.model_executor.layers.quantization.quark.gfx90a_int8_moe import (
-                apply_gfx90a_int8_moe as _fn)
-            _gfx90a_int8_moe_fn = _fn
-        except Exception as e:
-            logger.warning("Failed to load gfx90a int8 MoE kernel: %s", e)
-            _gfx90a_int8_moe_fn = None
-        _gfx90a_int8_moe_loaded = True
-    return _gfx90a_int8_moe_fn
-
-def apply_gfx90a_int8_moe(layer, x, topk_weights, topk_ids, moe_quant_config):
-    fn = _get_gfx90a_int8_moe()
-    if fn is None:
-        raise RuntimeError("gfx90a int8 MoE kernel not available")
-    return fn(layer, x, topk_weights, topk_ids, moe_quant_config)
-
 
 __all__ = [
     "QuarkMoEMethod",
@@ -543,6 +514,7 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
         self.input_quant = input_config
         self.weight_qscheme = self.weight_quant.get("qscheme", "per_tensor")
         self.static_input_scales = not self.input_quant.get("is_dynamic", False)
+        self.rocm_aiter_moe_enabled = rocm_aiter_ops.is_fused_moe_enabled()
 
     def create_weights(
         self,
@@ -788,12 +760,24 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # gfx90a: use custom int8 W8A8 MoE kernel for small batches (decode).
-        # Falls back to Triton fused_experts for larger batches (prefill).
-        if x.shape[0] <= GFX90A_INT8_MOE_MAX_TOKENS and on_gfx90a():
-            return apply_gfx90a_int8_moe(
-                layer, x, topk_weights, topk_ids, self.moe_quant_config)
-
+        if self.rocm_aiter_moe_enabled:
+            from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+                rocm_aiter_fused_experts,
+            )
+            return rocm_aiter_fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                moe_config=layer.moe_config,
+                activation=layer.activation,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                expert_map=layer.expert_map,
+                quant_config=self.moe_quant_config,
+                a1q_scale=layer.w13_input_scale,
+                num_local_tokens=None,
+            )
         from vllm.model_executor.layers.fused_moe import fused_experts
         return fused_experts(
             hidden_states=x,
