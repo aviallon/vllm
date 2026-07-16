@@ -766,24 +766,30 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
         # inside torch custom ops. The Triton path does true int8×int8 GEMM
         # with fp32 accumulation and is cudagraph-compatible.
         # AITER is still used on gfx942/gfx950 where .co kernels exist.
-        if self.rocm_aiter_moe_enabled and not _is_gfx90a():
-            from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
-                rocm_aiter_fused_experts,
-            )
-            return rocm_aiter_fused_experts(
-                hidden_states=x,
-                w1=layer.w13_weight,
-                w2=layer.w2_weight,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                moe_config=layer.moe_config,
-                activation=layer.activation,
-                apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                expert_map=layer.expert_map,
-                quant_config=self.moe_quant_config,
-                a1q_scale=layer.w13_input_scale,
-                num_local_tokens=None,
-            )
+        if self.rocm_aiter_moe_enabled:
+            try:
+                from vllm.platforms.rocm import on_gfx90a
+                _skip_aiter = on_gfx90a()
+            except ImportError:
+                _skip_aiter = False
+            if not _skip_aiter:
+                from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+                    rocm_aiter_fused_experts,
+                )
+                return rocm_aiter_fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight,
+                    w2=layer.w2_weight,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    moe_config=layer.moe_config,
+                    activation=layer.activation,
+                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                    expert_map=layer.expert_map,
+                    quant_config=self.moe_quant_config,
+                    a1q_scale=layer.w13_input_scale,
+                    num_local_tokens=None,
+                )
         from vllm.model_executor.layers.fused_moe import fused_experts
         return fused_experts(
             hidden_states=x,
