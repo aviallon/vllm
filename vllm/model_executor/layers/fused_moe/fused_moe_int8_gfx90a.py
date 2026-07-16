@@ -320,8 +320,10 @@ def fused_experts_int8_gfx90a(
             num_tokens, dtype=torch.int32, device=device)])
         sorted_weights = torch.cat([sorted_weights, torch.zeros(M_pp - M_padded,
             dtype=torch.float32, device=device)])
-    # Clamp invalid expert_ids to 0
-    sorted_expert_ids = torch.where(sorted_expert_ids < num_experts, sorted_expert_ids, 0)
+    # Set invalid expert_ids to -1 so kernel skips them
+    num_valid_blocks = (num_valid_ids[0].item() + block_size_m - 1) // block_size_m
+    sorted_expert_ids = sorted_expert_ids.clone()
+    sorted_expert_ids[num_valid_blocks:] = -1
 
     # Step 2: per-token quant of input (reuse AITER)
     from aiter import pertoken_quant
