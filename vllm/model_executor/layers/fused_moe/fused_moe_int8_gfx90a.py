@@ -20,6 +20,8 @@ Model shapes (Qwen3.6-35B-A3B, TP=2):
 import torch
 import triton
 import triton.language as tl
+from aiter.fused_moe import moe_sorting
+from aiter import pertoken_quant
 
 
 # ============================================================================
@@ -305,7 +307,7 @@ def fused_experts_int8_gfx90a(
         w2_scale = w2_scale.squeeze(-1)
 
     # Step 1: moe_sorting (reuse AITER)
-    from aiter.fused_moe import moe_sorting
+    moe_sorting(local_moe_sorting)
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids.to(torch.int32), topk_weights.to(torch.float32),
         num_experts, hidden, hidden_states.dtype)
@@ -326,7 +328,6 @@ def fused_experts_int8_gfx90a(
     sorted_expert_ids[num_valid_blocks:] = -1
 
     # Step 2: per-token quant of input (reuse AITER)
-    from aiter import pertoken_quant
     a_int8, a_scale = pertoken_quant(hidden_states, quant_dtype=torch.int8)
     a_int8 = a_int8.contiguous().view(M, hidden)
     a_scale = a_scale.contiguous().view(M)
