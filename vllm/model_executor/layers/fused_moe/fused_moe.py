@@ -212,13 +212,7 @@ def fused_moe_kernel_gptq_awq(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    # Use int32 accumulator for int8 W8A8 (non-block-scale) to leverage
-    # int8 MFMA hardware (v_mfma_i32_16x16x16i8 on gfx90a).
-    ACC_DTYPE: tl.constexpr = (
-        tl.int32 if use_int8_w8a8 and not (group_k > 0 and group_n > 0)
-        else tl.float32
-    )
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=ACC_DTYPE)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -497,7 +491,7 @@ def fused_moe_kernel(
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
-            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator).to(ACC_DTYPE)
+            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
@@ -507,7 +501,7 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
-                accumulator += (tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]).to(ACC_DTYPE)
+                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
@@ -515,7 +509,7 @@ def fused_moe_kernel(
                 else:
                     accumulator = tl.dot(a, b, acc=accumulator)
         else:
-            accumulator = tl.dot(a, b, acc=accumulator)
+            accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -528,10 +522,7 @@ def fused_moe_kernel(
     if use_int8_w8a16:
         accumulator = accumulator * b_scale
     elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
-        if use_int8_w8a8:
-            accumulator = accumulator.to(tl.float32) * a_scale * b_scale
-        else:
-            accumulator = accumulator * a_scale * b_scale
+        accumulator = accumulator * a_scale * b_scale
 
     # Bias addition:
     # Bias must be applied after dequantization:
