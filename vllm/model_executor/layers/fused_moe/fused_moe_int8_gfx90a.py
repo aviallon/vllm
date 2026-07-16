@@ -307,7 +307,7 @@ def fused_experts_int8_gfx90a(
         w2_scale = w2_scale.squeeze(-1)
 
     # Step 1: moe_sorting (reuse AITER)
-    moe_sorting(local_moe_sorting)
+    moe_sorting(
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf = moe_sorting(
         topk_ids.to(torch.int32), topk_weights.to(torch.float32),
         num_experts, hidden, hidden_states.dtype)
