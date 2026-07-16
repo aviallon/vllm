@@ -760,7 +760,13 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self.rocm_aiter_moe_enabled:
+        # On gfx90a, use the Triton fused_experts path for int8 W8A8 MoE.
+        # AITER's int8 MoE .co kernels don't exist for gfx90a, and the custom
+        # AITER kernel (fmoe_int8_g1u0_gfx90a) has memory allocation issues
+        # inside torch custom ops. The Triton path does true int8×int8 GEMM
+        # with fp32 accumulation and is cudagraph-compatible.
+        # AITER is still used on gfx942/gfx950 where .co kernels exist.
+        if self.rocm_aiter_moe_enabled and not _is_gfx90a():
             from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
                 rocm_aiter_fused_experts,
             )
