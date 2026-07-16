@@ -352,3 +352,37 @@ def fused_experts_int8_gfx90a(
     )
 
     return out_f32.to(torch.bfloat16)
+
+
+# ============================================================================
+# Register as torch custom op — makes it opaque to torch.compile
+# (prevents serialization of closure/AITER function references)
+# ============================================================================
+@torch.library.custom_op(
+    "vllm::fused_experts_int8_gfx90a",
+    mutates_args=(),
+)
+def fused_experts_int8_gfx90a_op(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    num_experts: int,
+) -> torch.Tensor:
+    return fused_experts_int8_gfx90a(
+        hidden_states, w1, w2, w1_scale, w2_scale,
+        topk_weights, topk_ids, num_experts,
+    )
+
+
+@fused_experts_int8_gfx90a_op.register_fake
+def _fused_experts_int8_gfx90a_fake(
+    hidden_states, w1, w2, w1_scale, w2_scale,
+    topk_weights, topk_ids, num_experts,
+):
+    M = hidden_states.shape[0]
+    hidden = w1.shape[2]
+    return torch.empty(M, hidden, dtype=hidden_states.dtype, device=hidden_states.device)

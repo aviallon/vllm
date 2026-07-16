@@ -774,18 +774,16 @@ class QuarkW8A8Int8MoEMethod(QuarkMoEMethod):
                 _skip_aiter = False
             if _skip_aiter:
                 # Use 3-step fused int8 MoE kernel with int32 MFMA on gfx90a
-                from vllm.model_executor.layers.fused_moe.fused_moe_int8_gfx90a import (
-                    fused_experts_int8_gfx90a,
-                )
-                return fused_experts_int8_gfx90a(
-                    hidden_states=x,
-                    w1=layer.w13_weight,
-                    w2=layer.w2_weight,
-                    w1_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    num_experts=layer.num_experts,
+                # Registered as custom op for torch.compile compatibility
+                return torch.ops.vllm.fused_experts_int8_gfx90a(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight_scale,
+                    topk_weights,
+                    topk_ids,
+                    layer.num_experts,
                 )
             if not _skip_aiter:
                 from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
