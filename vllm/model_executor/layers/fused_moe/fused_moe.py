@@ -497,7 +497,7 @@ def fused_moe_kernel(
         b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
         # We accumulate along the K dimension.
         if use_int8_w8a16:
-            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
+            accumulator = tl.dot(a, b.to(compute_type), acc=accumulator).to(ACC_DTYPE)
         elif use_fp8_w8a8 or use_int8_w8a8:
             if group_k > 0 and group_n > 0:
                 k_start = k * BLOCK_SIZE_K
@@ -515,7 +515,7 @@ def fused_moe_kernel(
                 else:
                     accumulator = tl.dot(a, b, acc=accumulator)
         else:
-            accumulator += tl.dot(a, b)
+            accumulator = tl.dot(a, b, acc=accumulator)
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
