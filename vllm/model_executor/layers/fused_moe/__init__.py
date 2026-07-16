@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# Register gfx90a fused int8 MoE custom op (must be imported early for torch.compile)
+try:
+    from vllm.model_executor.layers.fused_moe import fused_moe_int8_gfx90a  # noqa: F401
+except Exception:
+    pass
+
 from contextlib import contextmanager
 from typing import Any
 
