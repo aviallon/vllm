@@ -507,7 +507,7 @@ def fused_moe_kernel(
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
 
-                accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                accumulator += (tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]).to(ACC_DTYPE)
             else:
                 if use_fp8_w8a8:
                     # acc used to enable fp8_fast_accum
