@@ -212,7 +212,13 @@ def fused_moe_kernel_gptq_awq(
     # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
     # of fp32 values for higher accuracy.
     # `accumulator` will be converted back to fp16 after the loop.
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    # Use int32 accumulator for int8 W8A8 to leverage int8 MFMA hardware
+    # (v_mfma_i32_16x16x16i8 on gfx90a). Without this, Triton upcasts to
+    # float32 and uses bf16/fp32 MFMA, giving no int8 compute benefit.
+    if use_int8_w8a8 and not (group_k > 0 and group_n > 0):
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -507,7 +513,7 @@ def fused_moe_kernel(
                     # acc used to enable fp8_fast_accum
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
-                    accumulator += tl.dot(a, b)
+                    accumulator += tl.dot(a, b, out_dtype=tl.int32)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -522,7 +528,10 @@ def fused_moe_kernel(
     if use_int8_w8a16:
         accumulator = accumulator * b_scale
     elif (use_fp8_w8a8 or use_int8_w8a8) and not (group_k > 0 and group_n > 0):
-        accumulator = accumulator * a_scale * b_scale
+        if use_int8_w8a8:
+            accumulator = accumulator.to(tl.float32) * a_scale * b_scale
+        else:
+            accumulator = accumulator * a_scale * b_scale
 
     # Bias addition:
     # Bias must be applied after dequantization:
