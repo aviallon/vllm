@@ -513,7 +513,7 @@ def fused_moe_kernel(
                     # acc used to enable fp8_fast_accum
                     accumulator = tl.dot(a, b, acc=accumulator)
                 else:
-                    accumulator += tl.dot(a, b, out_dtype=tl.int32)
+                    accumulator = tl.dot(a, b, acc=accumulator, out_dtype=tl.int32)
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
