@@ -261,6 +261,14 @@ class DeltaFunctionCall(BaseModel):
     name: str | None = None
     arguments: str | None = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Prevents ``"name": null`` (and ``"arguments": null``) from being
+        # emitted on continuation tool-call deltas. The OpenAI streaming spec
+        # requires name/id/type only on the first delta for a tool-call index;
+        # continuation deltas must omit them entirely rather than send null.
+        return {k: v for k, v in handler(self).items() if v is not None}
+
 
 # a tool call delta where everything is optional
 class DeltaToolCall(OpenAIBaseModel):
@@ -268,6 +276,10 @@ class DeltaToolCall(OpenAIBaseModel):
     type: Literal["function"] | None = None
     index: int
     function: DeltaFunctionCall | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        return {k: v for k, v in handler(self).items() if v is not None}
 
 
 class ExtractedToolCallInformation(BaseModel):

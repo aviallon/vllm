@@ -15,9 +15,16 @@ models because:
      "ValueError: Unexpected tool call id ...".
 """
 
+import json
+
 import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.engine.protocol import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+)
 
 
 def _make_tool_call(tc_id: str, name: str, args: str) -> dict:
@@ -148,3 +155,49 @@ def test_multiple_tool_calls_materialised(num_tool_calls: int):
     # Verify after model_dump_json too
     _ = req.model_dump_json()
     assert len(assistant_msg.get("tool_calls", [])) == num_tool_calls
+
+
+def test_streaming_tool_call_continuation_omits_null_fields():
+    """Continuation tool-call deltas must omit name/id/type, not send null.
+
+    Regression test for OpenAI-compatible clients rejecting
+    ``"function.name": null`` on streaming tool-call continuation chunks
+    (e.g. vLLM serving an OpenAI-compatible provider consumed by the AI SDK).
+    The OpenAI spec requires name/id/type only on the first delta for a given
+    tool-call index; continuation deltas must omit them entirely.
+    """
+    first = DeltaMessage(
+        tool_calls=[
+            DeltaToolCall(
+                index=0,
+                id="call_1",
+                type="function",
+                function=DeltaFunctionCall(name="read_file", arguments=""),
+            )
+        ]
+    )
+    continuation = DeltaMessage(
+        tool_calls=[
+            DeltaToolCall(
+                index=0,
+                id=None,
+                type=None,
+                function=DeltaFunctionCall(
+                    name=None, arguments='{"path": "test'
+                ),
+            )
+        ]
+    )
+
+    first_json = json.loads(
+        first.model_dump_json(exclude_unset=True)
+    )["tool_calls"][0]
+    cont_json = json.loads(
+        continuation.model_dump_json(exclude_unset=True)
+    )["tool_calls"][0]
+
+    assert first_json["function"]["name"] == "read_file"
+    assert "name" not in cont_json["function"]
+    assert "id" not in cont_json
+    assert "type" not in cont_json
+    assert cont_json["function"]["arguments"] == '{"path": "test'
