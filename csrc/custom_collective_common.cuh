@@ -260,13 +260,19 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
 
 #else
 
-// gfx90a (CDNA2) over PCIe: a device-scope load cannot observe a peer's P2P
-// flag write (stale reads -> NaN). Use system scope there; release/acquire
-// ordering is applied per-barrier below.
+// gfx90a (CDNA2/MI210) over PCIe has weaker P2P coherence than CDNA3's fabric:
+// a device-scope load cannot observe a peer's P2P flag write (stale reads ->
+// NaN). Use system-scope loads there, and release/acquire ordering for the
+// start barrier so the flag write is ordered with the peer's data writes.
+// Other architectures keep the relaxed + device-scope fast path.
 #if defined(__gfx90a__)
-#define VLLM_BARRIER_LOAD_SCOPE __MEMORY_SCOPE_SYSTEM
+constexpr auto kBarrierLoadScope = __MEMORY_SCOPE_SYSTEM;
+constexpr auto kBarrierStartStoreOrder = __ATOMIC_RELEASE;
+constexpr auto kBarrierStartLoadOrder = __ATOMIC_ACQUIRE;
 #else
-#define VLLM_BARRIER_LOAD_SCOPE __MEMORY_SCOPE_DEVICE
+constexpr auto kBarrierLoadScope = __MEMORY_SCOPE_DEVICE;
+constexpr auto kBarrierStartStoreOrder = __ATOMIC_RELAXED;
+constexpr auto kBarrierStartLoadOrder = __ATOMIC_RELAXED;
 #endif
 
 template <int ngpus>
@@ -274,22 +280,13 @@ DINLINE void barrier_at_start(const RankSignals& sg, Signal* self_sg,
                               int rank) {
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
-    // simultaneously write to the corresponding flag of all ranks.
-    // Latency = 1 p2p write
-#if defined(__gfx90a__)
+    // Write our flag to the peer and spin until the peer's flag arrives.
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-                            flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+                            flag, kBarrierStartStoreOrder,
+                            __MEMORY_SCOPE_SYSTEM);
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                  __ATOMIC_ACQUIRE,
-                                  __MEMORY_SCOPE_SYSTEM) < flag);
-#else
-    __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
-                            flag, __ATOMIC_RELAXED, __MEMORY_SCOPE_SYSTEM);
-    // wait until we got true from all ranks
-    while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                  __ATOMIC_RELAXED,
-                                  VLLM_BARRIER_LOAD_SCOPE) < flag);
-#endif
+                                  kBarrierStartLoadOrder,
+                                  kBarrierLoadScope) < flag);
   }
   __syncthreads();
   // use one thread to update flag
@@ -305,8 +302,7 @@ DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->start[blockIdx.x][rank],
                             flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
     while (__scoped_atomic_load_n(&self_sg->start[blockIdx.x][threadIdx.x],
-                                  __ATOMIC_ACQUIRE,
-                                  VLLM_BARRIER_LOAD_SCOPE) < flag);
+                                  __ATOMIC_ACQUIRE, kBarrierLoadScope) < flag);
   }
   __syncthreads();
   if (threadIdx.x == 0) self_sg->_flag[blockIdx.x] = flag;
@@ -327,7 +323,7 @@ DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
     while (
         __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
                                final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               VLLM_BARRIER_LOAD_SCOPE) < flag);
+                               kBarrierLoadScope) < flag);
   }
   if constexpr (!final_sync) __syncthreads();
   // use one thread to update flag
