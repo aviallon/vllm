@@ -196,7 +196,12 @@ def fused_recurrent_gated_delta_rule_fwd(
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
     num_stages = 3
-    num_warps = 1
+    # num_warps=1 places the whole [BV, BK] fp32 recurrent state (4096 floats at
+    # BV=32, BK=128) into 32 threads, i.e. 128 fp32 registers per thread, which
+    # thrashes the VGPR file and halves occupancy on CDNA2. Two warps halves the
+    # per-thread footprint; measured 14.198 -> 9.814 us (-30.9%) on gfx90a,
+    # CUDA-graph timed, through this wrapper.
+    num_warps = 2
 
     o = q.new_empty(NK, *v.shape)
     if inplace_final_state:
