@@ -217,7 +217,13 @@ def triton_scaled_mm(
         is_small_N = N < 8192
         next_power_of_2_M = max(32, triton.next_power_of_2(M))
         if next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+            # Small-M (decode) regime: a BLOCK_SIZE_M of 64 wastes 63 of every
+            # 64 rows when M <= 32, because the kernel still walks the full
+            # tile. BLOCK_SIZE_M=16 measures -20%..-39% on CDNA2/gfx90a through
+            # this wrapper (maxdiff 0 vs BLOCK_SIZE_M=64). This branch is only
+            # reachable for M <= 32, so prefill is unaffected; a global
+            # BLOCK_SIZE_M=16 would regress large-M prefill by ~23%.
+            tile_shape = (16, 64, 256) if is_small_N else (16, 128, 256)
         elif next_power_of_2_M <= 64:
             tile_shape = (64, 64, 256)
         elif next_power_of_2_M <= 128:
