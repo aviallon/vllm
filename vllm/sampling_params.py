@@ -386,6 +386,9 @@ class SamplingParams(
     `RequestOutput`. Raises the interval above the engine-level
     `--stream-interval`. Values below engine setting are clamped up to it.
     The first and final outputs are always emitted immediately."""
+    return_progress: bool = False
+    """Whether to emit prefill-progress outputs while the request is still
+    prefilling. Only consumed by the OpenAI-compatible streaming endpoints."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -484,6 +487,7 @@ class SamplingParams(
         routed_experts_prompt_start: int = 0,
         # Debugging / RL-specific parameters.
         trace_decode_token_ids: list[int] | None = None,
+        return_progress: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Fast path uses a dict comprehension; on failure we iterate once
@@ -551,6 +555,7 @@ class SamplingParams(
             repetition_detection=repetition_detection,
             routed_experts_prompt_start=routed_experts_prompt_start,
             trace_decode_token_ids=trace_decode_token_ids,
+            return_progress=return_progress,
         )
 
     def __post_init__(self) -> None:
