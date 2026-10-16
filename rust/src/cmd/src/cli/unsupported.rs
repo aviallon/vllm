@@ -318,8 +318,10 @@ pub struct EngineUnsupportedArgs {
     pub mm_processor_kwargs: Option<Unsupported>,
 
     /// The size (in GiB) of the multi-modal processor cache.
+    /// No-op in the Rust frontend (no MM cache here yet) — accepted so the
+    /// stock `vllm serve` arg surface keeps working, warned at startup.
     #[arg(long)]
-    pub mm_processor_cache_gb: Option<Unsupported>,
+    pub mm_processor_cache_gb: Option<Noop>,
 
     /// Type of cache to use for the multi-modal preprocessor/mapper.
     #[arg(long)]
@@ -366,8 +368,10 @@ pub struct EngineUnsupportedArgs {
     /// Maximum number of requests that can be in-flight (waiting or running)
     /// at the same time. When the limit is reached, new requests are rejected
     /// with HTTP 503 so the client can retry on another instance.
+    /// Not enforced by the Rust frontend yet — accepted as a no-op (warned at
+    /// startup) instead of failing the launch.
     #[arg(long)]
-    pub max_num_queued_reqs: Option<Unsupported>,
+    pub max_num_queued_reqs: Option<Noop>,
 
     /// Maximum total prompt tokens of requests currently in the prefill phase.
     /// When the limit is reached, new requests are rejected with HTTP 503.
