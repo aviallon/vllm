@@ -1,5 +1,5 @@
 {
-    "triton_version": "3.7.0",
+    "triton_version": "3.8.0",
     "1": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 32,
@@ -25,7 +25,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 2,
         "num_stages": 2,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "8": {
         "BLOCK_SIZE_M": 16,
@@ -34,32 +34,32 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "16": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 2,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 1,
         "num_stages": 2,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "24": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_N": 16,
         "BLOCK_SIZE_K": 256,
         "GROUP_SIZE_M": 1,
-        "num_warps": 4,
+        "num_warps": 1,
         "num_stages": 2,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "32": {
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 4,
-        "num_warps": 2,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0
     },
@@ -67,8 +67,8 @@
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 2,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0
     },
@@ -76,17 +76,17 @@
         "BLOCK_SIZE_M": 16,
         "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 4,
-        "num_warps": 4,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 2,
         "num_stages": 2,
-        "waves_per_eu": 0
+        "waves_per_eu": 2
     },
     "96": {
         "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 32,
+        "BLOCK_SIZE_N": 64,
         "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 4,
-        "num_warps": 2,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0
     },
@@ -107,14 +107,5 @@
         "num_warps": 2,
         "num_stages": 2,
         "waves_per_eu": 2
-    },
-    "512": {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 32,
-        "BLOCK_SIZE_K": 256,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 2,
-        "num_stages": 2,
-        "waves_per_eu": 0
     }
 }
