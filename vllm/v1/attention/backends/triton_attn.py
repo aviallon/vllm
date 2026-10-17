@@ -52,9 +52,14 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
-# Decode batches above this many sequences use NUM_PAR_SOFTMAX_SEGMENTS even
-# when the 32-segment tuning below applies (see its measurement note).
+# Decode batches above this many sequence ROWS use NUM_PAR_SOFTMAX_SEGMENTS
+# even when the 32-segment tuning below applies (see its measurement note).
+# "Rows" is what the 3D kernel launches over (``seq_lens.shape[0]`` ==
+# ``len(seqused_k)``), i.e. the captured batch shape under FULL cudagraphs —
+# deliberately not the live request count.  See the gate in build().
 MAX_SEQS_FOR_32_SEGMENTS = 8
+# Cap for the per-batch segments decision log (the branch proof of the tuning).
+_SEGMENTS_DECISION_LOG_CAP = 12
 
 
 @dataclass
@@ -165,6 +170,8 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             )
         max_num_tokens_3d = self.seq_threshold_3D
         self.segments_32_tuned = False
+        # One-shot state of the per-batch segments decision log (branch proof).
+        self._segments_decision_logged: set[tuple[int, int]] = set()
         if self.max_seqs_64_segments > 0:
             self.num_par_softmax_segments = 64
             # build() reuses this scratch at 16 segments with proportionally more rows.
@@ -188,18 +195,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             # MI210, A/B/A-sandwiched baselines: -24.6% (4 seqs x 9000 KV),
             # -14.4% (8 x 9000), -8.0% (8 x 2048) vs 16 segments; +-5% at
             # few-sequence short KV (one measured exception: 8 x 512, +4.4%).
-            # Gated to <= MAX_SEQS_FOR_32_SEGMENTS sequences because at >= 16
-            # the same config measured +5..7% at 2048 KV and up to +65% at
-            # 512 KV.  bf16 (KVQuantMode.NONE) keeps 16 segments: 32 measured
-            # -22% at 8 x 9000 there.  Only power-of-two counts compile
-            # (reduce_segments uses tl.arange(NUM_SEGMENTS_PER_SEQ); 24 fails).
-            # build() falls back to 16 segments — same scratch viewed with
-            # twice the rows, like the SM120 case above — for larger batches.
+            # Gated to <= MAX_SEQS_FOR_32_SEGMENTS sequence rows because at
+            # >= 16 the same config measured +5..7% at 2048 KV and up to +65%
+            # at 512 KV.  bf16 (KVQuantMode.NONE) keeps 16 segments: 32
+            # measured -22% at 8 x 9000 there.  Only power-of-two counts
+            # compile (reduce_segments uses tl.arange(NUM_SEGMENTS_PER_SEQ);
+            # 24 fails).  build() picks the effective count per batch through
+            # the capture-aware gate documented there, and falls back to 16
+            # segments — same scratch viewed with twice the rows, like the
+            # SM120 case above — outside the measured regime.
             self.num_par_softmax_segments = 32
             self.segments_32_tuned = True
         logger.info(
             "triton_attn 3d segments branch: %s num_par_softmax_segments=%s "
-            "headdim=%s kv_quant=%s",
+            "headdim=%s kv_quant=%s%s",
             (
                 "sm120_64"
                 if self.max_seqs_64_segments > 0
@@ -208,6 +217,20 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             self.num_par_softmax_segments,
             self.headdim,
             getattr(kv_cache_spec, "kv_quant_mode", KVQuantMode.NONE).name,
+            (
+                # Not unconditional: this value is the scratch layout / tuning.
+                # The per-batch EFFECTIVE count is decided in build() and
+                # reported by the decision log — reading this line alone as
+                # "32 segments run everywhere" (or its absence as "the tuning
+                # never fires") is exactly the mistake that log exists to kill.
+                f" (scratch layout; per-batch effective count decided in "
+                f"build(): <= {MAX_SEQS_FOR_32_SEGMENTS} seq rows -> "
+                f"{self.num_par_softmax_segments}, "
+                f"above -> {NUM_PAR_SOFTMAX_SEGMENTS}; see "
+                f"'triton_attn 3d segments decision')"
+                if self.segments_32_tuned
+                else ""
+            ),
         )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
@@ -320,23 +343,61 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
                 -1, self.num_heads_q, segments
             )
-        elif self.segments_32_tuned and num_reqs > MAX_SEQS_FOR_32_SEGMENTS:
-            # The 32-segment tuning is measured for few-sequence batches;
-            # larger ones fall back to 16 segments on the same scratch viewed
-            # with twice the rows (identical mechanism to the SM120 case
-            # above; the kernels derive the segment strides from
-            # NUM_SEGMENTS_PER_SEQ, so the view is purely host-side layout).
-            segments = NUM_PAR_SOFTMAX_SEGMENTS
-            attn_metadata.num_par_softmax_segments = segments
-            attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
-                -1, self.num_heads_q, segments, self.softmax_segm_output.shape[-1]
+        elif self.segments_32_tuned:
+            # CAPTURE-AWARE GATE for the 32-segment tuning (frontier measured in
+            # the B2-3D bench, see the note in __init__): 32 segments up to
+            # MAX_SEQS_FOR_32_SEGMENTS sequence rows, 16 above.
+            #
+            # The criterion is the number of sequence ROWS the 3D kernel
+            # iterates — ``seq_lens.shape[0]``, exactly the ``num_seqs`` of the
+            # launch (``seqused_k``) — and deliberately NOT the live request
+            # count.  Under FULL cudagraphs (this workload's decode mode) the
+            # launch config (grid + the ``NUM_SEGMENTS_PER_SEQ`` constexpr) is
+            # baked per captured graph, so the decision must be a pure function
+            # of the captured batch SHAPE: a per-replay criterion (live request
+            # count, padding mask) would decide something the graph cannot
+            # execute, and the metadata would then disagree with what runs.
+            # The row count IS that shape (under eager it is the live count
+            # itself, because there is no padding).  The compromise, stated
+            # rather than hidden:
+            #   * it counts the CUDA-graph padding rows, so it is an upper bound
+            #     of the live request count — exact below 32 rows in
+            #     interactivity mode (capture sizes 1..32), off by less than one
+            #     capture bucket above.  ``rows <= 8`` always implies
+            #     ``live <= 8`` (padding only grows the row count), and every
+            #     capture-size set that covers 1..8 exactly (both patterns in
+            #     use do: 1..32 in interactivity mode, {1,2,4,8,...} otherwise)
+            #     also keeps ``live <= 8 => rows <= 8``, so the measured
+            #     frontier (32 segments wins at 4-8 long-KV sequences, loses at
+            #     >= 16 and in bf16) is preserved — a hypothetical gapped set
+            #     would only skip the tuning for live 5-8 (conservative, perf
+            #     only);
+            #   * a KV-length criterion — the other half of that frontier — is
+            #     not readable at capture time: ``seq_lens`` is filled with 1
+            #     there (see ``build_for_cudagraph_capture``), so a max_seqlen_k
+            #     gate would be silently wrong.
+            num_seq_rows = seq_lens.shape[0]
+            segments = (
+                NUM_PAR_SOFTMAX_SEGMENTS
+                if num_seq_rows > MAX_SEQS_FOR_32_SEGMENTS
+                else self.num_par_softmax_segments
             )
-            attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
-                -1, self.num_heads_q, segments
-            )
-            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
-                -1, self.num_heads_q, segments
-            )
+            self._log_segments_decision(num_seq_rows, segments, max_query_len)
+            if segments != self.num_par_softmax_segments:
+                # Outside the measured regime: 16 segments on the same scratch
+                # viewed with twice the rows (identical mechanism to the SM120
+                # case above; the kernels derive the segment strides from
+                # NUM_SEGMENTS_PER_SEQ, so the view is purely host-side layout).
+                attn_metadata.num_par_softmax_segments = segments
+                attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
+                    -1, self.num_heads_q, segments, self.softmax_segm_output.shape[-1]
+                )
+                attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
+                    -1, self.num_heads_q, segments
+                )
+                attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
+                    -1, self.num_heads_q, segments
+                )
 
         mm_ranges = common_attn_metadata.mm_req_doc_ranges
         if mm_ranges is not None:
@@ -360,6 +421,59 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
 
     def update_draft_decode_metadata(self, _metadata: TritonAttentionMetadata) -> None:
         pass
+
+    def _log_segments_decision(
+        self, num_seq_rows: int, segments: int, max_query_len: int
+    ) -> None:
+        """One-shot log of the per-batch segments decision (branch proof).
+
+        This is what makes ``segments=32`` DECIDABLE for a real decode batch:
+        the launch log only fires when a kernel is really launched (eager
+        batches and graph capture), so under FULL cudagraph replay — where the
+        graph replays a launch baked at capture — it never speaks for the live
+        batch.  ``build()`` does run for every step, capture and replay alike,
+        so the decision taken here is the one the graph was captured with
+        (same batch shape ⇒ same decision; that invariance is the contract of
+        the gate above).
+
+        Logged only where the decision is load-bearing: ``use_3d`` launches the
+        3D kernel only for decode (``max_seqlen_q <= 1``) batches of at most
+        ``seq_threshold_3D`` rows (see ``unified_attention``), so a prefill or
+        oversized batch can neither claim a launch that does not happen nor
+        consume a proof slot.
+
+        Quiet in production and non-starving: every (rows -> segments) pair is
+        logged at most once per builder; the tuned regime (rows <= gate) and
+        the first fallback row are RESERVED slots that always log regardless of
+        the cap; other row counts log while the cap lasts.  Bounded per
+        builder: <= gate + 2 reserved + _SEGMENTS_DECISION_LOG_CAP.
+        """
+        if max_query_len > 1 or num_seq_rows > self.seq_threshold_3D:
+            return
+        key = (num_seq_rows, segments)
+        if key in self._segments_decision_logged:
+            return
+        reserved = num_seq_rows <= MAX_SEQS_FOR_32_SEGMENTS + 1
+        if (
+            not reserved
+            and len(self._segments_decision_logged) >= _SEGMENTS_DECISION_LOG_CAP
+        ):
+            return
+        self._segments_decision_logged.add(key)
+        logger.info(
+            "triton_attn 3d segments decision: num_seq_rows=%s -> segments=%s "
+            "(%s; gate <= %s seq rows; rows = batch shape the 3D kernel "
+            "launches over — captured graph shape under FULL cudagraphs, "
+            "live request count under eager)",
+            num_seq_rows,
+            segments,
+            (
+                "tuned seg32_int8_head256"
+                if segments == self.num_par_softmax_segments
+                else "fallback to shipping 16"
+            ),
+            MAX_SEQS_FOR_32_SEGMENTS,
+        )
 
 
 class TritonAttentionBackend(AttentionBackend):
