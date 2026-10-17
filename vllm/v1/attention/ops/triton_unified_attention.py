@@ -855,31 +855,41 @@ def _log_tile_config_once(
     max_seqlen_q: int,
     num_seqs: int,
     kv_quant_mode: KVQuantMode,
+    ws_default: tuple[int, int] | None = (4, 2),
 ) -> None:
     """One-shot-per-config log of the effective attention launch knobs.
 
-    ``num_warps``/``num_stages`` of ``None`` mean "Triton launcher default",
-    measured as 4/2 for this kernel (the B2 bench proved the implicit and the
-    explicit 4/2 launches compile to the identical binary); the log prints the
-    effective values with a ``(default)`` marker so a defaulted knob is never
-    read as an explicit one.
+    ``num_warps``/``num_stages`` of ``None`` mean "Triton launcher default";
+    for ``kernel_unified_attention`` that default was measured as 4/2 (the B2
+    bench proved the implicit and the explicit 4/2 launches compile to the
+    identical binary), so the log prints the effective values with a
+    ``(default)`` marker.  Pass ``ws_default=None`` for delegated kernels whose
+    launcher default is not measured — the value is then left out rather than
+    asserted.
     """
     global _TILE_CONFIG_LOGGED
     key = (
         path,
         branch,
         block_m,
+        block_q,
         tile_size,
         num_warps,
         num_stages,
         num_segments,
+        head_size,
+        num_queries_per_kv,
         kv_quant_mode,
     )
     if key in _TILE_CONFIG_LOGGED or len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP:
         return
     _TILE_CONFIG_LOGGED.add(key)
-    warps = 4 if num_warps is None else num_warps
-    stages = 2 if num_stages is None else num_stages
+
+    def _ws(v: int | None, default: int | None) -> str:
+        if v is not None:
+            return str(v)
+        return f"{default}(default)" if default is not None else "(default)"
+
     logger.info(
         "triton_attn attention launch: path=%s branch=%s BLOCK_M=%s BLOCK_Q=%s "
         "TILE=%s warps=%s stages=%s segments=%s head_size=%s nq_per_kv=%s "
@@ -889,8 +899,8 @@ def _log_tile_config_once(
         block_m,
         block_q,
         tile_size if tile_size is not None else "delegate",
-        f"{warps}{'' if num_warps is not None else '(default)'}",
-        f"{stages}{'' if num_stages is not None else '(default)'}",
+        _ws(num_warps, ws_default[0] if ws_default else None),
+        _ws(num_stages, ws_default[1] if ws_default else None),
         num_segments,
         head_size,
         num_queries_per_kv,
@@ -971,26 +981,48 @@ def unified_attention(
         # if this line is what production shows, every tile-config change in
         # ``unified_attention`` is dead code for that workload.  The delegate
         # picks its own knobs (see ``int4_per_token_head._launch_packed_attn``);
-        # BLOCK_M/BLOCK_Q below mirror its formula.
+        # BLOCK_M/BLOCK_Q and the tile size below mirror its formulas, and the
+        # path/segment count mirror ITS OWN use_3d predicate — the delegate
+        # launches 2D with one segment whenever that predicate is false, so
+        # reporting the raw ``num_par_softmax_segments`` here would misreport
+        # exactly what this log exists to disambiguate.
+        _int4_num_seqs = len(seqused_k)
+        _int4_nq_per_kv = q.shape[1] // k.shape[2]
         _int4_block_m = (
             16
-            if q.shape[1] // k.shape[2] <= 16
-            else triton.next_power_of_2(q.shape[1] // k.shape[2])
+            if _int4_nq_per_kv <= 16
+            else triton.next_power_of_2(_int4_nq_per_kv)
+        )
+        _int4_use_3d = not (
+            seq_threshold_3D is None
+            or num_par_softmax_segments is None
+            or softmax_segm_output is None
+            or softmax_segm_max is None
+            or softmax_segm_expsum is None
+            or max_seqlen_q > 1
+            or _int4_num_seqs > seq_threshold_3D
+            or is_batch_invariant
         )
         _log_tile_config_once(
-            path="int4_delegate",
+            path="int4_3d" if _int4_use_3d else "int4_2d",
             branch="int4_delegate",
             block_m=_int4_block_m,
-            block_q=_int4_block_m // (q.shape[1] // k.shape[2]),
-            tile_size=None,
+            block_q=_int4_block_m // _int4_nq_per_kv,
+            tile_size=_get_tile_size(
+                q.shape[2],
+                1 + window_size[0] if window_size[0] >= 0 else 0,
+                q.element_size(),
+                is_prefill=not _int4_use_3d,
+            ),
             num_warps=None,
             num_stages=None,
-            num_segments=num_par_softmax_segments,
+            num_segments=num_par_softmax_segments if _int4_use_3d else 1,
             head_size=q.shape[2],
-            num_queries_per_kv=q.shape[1] // k.shape[2],
+            num_queries_per_kv=_int4_nq_per_kv,
             max_seqlen_q=max_seqlen_q,
-            num_seqs=len(seqused_k),
+            num_seqs=_int4_num_seqs,
             kv_quant_mode=kv_quant_mode,
+            ws_default=None,
         )
         unified_attention_int4(
             q=q,
