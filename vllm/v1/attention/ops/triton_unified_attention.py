@@ -786,6 +786,26 @@ def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     return sliding_window == 1024 and head_size in (128, 256)
 
 
+def _large_head_tuning_supported() -> bool:
+    """Whether the tuned large-head launch config applies to this GPU.
+
+    The config (TILE_SIZE_PREFILL=128, BLOCK_M=32, 8 warps) is measured
+    ~2x on B200 (sm100) for head_dim=256 prefill.  gfx90a (MI200) has the
+    same shape regime and now gets the same config; its GPU measurement is
+    still pending.  Compile-level register/scratch evidence (aragorn
+    ``research/triton-attn-spill-gfx90a-2026-10-17.json``) shows this config
+    spills on gfx90a for BOTH KV variants, so do not assume the B200 factor
+    transfers; spill-free candidates are measured in the same report.
+    """
+    if current_platform.is_device_capability_family(100):
+        return True
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx90a
+
+        return on_gfx90a()
+    return False
+
+
 def _get_tile_size(
     head_size: int,
     sliding_window: int,
@@ -946,12 +966,15 @@ def unified_attention(
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
-    # more query rows per block + 8 warps is ~2x faster on B200.
+    # more query rows per block + 8 warps is ~2x faster on B200 (sm100); the
+    # same config is now enabled on gfx90a (see
+    # ``_large_head_tuning_supported``). Decode (max_seqlen_q == 1) is
+    # excluded by the gate below and keeps its tile size untouched.
     tuned_large_head = (
         head_size == 256
         and max_seqlen_q > 1
         and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+        and _large_head_tuning_supported()
     )
     if tuned_large_head:
         BLOCK_M = 32
