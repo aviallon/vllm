@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any, NamedTuple
 
+import os
+
 import torch
 import torch._inductor.pattern_matcher as pm
 from torch import fx
@@ -827,12 +829,18 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
 
             # Fuse fused_add_rms_norm + dynamic per-token int8 quant
-            FusedAddRMSNormDynamicQuantPattern(epsilon, torch.int8).register(
-                self.patterns
-            )
+            # (gated OFF by default: the int8 matcher's auto_functionalized
+            # unpack assumes the fp8 op arity and crashes at trace time on
+            # torch 2.13 - it took down a bf16 model's engine init on
+            # 2026-10-17. The fusions only benefit W8A8 models anyway.
+            # Opt in with VLLM_FUSE_INT8_QUANT=1 after the arity is fixed.)
+            if os.getenv("VLLM_FUSE_INT8_QUANT", "0") == "1":
+                FusedAddRMSNormDynamicQuantPattern(epsilon, torch.int8).register(
+                    self.patterns
+                )
 
-            # Fuse rms_norm + dynamic per-token int8 quant
-            RMSNormDynamicQuantPattern(epsilon, torch.int8).register(self.patterns)
+                # Fuse rms_norm + dynamic per-token int8 quant
+                RMSNormDynamicQuantPattern(epsilon, torch.int8).register(self.patterns)
 
             # Only register group quant patterns on CUDA/ROCm where the C++ op exists
             for group_shape in [GroupShape(1, 128), GroupShape(1, 64)]:

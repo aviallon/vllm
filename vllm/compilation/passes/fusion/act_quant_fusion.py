@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from typing import Any
 
 import torch
@@ -338,7 +339,12 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
 
         self.register(SiluMulFp8StaticQuantPattern())
 
-        if silu_and_mul_per_token_quant_int8_op is not None:
+        if silu_and_mul_per_token_quant_int8_op is not None and os.getenv(
+            "VLLM_FUSE_INT8_QUANT", "0"
+        ) == "1":
+            # Gated OFF by default (2026-10-17): see the note in
+            # rms_quant_fusion.py - the int8 matcher arity crashes on
+            # torch 2.13 at trace time. W8A8-only benefit.
             self.register(SiluMulInt8QuantPattern())
 
         if silu_and_mul_nvfp4_quant_supported:
