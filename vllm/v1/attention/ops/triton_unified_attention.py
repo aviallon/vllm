@@ -32,9 +32,15 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
 
-# One-shot diagnostic (2026-10-17): log which prefill tile config fires, so a
-# branch that silently never triggers cannot be mistaken for a no-op win.
-_TILE_CONFIG_LOGGED = False
+# One-shot diagnostic (2026-10-17, extended the same day): log the effective
+# tile config AND the executed path ("2d" / "3d" / "int4_delegate") of every
+# attention launch.  The earlier version logged only the prefill tile branch,
+# after the tile selection, so a path that returns before that selection (the
+# INT4 delegation) — or a launch whose knobs come from somewhere else — could
+# not be told apart from a branch that silently never triggers.  Once per
+# distinct (path, config) combination, capped, to stay quiet in production.
+_TILE_CONFIG_LOGGED: set = set()
+_TILE_CONFIG_LOG_CAP = 8
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -834,6 +840,66 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
+def _log_tile_config_once(
+    *,
+    path: str,
+    branch: str,
+    block_m: int,
+    block_q: int,
+    tile_size: int | None,
+    num_warps: int | None,
+    num_stages: int | None,
+    num_segments: int | None,
+    head_size: int,
+    num_queries_per_kv: int,
+    max_seqlen_q: int,
+    num_seqs: int,
+    kv_quant_mode: KVQuantMode,
+) -> None:
+    """One-shot-per-config log of the effective attention launch knobs.
+
+    ``num_warps``/``num_stages`` of ``None`` mean "Triton launcher default",
+    measured as 4/2 for this kernel (the B2 bench proved the implicit and the
+    explicit 4/2 launches compile to the identical binary); the log prints the
+    effective values with a ``(default)`` marker so a defaulted knob is never
+    read as an explicit one.
+    """
+    global _TILE_CONFIG_LOGGED
+    key = (
+        path,
+        branch,
+        block_m,
+        tile_size,
+        num_warps,
+        num_stages,
+        num_segments,
+        kv_quant_mode,
+    )
+    if key in _TILE_CONFIG_LOGGED or len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP:
+        return
+    _TILE_CONFIG_LOGGED.add(key)
+    warps = 4 if num_warps is None else num_warps
+    stages = 2 if num_stages is None else num_stages
+    logger.info(
+        "triton_attn attention launch: path=%s branch=%s BLOCK_M=%s BLOCK_Q=%s "
+        "TILE=%s warps=%s stages=%s segments=%s head_size=%s nq_per_kv=%s "
+        "max_seqlen_q=%s num_seqs=%s kv_quant=%s",
+        path,
+        branch,
+        block_m,
+        block_q,
+        tile_size if tile_size is not None else "delegate",
+        f"{warps}{'' if num_warps is not None else '(default)'}",
+        f"{stages}{'' if num_stages is not None else '(default)'}",
+        num_segments,
+        head_size,
+        num_queries_per_kv,
+        max_seqlen_q,
+        num_seqs,
+        kv_quant_mode.name,
+    )
+
+
 def unified_attention(
     q,
     k,
@@ -900,6 +966,32 @@ def unified_attention(
 
         if sinks is not None:
             assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+        # This delegation RETURNS before the tile selection below, so its
+        # launches never see the prefill tile branches.  Log it explicitly:
+        # if this line is what production shows, every tile-config change in
+        # ``unified_attention`` is dead code for that workload.  The delegate
+        # picks its own knobs (see ``int4_per_token_head._launch_packed_attn``);
+        # BLOCK_M/BLOCK_Q below mirror its formula.
+        _int4_block_m = (
+            16
+            if q.shape[1] // k.shape[2] <= 16
+            else triton.next_power_of_2(q.shape[1] // k.shape[2])
+        )
+        _log_tile_config_once(
+            path="int4_delegate",
+            branch="int4_delegate",
+            block_m=_int4_block_m,
+            block_q=_int4_block_m // (q.shape[1] // k.shape[2]),
+            tile_size=None,
+            num_warps=None,
+            num_stages=None,
+            num_segments=num_par_softmax_segments,
+            head_size=q.shape[2],
+            num_queries_per_kv=q.shape[1] // k.shape[2],
+            max_seqlen_q=max_seqlen_q,
+            num_seqs=len(seqused_k),
+            kv_quant_mode=kv_quant_mode,
+        )
         unified_attention_int4(
             q=q,
             k_cache=k,
@@ -972,6 +1064,8 @@ def unified_attention(
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
+    # Self-description for the one-shot launch log below.
+    tile_config_branch = "shipping"
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
@@ -991,6 +1085,7 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+        tile_config_branch = "tuned_large_head"
     elif (
         head_size == 256
         and max_seqlen_q > 1
@@ -1019,31 +1114,7 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 4
         launch_num_stages = 2
-
-    global _TILE_CONFIG_LOGGED
-    if not _TILE_CONFIG_LOGGED:
-        _TILE_CONFIG_LOGGED = True
-        branch = (
-            "tuned_large_head"
-            if tuned_large_head
-            else (
-                "c3_int8"
-                if BLOCK_M == 32 and launch_num_warps == 4
-                else "shipping"
-            )
-        )
-        logger.info(
-            "triton_attn prefill tile config: branch=%s BLOCK_M=%s BLOCK_Q=%s "
-            "warps=%s stages=%s head_size=%s nq_per_kv=%s max_seqlen_q=%s",
-            branch,
-            BLOCK_M,
-            BLOCK_Q,
-            launch_num_warps,
-            launch_num_stages,
-            head_size,
-            num_queries_per_kv,
-            max_seqlen_q,
-        )
+        tile_config_branch = "c3_int8"
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1177,6 +1248,25 @@ def unified_attention(
         launch_kwargs["num_warps"] = launch_num_warps
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
+
+    # Logged here — not at the tile selection — so the entry names the path
+    # that is really launched ("2d"/"3d") with the knobs that really reach
+    # the JIT function.
+    _log_tile_config_once(
+        path="3d" if use_3d else "2d",
+        branch=tile_config_branch,
+        block_m=BLOCK_M,
+        block_q=BLOCK_Q,
+        tile_size=tile_size,
+        num_warps=launch_num_warps,
+        num_stages=launch_num_stages,
+        num_segments=num_segments,
+        head_size=head_size,
+        num_queries_per_kv=num_queries_per_kv,
+        max_seqlen_q=max_seqlen_q,
+        num_seqs=num_seqs,
+        kv_quant_mode=kv_quant_mode,
+    )
 
     kernel_unified_attention[grid](
         output_ptr=out,
