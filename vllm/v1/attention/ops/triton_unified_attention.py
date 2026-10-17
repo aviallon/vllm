@@ -790,20 +790,26 @@ def _large_head_tuning_supported() -> bool:
     """Whether the tuned large-head launch config applies to this GPU.
 
     The config (TILE_SIZE_PREFILL=128, BLOCK_M=32, 8 warps) is measured
-    ~2x on B200 (sm100) for head_dim=256 prefill.  gfx90a (MI200) has the
-    same shape regime and now gets the same config; its GPU measurement is
-    still pending.  Compile-level register/scratch evidence (aragorn
-    ``research/triton-attn-spill-gfx90a-2026-10-17.json``) shows this config
-    spills on gfx90a for BOTH KV variants, so do not assume the B200 factor
-    transfers; spill-free candidates are measured in the same report.
-    """
-    if current_platform.is_device_capability_family(100):
-        return True
-    if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx90a
+    ~2x on B200 (sm100) for head_dim=256 prefill.
 
-        return on_gfx90a()
-    return False
+    gfx90a (MI200) is deliberately NOT covered, even though it has the
+    same shape regime.  The B2 GPU bench (aragorn
+    ``research/gfx90a-triton-attn-reader-tile-config-bench-b2-2026-10-17.md``,
+    MI210, real prefill shapes B=8x9000 and B=4x9000, 16 q heads x 256,
+    GQA=8) measured the ported config:
+
+    - 8.6x-11x SLOWER than the shipping config in int8_per_token_head KV
+      mode (it spills: 1316B/2912B compile-time scratch, 2348B at
+      runtime, vs 0B for the shipping config);
+    - unable to even LAUNCH in bf16 (KVQuantMode.NONE): the binary needs
+      131072 B of LDS against gfx90a's 65536 B limit -> OutOfResources.
+
+    So enabling it on gfx90a would not merely fail to speed prefill up:
+    it would slow int8 prefill down ~10x and break bf16 prefill outright.
+    The config measured good on gfx90a (head_dim=256, int8 prefill only)
+    is the conditional BLOCK_M=32 variant in ``unified_attention`` below.
+    """
+    return current_platform.is_device_capability_family(100)
 
 
 def _get_tile_size(
@@ -966,9 +972,9 @@ def unified_attention(
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
-    # more query rows per block + 8 warps is ~2x faster on B200 (sm100); the
-    # same config is now enabled on gfx90a (see
-    # ``_large_head_tuning_supported``). Decode (max_seqlen_q == 1) is
+    # more query rows per block + 8 warps is ~2x faster on B200 (sm100).
+    # gfx90a is excluded (see ``_large_head_tuning_supported``: the config
+    # spills there and cannot launch in bf16). Decode (max_seqlen_q == 1) is
     # excluded by the gate below and keeps its tile size untouched.
     tuned_large_head = (
         head_size == 256
@@ -980,6 +986,34 @@ def unified_attention(
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
+        launch_num_stages = 2
+    elif (
+        head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+    ):
+        # C3 from the B2 gfx90a reader bench (aragorn
+        # ``research/gfx90a-triton-attn-reader-tile-config-bench-b2-2026-10-17.md``):
+        # TILE_SIZE_PREFILL stays 32, BLOCK_M 16->32, defaults 4 warps /
+        # 2 stages.  Measured -26% on the reader kernel for head_dim=256
+        # int8_per_token_head prefill (B=8x9000 and B=4x9000, two
+        # concordant blocks, spill-free, outputs ~1 ulp vs the shipping
+        # config).  This is a reader-kernel measurement only: it promises
+        # NO end-to-end prefill gain.
+        #
+        # Conditioned on KV mode 2 because in bf16 (KVQuantMode.NONE) the
+        # same config measured +5..10% SLOWER there, so bf16 keeps the
+        # shipping BLOCK_M=16.  ``num_queries_per_kv <= 16`` matches the
+        # measured regime (shipping BLOCK_M is 16 exactly then; for
+        # num_queries_per_kv > 16 the default BLOCK_M already exceeds 32
+        # and forcing 32 would even break BLOCK_Q).  BLOCK_Q (= BLOCK_M //
+        # num_queries_per_kv) and the grid's first dimension
+        # (total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs, computed
+        # below) both derive from BLOCK_M and follow automatically.
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 4
         launch_num_stages = 2
 
     # Ideally we would launch with kernel with:
