@@ -52,6 +52,9 @@ logger = init_logger(__name__)
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+# Decode batches above this many sequences use NUM_PAR_SOFTMAX_SEGMENTS even
+# when the 32-segment tuning below applies (see its measurement note).
+MAX_SEQS_FOR_32_SEGMENTS = 8
 
 
 @dataclass
@@ -161,6 +164,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                 NUM_PAR_SOFTMAX_SEGMENTS * self.num_heads_kv
             )
         max_num_tokens_3d = self.seq_threshold_3D
+        self.segments_32_tuned = False
         if self.max_seqs_64_segments > 0:
             self.num_par_softmax_segments = 64
             # build() reuses this scratch at 16 segments with proportionally more rows.
@@ -171,6 +175,40 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
                     self.num_par_softmax_segments // NUM_PAR_SOFTMAX_SEGMENTS,
                 ),
             )
+        elif (
+            self.headdim == 256
+            and getattr(kv_cache_spec, "kv_quant_mode", KVQuantMode.NONE)
+            == KVQuantMode.INT8_PER_TOKEN_HEAD
+        ):
+            # B2-3D gfx90a reader bench (aragorn
+            # ``research/gfx90a-triton-attn-3d-tile-config-bench-b2-3d-2026-10-17.md``):
+            # 32 tiled-softmax segments instead of 16 on the 3D decode path
+            # (``kernel_unified_attention`` IS_3D + ``reduce_segments``, timed
+            # together), for head_dim=256 int8_per_token_head.  Measured on
+            # MI210, A/B/A-sandwiched baselines: -24.6% (4 seqs x 9000 KV),
+            # -14.4% (8 x 9000), -8.0% (8 x 2048) vs 16 segments; +-5% at
+            # few-sequence short KV (one measured exception: 8 x 512, +4.4%).
+            # Gated to <= MAX_SEQS_FOR_32_SEGMENTS sequences because at >= 16
+            # the same config measured +5..7% at 2048 KV and up to +65% at
+            # 512 KV.  bf16 (KVQuantMode.NONE) keeps 16 segments: 32 measured
+            # -22% at 8 x 9000 there.  Only power-of-two counts compile
+            # (reduce_segments uses tl.arange(NUM_SEGMENTS_PER_SEQ); 24 fails).
+            # build() falls back to 16 segments — same scratch viewed with
+            # twice the rows, like the SM120 case above — for larger batches.
+            self.num_par_softmax_segments = 32
+            self.segments_32_tuned = True
+        logger.info(
+            "triton_attn 3d segments branch: %s num_par_softmax_segments=%s "
+            "headdim=%s kv_quant=%s",
+            (
+                "sm120_64"
+                if self.max_seqs_64_segments > 0
+                else ("seg32_int8_head256" if self.segments_32_tuned else "shipping16")
+            ),
+            self.num_par_softmax_segments,
+            self.headdim,
+            getattr(kv_cache_spec, "kv_quant_mode", KVQuantMode.NONE).name,
+        )
         headdim_padded = next_power_of_2(self.headdim)
         self.softmax_segm_output = torch.empty(
             (
@@ -271,6 +309,23 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         ):
             # The 16-segment grid fills the SMs, or the 64-segment rows cannot
             # hold every query token: same scratch, 16-segment layout.
+            segments = NUM_PAR_SOFTMAX_SEGMENTS
+            attn_metadata.num_par_softmax_segments = segments
+            attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
+                -1, self.num_heads_q, segments, self.softmax_segm_output.shape[-1]
+            )
+            attn_metadata.softmax_segm_max = self.softmax_segm_max.view(
+                -1, self.num_heads_q, segments
+            )
+            attn_metadata.softmax_segm_expsum = self.softmax_segm_expsum.view(
+                -1, self.num_heads_q, segments
+            )
+        elif self.segments_32_tuned and num_reqs > MAX_SEQS_FOR_32_SEGMENTS:
+            # The 32-segment tuning is measured for few-sequence batches;
+            # larger ones fall back to 16 segments on the same scratch viewed
+            # with twice the rows (identical mechanism to the SM120 case
+            # above; the kernels derive the segment strides from
+            # NUM_SEGMENTS_PER_SEQ, so the view is purely host-side layout).
             segments = NUM_PAR_SOFTMAX_SEGMENTS
             attn_metadata.num_par_softmax_segments = segments
             attn_metadata.softmax_segm_output = self.softmax_segm_output.view(
