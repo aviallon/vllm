@@ -26,10 +26,14 @@ from vllm.model_executor.layers.fusion.relu2_fp8_quant import (
     relu_squared_static_fp8_quant,
 )
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    silu_and_mul_per_token_quant_int8,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
@@ -98,6 +102,22 @@ def _silu_and_mul_fp8_dynamic_128(
     return _silu_and_mul_fp8_dynamic_block(x, linear, 128, kFp8Dynamic128Sym)
 
 
+def _silu_and_mul_int8_dynamic(
+    x: torch.Tensor, linear: LinearBase
+) -> QuantizedActivation:
+    """SiluAndMul + int8 dynamic per-token quantization."""
+    d = x.shape[-1] // 2
+    out_shape = x.shape[:-1] + (d,)
+    result, scales = silu_and_mul_per_token_quant_int8(x)
+    return QuantizedActivation(
+        data=result,
+        scale=scales,
+        orig_dtype=x.dtype,
+        orig_shape=out_shape,
+        quant_key=kInt8DynamicTokenSym,
+    )
+
+
 def _silu_and_mul_nvfp4_dynamic(
     x: torch.Tensor, linear: LinearBase
 ) -> QuantizedActivation:
@@ -148,6 +168,7 @@ def _silu_and_mul_nvfp4_dynamic(
 # Add a row for each supported manual producer.
 _FUSED_ACT_QUANT: dict[tuple[type, QuantKey], Callable] = {
     (SiluAndMul, kFp8StaticTensorSym): _silu_and_mul_fp8_static,
+    (SiluAndMul, kInt8DynamicTokenSym): _silu_and_mul_int8_dynamic,
 }
 
 

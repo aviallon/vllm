@@ -21,6 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
@@ -42,6 +43,9 @@ QUANT_OPS: dict[QuantKey, OpOverload] = {
 if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+
+if hasattr(torch.ops._C, "dynamic_scaled_int8_quant"):
+    QUANT_OPS[kInt8DynamicTokenSym] = torch.ops._C.dynamic_scaled_int8_quant.default  # noqa: E501
 
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
@@ -522,6 +526,78 @@ class MatcherQuantFP8(MatcherCustomOp):
             return [input, self.empty_f32(1, 1)]
 
         return [input]
+
+
+class MatcherQuantInt8(MatcherCustomOp):
+    """Matcher for dynamic per-token symmetric int8 quantization.
+
+    Mirrors MatcherQuantFP8's dynamic per-token branch, but traces the int8
+    op's own call convention (``azp`` argument instead of ``scale_ub``). The
+    scale convention is the consumer's: one float32 scale per token,
+    absmax / 127 (see ops.scaled_int8_quant / per_token_quant_int8).
+    """
+
+    def __init__(
+        self,
+        quant_key: QuantKey,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is None:
+            enabled = (
+                not current_platform.is_xpu()
+                and hasattr(torch.ops._C, "dynamic_scaled_int8_quant")
+            )
+
+        super().__init__(enabled)
+        self.quant_key = quant_key
+
+        assert quant_key in QUANT_OPS, (
+            f"unsupported quantization scheme {quant_key}"
+        )
+        self.QUANT_OP = QUANT_OPS[quant_key]
+
+        assert quant_key.dtype == torch.int8, "Only int8 supported"
+        assert quant_key.scale2 is None
+        assert not quant_key.scale.static
+        assert quant_key.scale.group_shape.is_per_token()
+
+    def forward_custom(
+        self,
+        input: torch.Tensor,
+        scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert scale is None
+        # Mirror the shipping ops.scaled_int8_quant call site: empty_like for
+        # the int8 result, a flattened [num_tokens, 1] float32 scale tensor.
+        result = torch.empty_like(input, dtype=self.quant_key.dtype)
+        scale = self.make_scale(input)
+        _, result, scale = auto_functionalized(
+            self.QUANT_OP, result=result, input=input, scale=scale, azp=None
+        )
+        return result, scale
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.model_executor.layers.quantization.utils.int8_utils import (
+            per_token_quant_int8,
+        )
+
+        return per_token_quant_int8(input)  # type: ignore[no-any-return]
+
+    def make_scale(self, input: torch.Tensor, transposed: bool = False) -> torch.Tensor:
+        assert not transposed
+        # One float32 scale per token, flattened like the shipping
+        # ops.scaled_int8_quant call site.
+        num_tokens = input.numel() // input.shape[-1]
+        return torch.empty(
+            (num_tokens, 1), device=input.device, dtype=torch.float32
+        )
+
+    def inputs(self) -> list[torch.Tensor]:
+        return [self.empty(5, 16)]
 
 
 class MatcherSiluAndMul(MatcherCustomOp):

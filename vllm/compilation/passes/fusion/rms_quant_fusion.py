@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
     kStaticTensorScale,
 )
@@ -33,6 +34,7 @@ from ..inductor_pass import enable_fake_mode
 from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 from .matcher_utils import (
     MatcherQuantFP8,
+    MatcherQuantInt8,
 )
 
 logger = init_logger(__name__)
@@ -163,6 +165,8 @@ QUANT_OPS: dict[QuantKey, OpOverload] = {
 if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+if hasattr(torch.ops._C, "dynamic_scaled_int8_quant"):
+    QUANT_OPS[kInt8DynamicTokenSym] = torch.ops._C.dynamic_scaled_int8_quant.default  # noqa: E501
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out
 
@@ -196,6 +200,15 @@ FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
     FusedRMSQuantKey(
         kFp8DynamicTokenSym, True
     ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    # The fused layernorm+quant kernel accepts int8 output (ScalarType::Char)
+    # with the same dynamic per-token scale convention as
+    # dynamic_scaled_int8_quant (absmax / 127, one float32 scale per token).
+    FusedRMSQuantKey(
+        kInt8DynamicTokenSym, False
+    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    FusedRMSQuantKey(
+        kInt8DynamicTokenSym, True
+    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
 }
 # rms_norm_per_block_quant is CUDA-only; guard it like per_token_group_fp8_quant above.
 if hasattr(torch.ops._C, "rms_norm_per_block_quant"):
@@ -223,11 +236,15 @@ class RMSNormQuantPattern:
         assert key in FUSED_OPS, f"unsupported fused rmsnorm+quant op for {key}"
         self.FUSED_OP = FUSED_OPS[key]
 
-        self.quant_matcher = MatcherQuantFP8(
-            key.quant,
-            has_col_major_scales=has_col_major_scales,
-            is_e8m0=is_e8m0,
-            is_tma_aligned=is_tma_aligned,
+        self.quant_matcher = (
+            MatcherQuantInt8(key.quant)
+            if key.quant.dtype == torch.int8
+            else MatcherQuantFP8(
+                key.quant,
+                has_col_major_scales=has_col_major_scales,
+                is_e8m0=is_e8m0,
+                is_tma_aligned=is_tma_aligned,
+            )
         )
 
 
@@ -808,6 +825,14 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
 
             # Fuse rms_norm + dynamic per-token fp8 quant
             RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
+
+            # Fuse fused_add_rms_norm + dynamic per-token int8 quant
+            FusedAddRMSNormDynamicQuantPattern(epsilon, torch.int8).register(
+                self.patterns
+            )
+
+            # Fuse rms_norm + dynamic per-token int8 quant
+            RMSNormDynamicQuantPattern(epsilon, torch.int8).register(self.patterns)
 
             # Only register group quant patterns on CUDA/ROCm where the C++ op exists
             for group_shape in [GroupShape(1, 128), GroupShape(1, 64)]:
