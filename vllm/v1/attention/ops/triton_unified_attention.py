@@ -31,6 +31,10 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+
+# One-shot diagnostic (2026-10-17): log which prefill tile config fires, so a
+# branch that silently never triggers cannot be mistaken for a no-op win.
+_TILE_CONFIG_LOGGED = False
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -1015,6 +1019,31 @@ def unified_attention(
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 4
         launch_num_stages = 2
+
+    global _TILE_CONFIG_LOGGED
+    if not _TILE_CONFIG_LOGGED:
+        _TILE_CONFIG_LOGGED = True
+        branch = (
+            "tuned_large_head"
+            if tuned_large_head
+            else (
+                "c3_int8"
+                if BLOCK_M == 32 and launch_num_warps == 4
+                else "shipping"
+            )
+        )
+        logger.info(
+            "triton_attn prefill tile config: branch=%s BLOCK_M=%s BLOCK_Q=%s "
+            "warps=%s stages=%s head_size=%s nq_per_kv=%s max_seqlen_q=%s",
+            branch,
+            BLOCK_M,
+            BLOCK_Q,
+            launch_num_warps,
+            launch_num_stages,
+            head_size,
+            num_queries_per_kv,
+            max_seqlen_q,
+        )
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
