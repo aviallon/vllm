@@ -405,6 +405,20 @@ def kernel_unified_attention(
         # / padded dims are 0 in Q, so their absmax is 0 and the 1e-6 floor
         # keeps the division finite: they quantise to all-zero rows and their
         # score rows are masked to -inf later anyway.
+        #
+        # The fp32 cast of the i32 dot below is lossless while
+        # HEAD_SIZE_PADDED * 128 * 128 <= 2^24, i.e. HEAD_SIZE_PADDED <= 1024
+        # (2^24 / 16384).  Every integer <= 2^24 is exactly representable in
+        # fp32, so the boundary value itself is safe.  head_size 256 (the only
+        # measured shape) is far inside; assert the bound so a hypothetical
+        # wider head cannot start rounding the accumulator in fp32 silently.
+        # The i32 accumulation itself stays exact to head_size ~131k — this
+        # bound is about the cast.
+        tl.static_assert(
+            HEAD_SIZE_PADDED <= 1024,
+            "USE_INT8_QK requires HEAD_SIZE_PADDED <= 1024 for the exact "
+            "i32->fp32 accumulator cast",
+        )
         q_absmax = tl.max(tl.abs(Q.to(tl.float32)), axis=1)
         q_row_scale = tl.maximum(q_absmax / 127.0, 1e-6)
         q_scaled = Q.to(tl.float32) * (1.0 / q_row_scale[:, None])
@@ -585,7 +599,9 @@ def kernel_unified_attention(
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if USE_INT8_QK:
             # int8 x int8 -> i32 (exact products, exact i32 accumulation:
-            # 256 * 127 * 127 = 4.1M < 2^24, so the fp32 cast below is lossless).
+            # worst case HEAD_SIZE_PADDED * 128 * 128 = 4 194 304 at
+            # head_size 256 — < 2^24, so the fp32 cast below is lossless;
+            # the <= 1024 head-size bound is asserted in the prologue).
             # The dequant factors are per ROW (q_row_scale, prologue) and per
             # COLUMN (k_token_head_scales, gathered as before), fused into the
             # post-dot multiply — no gather added, none removed (the static
