@@ -295,6 +295,14 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    # Native int8 QK^T (the "missing branch" of the int8 reader): requantise
+    # the query rows ONCE per program in the prologue, then compute QK as
+    # int8 x int8 with an i32 accumulator.  Only for KV_QUANT_MODE == 2
+    # (INT8 per-token-head) — asserted below.  The per-(token, head) k scales
+    # stay exactly where they are (post-dot, per column); only the K upcast
+    # disappears.  PV keeps its bf16 form (V upcast, P scaled): the int8 PV
+    # variant measured SLOWER and puts P's precision at risk.
+    USE_INT8_QK: tl.constexpr = False,
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
@@ -305,6 +313,13 @@ def kernel_unified_attention(
         KV_QUANT_MODE <= 3
     )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+    if USE_INT8_QK:
+        # The i8 x i8 dot needs an int8 cache tile AND per-token-head scales
+        # folded post-dot; nothing else is implemented or safe.
+        tl.static_assert(
+            KV_QUANT_MODE == 2,
+            "USE_INT8_QK requires KV_QUANT_MODE == 2 (INT8 per-token-head)",
+        )
 
     if USE_TD:
         tl.static_assert(
@@ -381,6 +396,20 @@ def kernel_unified_attention(
             mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             other=0.0,
         )
+
+    if USE_INT8_QK:
+        # Prologue requant of Q: one dynamic per-row absmax over the loaded
+        # tile (amortised over the whole tile loop — ~258 iterations at 9k),
+        # round-half-away-from-zero then int8 truncation, same rule as the
+        # per-token-head writer (_reshape_cache_per_token_head).  Masked rows
+        # / padded dims are 0 in Q, so their absmax is 0 and the 1e-6 floor
+        # keeps the division finite: they quantise to all-zero rows and their
+        # score rows are masked to -inf later anyway.
+        q_absmax = tl.max(tl.abs(Q.to(tl.float32)), axis=1)
+        q_row_scale = tl.maximum(q_absmax / 127.0, 1e-6)
+        q_scaled = Q.to(tl.float32) * (1.0 / q_row_scale[:, None])
+        q_scaled = tl.where(q_scaled >= 0, q_scaled + 0.5, q_scaled - 0.5)
+        Q_i8 = tl.clamp(q_scaled, -128.0, 127.0).to(tl.int8)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -504,7 +533,12 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if USE_INT8_QK:
+            # K stays raw int8 for the i8 dot below — this is the upcast that
+            # the native branch removes.  V is still upcast (PV stays bf16).
+            K = K_load
+        else:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
@@ -549,7 +583,17 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if USE_INT8_QK:
+            # int8 x int8 -> i32 (exact products, exact i32 accumulation:
+            # 256 * 127 * 127 = 4.1M < 2^24, so the fp32 cast below is lossless).
+            # The dequant factors are per ROW (q_row_scale, prologue) and per
+            # COLUMN (k_token_head_scales, gathered as before), fused into the
+            # post-dot multiply — no gather added, none removed (the static
+            # per-head variant is the one that removes them).
+            S += tl.dot(Q_i8, K, out_dtype=tl.int32).to(tl.float32) * (
+                score_scale * q_row_scale[:, None] * k_token_head_scales[None, :]
+            )
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -855,6 +899,7 @@ def _log_tile_config_once(
     max_seqlen_q: int,
     num_seqs: int,
     kv_quant_mode: KVQuantMode,
+    int8_qk: bool = False,
     ws_default: tuple[int, int] | None = (4, 2),
 ) -> None:
     """One-shot-per-config log of the effective attention launch knobs.
@@ -880,6 +925,7 @@ def _log_tile_config_once(
         head_size,
         num_queries_per_kv,
         kv_quant_mode,
+        int8_qk,
     )
     if key in _TILE_CONFIG_LOGGED or len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP:
         return
@@ -893,7 +939,7 @@ def _log_tile_config_once(
     logger.info(
         "triton_attn attention launch: path=%s branch=%s BLOCK_M=%s BLOCK_Q=%s "
         "TILE=%s warps=%s stages=%s segments=%s head_size=%s nq_per_kv=%s "
-        "max_seqlen_q=%s num_seqs=%s kv_quant=%s",
+        "max_seqlen_q=%s num_seqs=%s kv_quant=%s qk_i8=%s",
         path,
         branch,
         block_m,
@@ -907,6 +953,7 @@ def _log_tile_config_once(
         max_seqlen_q,
         num_seqs,
         kv_quant_mode.name,
+        int8_qk,
     )
 
 
@@ -1064,6 +1111,15 @@ def unified_attention(
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
         )
+
+    # Native int8 QK^T (bg-19 candidate b): the query rows are requantised
+    # once per program and QK runs as int8 x int8 (i32 acc), instead of
+    # upcasting every K tile to bf16 at every loop iteration and dotting in
+    # bf16.  Conditioned on KVQuantMode.INT8_PER_TOKEN_HEAD ONLY — bf16 and
+    # the FP8 modes are byte-for-byte the old code path.  PV keeps its bf16
+    # form; the per-(token, head) K/V scales are unchanged (gathered per tile,
+    # applied post-dot), so the cache layout and the writer need no change.
+    use_int8_qk = kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
 
     use_mm_prefix = False
     max_mm_ranges = 0
@@ -1298,6 +1354,7 @@ def unified_attention(
         max_seqlen_q=max_seqlen_q,
         num_seqs=num_seqs,
         kv_quant_mode=kv_quant_mode,
+        int8_qk=use_int8_qk,
     )
 
     kernel_unified_attention[grid](
@@ -1375,6 +1432,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        USE_INT8_QK=use_int8_qk,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         **launch_kwargs,
     )
