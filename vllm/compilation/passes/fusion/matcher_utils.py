@@ -54,6 +54,45 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
 
+def _mutable_arg_names(op: OpOverload) -> list[str]:
+    """Names of the op's mutable arguments, in schema order.
+
+    Optional mutable arguments (``Tensor!? azp``) count too: an argument is
+    mutable because the SCHEMA says so, regardless of whether the call passed a
+    value for it.
+    """
+    return [
+        arg.name
+        for arg in op._schema.arguments
+        if arg.alias_info is not None and arg.alias_info.is_write
+    ]
+
+
+def functionalized_mutable_args(op: OpOverload, out: Any) -> dict[str, Any]:
+    """Map ``auto_functionalized``'s return tuple onto the op's mutable args.
+
+    ``auto_functionalized`` returns ``(op_return, *mutated_in_schema_order)``:
+    the leading entry is the op's return value (``None`` for ``-> ()`` ops) and
+    the mutated entries include optional mutable arguments even when the call
+    passed ``None`` for them.  The tuple's arity is therefore a property of the
+    SCHEMA, not of the call: ``dynamic_scaled_int8_quant``
+    (``Tensor! result, Tensor input, Tensor! scale, Tensor!? azp) -> ()``
+    returns 4 entries ``(None, result, scale, azp)``, which a fixed
+    ``_, result, scale = ...`` unpack cannot read (measured under
+    torch 2.13.0+git733fca1, aragorn
+    research/w8a8-pdtest-2026-10-18/evidence/arity-probe-torch213.log).  Index
+    by schema instead of unpacking a fixed arity.
+    """
+    names = _mutable_arg_names(op)
+    values = out if isinstance(out, tuple) else (out,)
+    if len(values) < len(names):
+        raise RuntimeError(
+            f"auto_functionalized({op}) returned {len(values)} value(s), fewer "
+            f"than the {len(names)} mutable argument(s) {names} of its schema"
+        )
+    return dict(zip(names, values[len(values) - len(names) :]))
+
+
 class MatcherCustomOp(ABC):
     def __init__(self, enabled: bool) -> None:
         config = get_current_vllm_config()
@@ -468,7 +507,7 @@ class MatcherQuantFP8(MatcherCustomOp):
             fp8_min = finfo.min
             fp8_max = finfo.max
 
-            _, result, scale = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP,
                 input=input,
                 output_q=result,
@@ -481,21 +520,28 @@ class MatcherQuantFP8(MatcherCustomOp):
                 dummy_is_scale_transposed=self.has_col_major_scales,
                 dummy_is_tma_aligned=self.is_tma_aligned,
             )
-            return result, scale
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["output_q"], outs["output_s"]
 
         if self.quant_key.scale.static:
             assert scale is not None
-            _, result = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP, result=result, input=input, scale=scale
             )
-            return result, scale
+            # NOTE: the old `_, result = ...` unpack read a 2-tuple, but this
+            # op has TWO mutable args (result, scale), so auto_functionalized
+            # returns 3 entries and the unpack raised "too many values".  The
+            # scale the op wrote is the one to return, not the caller's input.
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["result"], outs["scale"]
         else:
             assert scale is None
             scale = self.make_scale(input)
-            _, result, scale = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP, result=result, input=input, scale=scale, scale_ub=None
             )
-            return result, scale
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["result"], outs["scale"]
 
     def forward_native(
         self,
@@ -571,10 +617,15 @@ class MatcherQuantInt8(MatcherCustomOp):
         # the int8 result, a flattened [num_tokens, 1] float32 scale tensor.
         result = torch.empty_like(input, dtype=self.quant_key.dtype)
         scale = self.make_scale(input)
-        _, result, scale = auto_functionalized(
+        ret = auto_functionalized(
             self.QUANT_OP, result=result, input=input, scale=scale, azp=None
         )
-        return result, scale
+        # Schema-indexed: dynamic_scaled_int8_quant has THREE mutable args
+        # (result, scale, azp - `Tensor!? azp` is optional AND mutable), so the
+        # return is a 4-tuple (None, result, scale, azp) and the old fixed
+        # `_, result, scale =` unpack raised "too many values to unpack".
+        outs = functionalized_mutable_args(self.QUANT_OP, ret)
+        return outs["result"], outs["scale"]
 
     def forward_native(
         self,
@@ -617,8 +668,8 @@ class MatcherSiluAndMul(MatcherCustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        result = auto_functionalized(SILU_MUL_OP, result=out, input=x)
-        return result[1]
+        ret = auto_functionalized(SILU_MUL_OP, result=out, input=x)
+        return functionalized_mutable_args(SILU_MUL_OP, ret)["result"]
 
     def forward_native(
         self,
