@@ -26,6 +26,7 @@ consumers are ``getitem`` calls, so their indices are remapped by base name.
 """
 
 import operator
+from typing import Any
 
 import torch
 from torch import fx
@@ -117,7 +118,7 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
 
         # Build the v1 call: every schema arg as a named kwarg, mutated args
         # taking their base tensor (or None).
-        v1_kwargs: dict[str, object] = {}
+        v1_kwargs: dict[str, Any] = {}
         for arg in op._schema.arguments:
             name = arg.name
             if name in mutable:
