@@ -61,18 +61,130 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
     def __call__(self, graph: fx.Graph) -> None:
         if _v2_hop is None:
             return
-        count = 0
+        wrapped = 0
+        rewritten = 0
         for node in list(graph.nodes):
-            if not self._is_v2(node):
-                continue
-            if self._normalize_one(graph, node):
-                count += 1
-        if count:
+            if self._is_v2(node):
+                rewritten += int(self._normalize_one(graph, node))
+            elif self._is_raw_mutation_call(node):
+                wrapped += int(self._wrap_raw_call(graph, node))
+        if rewritten or wrapped:
             logger.info(
-                "normalize_auto_functionalized: rewrote %d "
-                "auto_functionalized_v2 node(s) to the v1 call form",
-                count,
+                "normalize_auto_functionalized: rewrote %d v2 node(s), "
+                "wrapped %d raw mutation call(s) into the v1 call form",
+                rewritten,
+                wrapped,
             )
+
+    @staticmethod
+    def _is_raw_mutation_call(node: fx.Node) -> bool:
+        """A plain ``op(result, input, ...)`` mutation call -- the form AOT
+        leaves behind when auto_functionalized_v2 is disabled (vLLM's
+        inductor_compile_config sets ``enable_auto_functionalized_v2: False``),
+        which is exactly what the real w8a8 engine graph contains."""
+        if node.op != "call_function" or not isinstance(node.target, OpOverload):
+            return False
+        schema = node.target._schema
+        return bool(schema.is_mutable) and not schema.returns
+
+    def _wrap_raw_call(self, graph: fx.Graph, node: fx.Node) -> bool:
+        """Rewrite one raw mutation call into the equivalent auto_functionalized
+        (v1) node, rewiring post-call users of the mutated buffers to the
+        functionalised outputs."""
+        op = node.target
+        assert isinstance(op, OpOverload)
+        schema = op._schema
+        schema_args = list(schema.arguments)
+
+        # Map the call's args/kwargs onto schema names (same normalisation
+        # do_auto_functionalize performs).
+        values: dict[str, Any] = {}
+        for idx, arg in enumerate(schema_args):
+            if arg.name in node.kwargs:
+                values[arg.name] = node.kwargs[arg.name]
+            elif idx < len(node.args):
+                values[arg.name] = node.args[idx]
+            else:
+                try:
+                    values[arg.name] = arg.default_value
+                except Exception:
+                    return self._refuse(node, "raw call misses required arg")
+        if node.kwargs and set(node.kwargs) - {a.name for a in schema_args}:
+            return self._refuse(node, "raw call has unknown kwargs")
+        if len(node.args) > len(schema_args):
+            return self._refuse(node, "raw call has too many positional args")
+        if node.users:
+            return self._refuse(node, "raw mutation call return value is used")
+
+        mutable = _mutable_arg_names(op)
+        # Pre-call users of a mutated buffer read the OLD value and must stay;
+        # post-call users read the mutated value and move to the getitem.
+        positions = {n: i for i, n in enumerate(graph.nodes)}
+        call_pos = positions[node]
+        moves: list[tuple[fx.Node, fx.Node]] = []
+        for name in mutable:
+            v = values[name]
+            if v is None:
+                continue
+            if not isinstance(v, fx.Node):
+                return self._refuse(node, "non-node mutated value")
+            for user in list(v.users):
+                if user is node:
+                    continue
+                if positions.get(user, call_pos) < call_pos:
+                    # pre-call read of the same buffer: legal (reads the old
+                    # value), keep it.
+                    continue
+                if isinstance(user.target, OpOverload) and (
+                    user.target._schema.is_mutable
+                ):
+                    # a LATER mutation call targeting the same buffer: its
+                    # semantics need the raw buffer, not a functional value.
+                    return self._refuse(node, "mutated buffer re-mutated later")
+                moves.append((user, v))
+        non_mutated_values = {
+            id(values[a.name]) for a in schema_args if a.name not in mutable
+        }
+        for name in mutable:
+            if (
+                isinstance(values[name], fx.Node)
+                and id(values[name]) in non_mutated_values
+            ):
+                return self._refuse(node, "mutated buffer also used as non-mutated arg")
+
+        v1_kwargs: dict[str, Any] = dict(values)
+        new_node = graph.call_function(
+            auto_functionalized, args=(op,), kwargs=v1_kwargs
+        )
+        new_node.meta.update(
+            {k: v for k, v in node.meta.items() if k != "eager_input_vals"}
+        )
+
+        k_returns = len(schema.returns) or 1
+        getitems: dict[str, fx.Node] = {}
+        for pos, name in enumerate(mutable):
+            getitems[name] = graph.call_function(
+                operator.getitem, args=(new_node, k_returns + pos)
+            )
+
+        for user, base in moves:
+            # find which mutated value this user read
+            target = None
+            for name in mutable:
+                if values[name] is base:
+                    target = getitems[name]
+                    break
+            if target is None:
+                continue
+            new_args = tuple(target if a is base else a for a in user.args)
+            new_kwargs = {
+                k: (target if a is base else a) for k, a in user.kwargs.items()
+            }
+            user.args = new_args
+            user.kwargs = new_kwargs
+
+        graph.erase_node(node)
+        return True
 
     @staticmethod
     def _is_v2(node: fx.Node) -> bool:

@@ -145,11 +145,25 @@ def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
         if isinstance(x, fx.Node) and isinstance(weight, fx.Node):
             x_dtype = x.meta["val"].dtype
             w_dtype = weight.meta["val"].dtype
-            return w_dtype == x_dtype or (
+            ok = w_dtype == x_dtype or (
                 w_dtype == torch.float32
                 and x_dtype in (torch.float16, torch.bfloat16)
             )
+            if not ok:
+                key = f"dtype_check_rejected:{x_dtype}/{w_dtype}"
+                if key not in _dtype_check_logged:
+                    _dtype_check_logged.add(key)
+                    logger.warning(
+                        "rms+quant fusion rejected by dtype check: input=%s "
+                        "weight=%s (one-shot)",
+                        x_dtype,
+                        w_dtype,
+                    )
+            return ok
     return True
+
+
+_dtype_check_logged: set[str] = set()
 
 
 def _counted_dtype_check(pm_pass: PatternMatcherPass, motif_owner: Any) -> Any:

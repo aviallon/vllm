@@ -830,14 +830,18 @@ class FusionSiteCensus:
                 # one-shot site dump: the exact nodes between the producer and
                 # the quant (the form the matchers must reproduce)
                 cursor = qinput
-                first_site.append(repr(qnode))
+                first_site.append(qnode.format_node())
                 seen = 0
                 while isinstance(cursor, fx.Node) and seen < 6:
-                    first_site.append(repr(cursor))
+                    first_site.append(cursor.format_node())
                     if called_op(cursor) is not None or not cursor.args:
                         break
                     cursor = cursor.args[0]
                     seen += 1
+                # and the allocs feeding the quant call (result/scale)
+                for key, val in op_call_kwargs(qnode, quant_op).items():
+                    if isinstance(val, fx.Node) and val is not qinput:
+                        first_site.append(f"{key}={val.format_node()}")
 
         logger.info(
             "fusion site census (real graph, one-shot): ops=%s "
