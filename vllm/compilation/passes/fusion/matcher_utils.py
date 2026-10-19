@@ -617,28 +617,46 @@ class MatcherQuantInt8(MatcherCustomOp):
         self,
         input: torch.Tensor,
         scale: torch.Tensor | None = None,
+        result_buf: torch.Tensor | None = None,
+        scale_buf: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert scale is None
-        # Mirror the shipping ops.scaled_int8_quant call site's allocation --
-        # but in the form the ENGINE's graph actually contains after the
-        # standalone_compile pre-grad decompositions: empty_like is decomposed
-        # to empty(size, layout=strided, pin_memory=False). Reproducing that
-        # exact call (instead of torch.empty_like, which the pattern trace
-        # would decompose into a sym_size-call-bearing form) is what makes
-        # register_replacement's exact re-match pass; with empty_like the
-        # re-traced pattern carried aten.sym_size nodes where the real graph
-        # has a literal dim, and check_fn silently rejected every site
-        # (measured 2026-10-19).
-        result = torch.empty(
-            (input.numel() // input.shape[-1], input.shape[-1]),
-            dtype=self.quant_key.dtype,
-            layout=torch.strided,
-            device=input.device,
-            pin_memory=False,
-        )
-        scale = self.make_scale(input)
+        # Two allocation regimes, deliberately:
+        #
+        # * ``result_buf``/``scale_buf`` given (the norm->quant patterns pass
+        #   the allocs as PATTERN INPUTS): the buffers are plain pattern
+        #   placeholders, so nothing about their shape is baked into the
+        #   pattern. This is what makes ``register_replacement``'s exact
+        #   re-match pass on every site: with computed allocs the re-traced
+        #   pattern tied both alloc dims to ONE shared symbol placeholder,
+        #   while the engine graph carries the token dim as separate
+        #   (semantically equal) sym-int placeholder args per use site --
+        #   a shared pattern placeholder must bind one node, so every site
+        #   whose two allocs referenced different placeholders was silently
+        #   rejected by check_fn (measured 2026-10-19/20).
+        #
+        # * computed (no buffers): mirrors the shipping
+        #   ops.scaled_int8_quant call site's allocation in the form the
+        #   ENGINE's graph contains after standalone_compile's pre-grad
+        #   decompositions (empty_like -> empty(size, layout=strided,
+        #   pin_memory=False)). Kept for the fp8 path and for callers that
+        #   have no buffers to pass.
+        if result_buf is None:
+            result_buf = torch.empty(
+                (input.numel() // input.shape[-1], input.shape[-1]),
+                dtype=self.quant_key.dtype,
+                layout=torch.strided,
+                device=input.device,
+                pin_memory=False,
+            )
+        if scale_buf is None:
+            scale_buf = self.make_scale(input)
         ret = auto_functionalized(
-            self.QUANT_OP, result=result, input=input, scale=scale, azp=None
+            self.QUANT_OP,
+            result=result_buf,
+            input=input,
+            scale=scale_buf,
+            azp=None,
         )
         # Schema-indexed: dynamic_scaled_int8_quant has THREE mutable args
         # (result, scale, azp - `Tensor!? azp` is optional AND mutable), so the
@@ -669,6 +687,27 @@ class MatcherQuantInt8(MatcherCustomOp):
 
     def inputs(self) -> list[torch.Tensor]:
         return [self.empty(5, 16)]
+
+    def buffer_examples(self, rows: int, hidden: int) -> list[torch.Tensor]:
+        """Example alloc buffers, for patterns that take the quant call's
+        ``result``/``scale`` allocations as pattern inputs (see
+        :meth:`forward_custom`)."""
+        return [
+            torch.empty(
+                (rows, hidden),
+                dtype=self.quant_key.dtype,
+                layout=torch.strided,
+                device=self.device,
+                pin_memory=False,
+            ),
+            torch.empty(
+                (rows, 1),
+                dtype=torch.float32,
+                layout=torch.strided,
+                device=self.device,
+                pin_memory=False,
+            ),
+        ]
 
 
 class MatcherSiluAndMul(MatcherCustomOp):

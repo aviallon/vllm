@@ -121,6 +121,16 @@ class PatternMatchTelemetry:
     counts: ClassVar[defaultdict[str, int]] = defaultdict(int)
     """(pass_name:motif) -> accepted match count."""
 
+    matched_node_names: ClassVar[defaultdict[str, set[str]]] = defaultdict(set)
+    """(pass_name:motif) -> names of graph nodes part of confirmed matches.
+    Lets the site diagnostic say which QUANT SITE each confirmed match fused
+    (the auto_functionalized node name is the site id)."""
+
+    dry_run: ClassVar[bool] = False
+    """Introspection mode: evaluate (and report) without counting or logging.
+    The site diagnostic calls ``extra_check`` to see WHY a site is rejected;
+    without this flag that would double-count every confirmed match."""
+
     registered: ClassVar[defaultdict[str, list[str]]] = defaultdict(list)
     """pass_name -> motif names registered (to report explicit zeros)."""
 
@@ -152,6 +162,7 @@ class PatternMatchTelemetry:
         warnings -- seen 7x in the 2026-10-19 probe logs for exactly that
         reason. Tests/tools that restart measuring must call this."""
         cls.counts.clear()
+        cls.matched_node_names.clear()
         cls._prev_summed.clear()
         cls._logged.clear()
         cls._summarized.clear()
@@ -159,7 +170,12 @@ class PatternMatchTelemetry:
     def __call__(self, match: Any) -> bool:
         if self.base is not None and not self.base(match):
             return False
+        if PatternMatchTelemetry.dry_run:
+            return True
         PatternMatchTelemetry.counts[self.key] += 1
+        PatternMatchTelemetry.matched_node_names[self.key].update(
+            getattr(n, "name", "?") for n in match.nodes
+        )
         if self.key not in PatternMatchTelemetry._logged:
             PatternMatchTelemetry._logged.add(self.key)
             logger.info(

@@ -42,7 +42,11 @@ from .matcher_utils import (
     FusionSiteCensus,
     MatcherQuantFP8,
     MatcherQuantInt8,
+    called_op,
+    op_call_kwargs,
 )
+from .fusion_site_diag import FusionSiteDiag
+from . import fusion_site_diag
 
 logger = init_logger(__name__)
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -169,6 +173,78 @@ def _counted_dtype_check(pm_pass: PatternMatcherPass, motif_owner: Any) -> Any:
     """Telemetry-wrapped :func:`_rms_input_weight_dtype_match` for a pattern."""
     motif = getattr(motif_owner, "motif", type(motif_owner).__name__)
     return counted_extra_check(pm_pass.pass_name, motif, _rms_input_weight_dtype_match)
+
+
+def _int8_alloc_conform(quant_op: Any, match: Any) -> bool:
+    """Guard for the buffer-as-input int8 patterns (see MatcherQuantInt8).
+
+    The allocs are pattern inputs -- wildcards -- so nothing constrains their
+    shape at match time; the fused kernel writes ``result`` as the quant input
+    shape and ``scale`` as one float32 per token, exactly like the quant call
+    it replaces. Reject (loudly, one-shot) the rare site whose buffers would
+    not satisfy that contract instead of writing out of bounds.
+    """
+    for node in match.nodes:
+        if called_op(node) is not quant_op:
+            continue
+        kwargs = op_call_kwargs(node, quant_op)
+        result, scale, inp = (
+            kwargs.get("result"),
+            kwargs.get("scale"),
+            kwargs.get("input"),
+        )
+        try:
+            r_val, s_val, i_val = (
+                result.meta["val"],
+                scale.meta["val"],
+                inp.meta["val"],
+            )
+        except (AttributeError, KeyError, TypeError):
+            logger.warning(
+                "rms+quant int8 fusion rejected: buffers without meta vals "
+                "(one-shot)"
+            )
+            return False
+        rows = i_val.numel() // i_val.shape[-1]
+        ok = (
+            r_val.dtype == torch.int8
+            and s_val.dtype == torch.float32
+            and r_val.numel() == i_val.numel()
+            and s_val.numel() == rows
+        )
+        if not ok:
+            key = (
+                f"alloc_conform:{r_val.dtype}/{tuple(r_val.shape)}/"
+                f"{s_val.dtype}/{tuple(s_val.shape)}/{tuple(i_val.shape)}"
+            )
+            if key not in _dtype_check_logged:
+                _dtype_check_logged.add(key)
+                logger.warning(
+                    "rms+quant int8 fusion rejected by alloc guard: result=%s%s "
+                    "scale=%s%s input=%s%s (one-shot)",
+                    r_val.dtype,
+                    tuple(r_val.shape),
+                    s_val.dtype,
+                    tuple(s_val.shape),
+                    i_val.dtype,
+                    tuple(i_val.shape),
+                )
+        return ok
+    return True
+
+
+def _counted_int8_check(
+    pm_pass: PatternMatcherPass, motif_owner: Any, quant_op: Any
+) -> Any:
+    """Telemetry-wrapped dtype + alloc-conform check for the int8 patterns."""
+    motif = getattr(motif_owner, "motif", type(motif_owner).__name__)
+
+    def check(match: Any) -> bool:
+        return _rms_input_weight_dtype_match(match) and _int8_alloc_conform(
+            quant_op, match
+        )
+
+    return counted_extra_check(pm_pass.pass_name, motif, check)
 
 
 def empty_bf16(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -629,6 +705,10 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if isinstance(self.quant_matcher, MatcherQuantInt8):
+            self._register_int8(pm_pass)
+            return
+
         def pattern(
             input: torch.Tensor, weight: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -671,6 +751,67 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
             extra_check=_counted_dtype_check(pm_pass, self),
         )
 
+    def _register_int8(self, pm_pass: PatternMatcherPass) -> None:
+        """int8 variant: the quant call's allocs are PATTERN INPUTS.
+
+        The buffers are wildcards in the pattern, so ``register_replacement``'s
+        exact re-match (check_fn) imposes no shape constraint on them -- the
+        failure mode that silently rejected every site whose two allocs used
+        different (semantically equal) sym-int placeholder args. See
+        ``MatcherQuantInt8.forward_custom``.
+        """
+
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            result_buf: torch.Tensor,
+            scale_buf: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result_rms = vllm.ir.ops.rms_norm(input, weight, self.epsilon)
+            # result, scale
+            return self.quant_matcher(  # type: ignore[no-any-return]
+                result_rms, result_buf=result_buf, scale_buf=scale_buf
+            )
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            result_buf: torch.Tensor,
+            scale_buf: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # In case we're matching native rms-norm, conversions might be
+            # optimized out. We convert here just to be safe.
+            input = input.to(dtype=self.model_dtype)
+
+            at = auto_functionalized(
+                self.FUSED_OP,
+                result=result_buf,
+                input=input,
+                weight=weight,
+                scale=scale_buf,
+                epsilon=self.epsilon,
+                scale_ub=None,
+                residual=None,
+            )
+
+            # result, scale
+            return at[1], at[2]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            [
+                empty_bf16(5, 16),  # input
+                empty_bf16(16),  # weight
+                *self.quant_matcher.buffer_examples(5, 16),
+            ],
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_counted_int8_check(
+                pm_pass, self, self.quant_matcher.QUANT_OP
+            ),
+        )
+
 
 class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
     def __init__(
@@ -688,6 +829,10 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
         super().__init__(epsilon, key)
 
     def register(self, pm_pass: PatternMatcherPass) -> None:
+        if isinstance(self.quant_matcher, MatcherQuantInt8):
+            self._register_int8(pm_pass)
+            return
+
         def pattern(
             input: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -734,6 +879,69 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
+        )
+
+    def _register_int8(self, pm_pass: PatternMatcherPass) -> None:
+        """int8 variant: the quant call's allocs are PATTERN INPUTS (see
+        ``RMSNormDynamicQuantPattern._register_int8``)."""
+
+        def pattern(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            residual: torch.Tensor,
+            result_buf: torch.Tensor,
+            scale_buf: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result_rms, residual = vllm.ir.ops.fused_add_rms_norm(
+                input, residual, weight, self.epsilon
+            )
+            result, scale = self.quant_matcher(
+                result_rms, result_buf=result_buf, scale_buf=scale_buf
+            )
+
+            return result, residual, scale
+
+        def replacement(
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            residual: torch.Tensor,
+            result_buf: torch.Tensor,
+            scale_buf: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            # In case we're matching native rms-norm, conversions might be
+            # optimized out. We convert here just to be safe.
+            input = input.to(dtype=self.model_dtype)
+
+            at = auto_functionalized(
+                self.FUSED_OP,
+                result=result_buf,
+                input=input,
+                weight=weight,
+                scale=scale_buf,
+                epsilon=self.epsilon,
+                scale_ub=None,
+                residual=residual,
+            )
+
+            # result, residual, scale
+            return at[1], at[3], at[2]
+
+        inputs = [
+            empty_bf16(5, 16),  # input
+            empty_bf16(16),  # weight
+            empty_bf16(5, 16),  # residual
+            *self.quant_matcher.buffer_examples(5, 16),
+        ]
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            inputs,
+            pm.fwd_only,
+            pm_pass,
+            extra_check=_counted_int8_check(
+                pm_pass, self, self.quant_matcher.QUANT_OP
+            ),
         )
 
 
@@ -912,6 +1120,11 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
                                 is_tma_aligned=is_tma_aligned,
                             ).register(self.patterns)
 
+        self._legacy_diag = (
+            fusion_site_diag.build_legacy_entries()
+            if fusion_site_diag.enabled()
+            else None
+        )
         self.dump_patterns(config, self.patterns)
 
     @VllmInductorPass.time_and_log
@@ -919,7 +1132,9 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
         # One-shot census BEFORE rewriting: candidate sites and their shapes
         # are the ground truth the per-motif match counts are read against.
         FusionSiteCensus.log(graph)
+        FusionSiteDiag.report(graph, self.patterns, self._legacy_diag)
         self.matched_count = self.patterns.apply(graph)
+        FusionSiteDiag.report_result(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
         log_pattern_match_summary(self.patterns.pass_name, self.matched_count)
 
