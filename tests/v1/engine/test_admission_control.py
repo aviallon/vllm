@@ -7,14 +7,21 @@ These tests cover:
 - OutputProcessor.get_num_queued_tokens() token counting
 - AsyncLLM.check_admission() admission control logic
 - Exception classes (GracefulHTTPError, QueueOverflowError, MaxQueuedTokensError)
-- create_error_response() mapping GracefulHTTPError to HTTP 503
+- create_error_response() mapping GracefulHTTPError to HTTP 503 / 429
+- RetryAfterEstimator() heuristic, bounds and staleness
+- the retry-after-on-overload mode (HTTP 429 + Retry-After, both response forms)
 - SchedulerConfig field defaults and validation
 - human_readable_int CLI notation for max_num_queued_tokens
 """
 
 import argparse
 import asyncio
+import json
 import multiprocessing
+import os
+import subprocess
+import sys
+import textwrap
 from collections.abc import Awaitable, Callable
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -24,8 +31,10 @@ import pytest
 from pydantic import ValidationError
 
 from vllm.config.scheduler import SchedulerConfig
+from vllm.entrypoints.generate.base.serving import GenerateBaseServing
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
+    error_response_to_json_response,
 )
 from vllm.exceptions import (
     GracefulHTTPError,
@@ -37,11 +46,18 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.utils.argparse_utils import human_readable_int
 from vllm.v1.engine import EngineCoreRequest
-from vllm.v1.engine.admission_control import SharedAdmissionStats
+from vllm.v1.engine.admission_control import (
+    RETRY_AFTER_FALLBACK_SECONDS,
+    RETRY_AFTER_MAX_SECONDS,
+    RETRY_AFTER_MIN_SECONDS,
+    RETRY_AFTER_RATE_TAU_SECONDS,
+    RetryAfterEstimator,
+    SharedAdmissionStats,
+)
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.output_processor import OutputProcessor
 
-pytestmark = pytest.mark.cpu_test
+pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,17 +76,20 @@ def _make_async_llm(
     max_num_queued_tokens: int | None = None,
     num_unfinished: int = 0,
     num_queued_tokens: int = 0,
+    retry_after_on_overload: bool = False,
 ) -> AsyncLLM:
     """Create a bare AsyncLLM with just the attributes needed for scheduling."""
     llm = AsyncLLM.__new__(AsyncLLM)
     llm.scheduler_config = SimpleNamespace(
         max_num_queued_reqs=max_num_queued_reqs,
         max_num_queued_tokens=max_num_queued_tokens,
+        retry_after_on_overload=retry_after_on_overload,
     )
     llm.output_processor = MagicMock()
     llm.output_processor.get_num_unfinished_requests.return_value = num_unfinished
     llm.output_processor.get_num_queued_tokens.return_value = num_queued_tokens
     llm.admission_stats = None
+    llm.retry_estimator = RetryAfterEstimator() if retry_after_on_overload else None
     return llm
 
 
@@ -511,3 +530,247 @@ def test_human_readable_int_parses_notation(input_str: str, expected: int):
 def test_human_readable_int_rejects_invalid(invalid: str):
     with pytest.raises((argparse.ArgumentTypeError, ValueError)):
         human_readable_int(invalid)
+
+
+# ---------------------------------------------------------------------------
+# Retry-After / HTTP 429 overload mode
+# ---------------------------------------------------------------------------
+
+
+def test_admission_errors_stay_503_without_retry_after():
+    """Default behaviour is unchanged: 503, no retry hint."""
+    for err in (QueueOverflowError(), MaxQueuedTokensError()):
+        assert err.http_status == HTTPStatus.SERVICE_UNAVAILABLE
+        assert err.retry_after is None
+
+
+def test_admission_errors_with_retry_after_are_429():
+    for err in (
+        QueueOverflowError(retry_after=7),
+        MaxQueuedTokensError(retry_after=7),
+    ):
+        assert err.http_status == HTTPStatus.TOO_MANY_REQUESTS
+        assert err.retry_after == 7
+
+
+def test_graceful_http_error_carries_retry_after():
+    err = GracefulHTTPError("slow down", HTTPStatus.TOO_MANY_REQUESTS, 15)
+    assert err.retry_after == 15
+
+
+def test_error_response_carries_retry_after_in_body():
+    resp = create_error_response(QueueOverflowError(retry_after=7))
+    assert resp.error.code == HTTPStatus.TOO_MANY_REQUESTS.value
+    assert resp.error.type == HTTPStatus.TOO_MANY_REQUESTS.phrase
+    assert resp.error.retry_after == 7
+
+
+def test_error_response_without_hint_has_no_retry_after():
+    resp = create_error_response(QueueOverflowError())
+    assert resp.error.retry_after is None
+
+
+def test_json_error_response_sets_retry_after_header():
+    resp = error_response_to_json_response(
+        create_error_response(QueueOverflowError(retry_after=7))
+    )
+    assert resp.status_code == HTTPStatus.TOO_MANY_REQUESTS.value
+    assert resp.headers["Retry-After"] == "7"
+
+
+def test_json_error_response_omits_header_without_hint():
+    resp = error_response_to_json_response(create_error_response(QueueOverflowError()))
+    assert resp.status_code == HTTPStatus.SERVICE_UNAVAILABLE.value
+    assert "retry-after" not in resp.headers
+
+
+def test_streaming_error_carries_retry_after_in_body():
+    """A streaming rejection cannot carry headers: the 200 is already sent."""
+    serving = GenerateBaseServing.__new__(GenerateBaseServing)
+    payload = json.loads(
+        serving.create_streaming_error_response(QueueOverflowError(retry_after=9))
+    )
+    assert payload["error"]["code"] == HTTPStatus.TOO_MANY_REQUESTS.value
+    assert payload["error"]["retry_after"] == 9
+
+
+def test_check_admission_disabled_has_no_retry_after():
+    llm = _make_async_llm(max_num_queued_reqs=2, num_unfinished=2)
+    with pytest.raises(QueueOverflowError) as exc_info:
+        llm.check_admission()
+    assert exc_info.value.retry_after is None
+    assert exc_info.value.http_status == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_check_admission_estimates_retry_after_on_queue_overflow():
+    llm = _make_async_llm(
+        max_num_queued_reqs=2,
+        num_unfinished=2,
+        num_queued_tokens=200,
+        retry_after_on_overload=True,
+    )
+    assert llm.retry_estimator is not None
+    llm.retry_estimator = RetryAfterEstimator(clock=lambda: 0.0)
+    # One observation pins the rates: 100 prompt tokens and 1 completion
+    # over tau => 10 tok/s and 0.1 req/s.
+    llm.retry_estimator.observe(num_finished=1, prefill_tokens=100)
+    with pytest.raises(QueueOverflowError) as exc_info:
+        llm.check_admission()
+    assert exc_info.value.http_status == HTTPStatus.TOO_MANY_REQUESTS
+    # (200/10 + 2/0.1) * 1.1 = 44
+    assert exc_info.value.retry_after == 44
+
+
+def test_check_admission_estimates_retry_after_on_token_backlog():
+    llm = _make_async_llm(
+        max_num_queued_tokens=100,
+        num_unfinished=3,
+        num_queued_tokens=150,
+        retry_after_on_overload=True,
+    )
+    assert llm.retry_estimator is not None
+    llm.retry_estimator = RetryAfterEstimator(clock=lambda: 0.0)
+    llm.retry_estimator.observe(num_finished=1, prefill_tokens=100)
+    with pytest.raises(MaxQueuedTokensError) as exc_info:
+        llm.check_admission()
+    assert exc_info.value.http_status == HTTPStatus.TOO_MANY_REQUESTS
+    # (150/10 + 3/0.1) * 1.1 = 49.5 -> 50
+    assert exc_info.value.retry_after == 50
+
+
+# ---------------------------------------------------------------------------
+# RetryAfterEstimator heuristic
+# ---------------------------------------------------------------------------
+
+
+def test_estimator_falls_back_before_any_observation():
+    est = RetryAfterEstimator()
+    assert (
+        est.estimate_seconds(num_in_flight=8, prefill_backlog_tokens=1000, now=0.0)
+        == RETRY_AFTER_FALLBACK_SECONDS
+    )
+
+
+def test_estimator_uses_measured_rates():
+    est = RetryAfterEstimator()
+    est.observe(num_finished=1, prefill_tokens=100, now=0.0)
+    # (200/10 + 5/0.1) * 1.1 = 77.0
+    assert est.estimate_seconds(5, 200, now=0.0) == 77
+
+
+def test_estimator_clamps_to_max():
+    est = RetryAfterEstimator()
+    est.observe(num_finished=1, prefill_tokens=100, now=0.0)
+    assert (
+        est.estimate_seconds(num_in_flight=10**6, prefill_backlog_tokens=10**9, now=0.0)
+        == RETRY_AFTER_MAX_SECONDS
+    )
+
+
+def test_estimator_clamps_to_min():
+    est = RetryAfterEstimator()
+    est.observe(num_finished=1, prefill_tokens=100, now=0.0)
+    assert (
+        est.estimate_seconds(num_in_flight=0, prefill_backlog_tokens=0, now=0.0)
+        == RETRY_AFTER_MIN_SECONDS
+    )
+
+
+def test_estimator_decays_to_fallback_after_idle():
+    """A rate whose traffic stopped must not survive as a stale estimate."""
+    est = RetryAfterEstimator()
+    est.observe(num_finished=1, prefill_tokens=100, now=0.0)
+    later = 60.0 * RETRY_AFTER_RATE_TAU_SECONDS
+    assert (
+        est.estimate_seconds(num_in_flight=8, prefill_backlog_tokens=1000, now=later)
+        == RETRY_AFTER_FALLBACK_SECONDS
+    )
+
+
+def _make_feed_output_processor(est: RetryAfterEstimator) -> OutputProcessor:
+    op = OutputProcessor.__new__(OutputProcessor)
+    op.retry_estimator = est
+    op.admission_stats = None
+    return op
+
+
+def test_output_processor_feeds_estimator_on_prefill_completion():
+    """Rates that are never fed silently degrade the heuristic to its
+    fallback; prompt work is observed when a request leaves prefill."""
+    est = RetryAfterEstimator(clock=lambda: 0.0)
+    op = _make_feed_output_processor(est)
+    req_state = MagicMock()
+    req_state.is_prefilling = True
+    req_state.prompt_len = 100
+    req_state.num_cached_tokens = 0
+    req_state.remote_prefill_cached_tokens = None
+    req_state.streaming_input = False
+    req_state.queue = None
+    req_state.detokenizer.update.return_value = None
+    req_state.make_request_output.return_value = MagicMock()
+    op.request_states = {"r1": req_state}
+
+    eco = MagicMock()
+    eco.request_id = "r1"
+    eco.new_token_ids = [1]
+    eco.finish_reason = None
+    eco.prefill_stats = None
+    eco.num_cached_tokens = 20
+    eco.pooling_output = None
+    op.process_outputs([eco], 0.0, None)
+
+    # 80 computed prompt tokens over tau => 8 tok/s; 200/8 * 1.1 = 27.5 -> 28
+    assert est.estimate_seconds(num_in_flight=0, prefill_backlog_tokens=200) == 28
+
+
+def test_output_processor_feeds_estimator_on_request_finish():
+    """Completions are observed when a request leaves the frontend."""
+    est = RetryAfterEstimator(clock=lambda: 0.0)
+    op = _make_feed_output_processor(est)
+    req_state = MagicMock()
+    req_state.request_id = "r1"
+    req_state.external_req_id = "ext"
+    req_state.parent_req = None
+    op.request_states = {"r1": req_state}
+    op.external_req_ids = {"ext": ["r1"]}
+    op.lora_states = MagicMock()
+
+    op._finish_request(req_state)
+
+    # 1 completion over tau => 0.1 req/s; 4/0.1 * 1.1 = 44
+    assert est.estimate_seconds(num_in_flight=4, prefill_backlog_tokens=0) == 44
+
+
+# ---------------------------------------------------------------------------
+# retry-after-on-overload config surface
+# ---------------------------------------------------------------------------
+
+
+def test_scheduler_config_retry_after_on_overload_defaults_off():
+    assert _make_scheduler_config().retry_after_on_overload is False
+
+
+def test_scheduler_config_retry_after_on_overload_accepts_true():
+    assert _make_scheduler_config(retry_after_on_overload=True).retry_after_on_overload
+
+
+def test_retry_after_on_overload_cli_flag():
+    """The flag must parse into EngineArgs; an unparsed flag is a silent no-op."""
+    code = textwrap.dedent(
+        """
+        import argparse
+        from vllm.engine.arg_utils import EngineArgs
+
+        parser = argparse.ArgumentParser()
+        EngineArgs.add_cli_args(parser)
+        default = parser.parse_args(["--model", "m"])
+        enabled = parser.parse_args(["--model", "m", "--retry-after-on-overload"])
+        assert default.retry_after_on_overload is False
+        assert enabled.retry_after_on_overload is True
+        """
+    )
+    env = os.environ | {"VLLM_TARGET_DEVICE": "cpu"}
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr

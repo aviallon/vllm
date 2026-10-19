@@ -5,12 +5,16 @@ from fastapi import FastAPI
 
 from vllm.logger import init_logger
 
-from .exception_handling.error_response import create_error_response
+from .exception_handling.error_response import (
+    create_error_response,
+    error_response_to_json_response,
+)
 
 logger = init_logger(__name__)
 
 __all__ = [
     "create_error_response",
+    "error_response_to_json_response",
     "register_vllm_serve_api_routers",
     "register_vllm_dev_api_routers",
 ]

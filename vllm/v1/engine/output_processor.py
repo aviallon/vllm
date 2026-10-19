@@ -30,6 +30,7 @@ from vllm.tracing import (
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
+from vllm.v1.engine.admission_control import RetryAfterEstimator
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
@@ -493,6 +494,7 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        retry_estimator: RetryAfterEstimator | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -503,6 +505,7 @@ class OutputProcessor:
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
+        self.retry_estimator = retry_estimator
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -567,6 +570,7 @@ class OutputProcessor:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
                 self.lora_states.request_finished(request_id, req_state.lora_name)
+                self._observe_request_done()
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
                 if req_state.queue is not None and (
@@ -687,6 +691,7 @@ class OutputProcessor:
         """
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        prefill_tokens_processed = 0
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -726,6 +731,10 @@ class OutputProcessor:
                 # return_progress) carry no tokens and do not end the prefill.
                 if len(new_token_ids) > 0 or finish_reason is not None:
                     req_state.is_prefilling = False
+                    if self.retry_estimator is not None:
+                        prefill_tokens_processed += max(
+                            req_state.prompt_len - req_state.num_cached_tokens, 0
+                        )
 
             if engine_core_output.spec_decode_metrics is not None:
                 req_state.spec_decode_metrics = engine_core_output.spec_decode_metrics
@@ -805,6 +814,9 @@ class OutputProcessor:
                     if self.tracing_enabled:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
 
+        if self.retry_estimator is not None and prefill_tokens_processed:
+            self.retry_estimator.observe(prefill_tokens=prefill_tokens_processed)
+
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
@@ -823,7 +835,12 @@ class OutputProcessor:
         parent_req = req_state.parent_req
         if parent_req and not parent_req.child_requests:
             self.parent_requests.pop(parent_req.request_id, None)
+        self._observe_request_done()
         self._update_admission_stats()
+
+    def _observe_request_done(self) -> None:
+        if self.retry_estimator is not None:
+            self.retry_estimator.observe(num_finished=1)
 
     def _update_admission_stats(self) -> None:
         if self.admission_stats is not None:

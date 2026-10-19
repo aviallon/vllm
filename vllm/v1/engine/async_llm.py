@@ -50,7 +50,10 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.async_utils import cancel_task_threadsafe
 from vllm.utils.collection_utils import as_list
 from vllm.v1.engine import EngineCoreRequest, PauseMode
-from vllm.v1.engine.admission_control import SharedAdmissionStats
+from vllm.v1.engine.admission_control import (
+    RetryAfterEstimator,
+    SharedAdmissionStats,
+)
 from vllm.v1.engine.core_client import EngineCoreClient
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 from vllm.v1.engine.input_processor import InputProcessor
@@ -168,6 +171,12 @@ class AsyncLLM(EngineClient):
             else None
         )
 
+        self.retry_estimator = (
+            RetryAfterEstimator()
+            if self.scheduler_config.retry_after_on_overload
+            else None
+        )
+
         # Converts EngineCoreOutputs --> RequestOutput.
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
@@ -175,6 +184,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
+            retry_estimator=self.retry_estimator,
         )
 
         # EngineCore (starts the engine in background process).
@@ -318,7 +328,9 @@ class AsyncLLM(EngineClient):
         """Reject the request if it would exceed queue limits.
 
         Both limits return HTTP 503 (Service Unavailable) so that load
-        balancers and client SDKs retry on a different instance.
+        balancers and client SDKs retry on a different instance. With
+        ``retry_after_on_overload`` the rejections become HTTP 429 (Too Many
+        Requests) carrying an estimated ``Retry-After`` instead.
 
         - ``max_num_queued_reqs``: approximate global cap on the number of
           unfinished requests (waiting + running). A request with ``n > 1``
@@ -357,7 +369,7 @@ class AsyncLLM(EngineClient):
                     n,
                     max_num_reqs,
                 )
-                raise QueueOverflowError()
+                raise QueueOverflowError(retry_after=self._estimate_retry_after())
 
         max_queued_tokens = self.scheduler_config.max_num_queued_tokens
         if max_queued_tokens is not None:
@@ -370,7 +382,26 @@ class AsyncLLM(EngineClient):
                     current_tokens,
                     max_queued_tokens,
                 )
-                raise MaxQueuedTokensError()
+                raise MaxQueuedTokensError(retry_after=self._estimate_retry_after())
+
+    def _estimate_retry_after(self) -> int | None:
+        """Seconds to advertise in a rejection's ``Retry-After``, or None.
+
+        Returns None when ``retry_after_on_overload`` is off, which keeps
+        the rejection a plain HTTP 503 without a hint.
+        """
+        if not self.scheduler_config.retry_after_on_overload:
+            return None
+        assert self.retry_estimator is not None
+        current_requests = (
+            self.admission_stats.get_num_requests()
+            if self.admission_stats is not None
+            else self.get_num_unfinished_requests()
+        )
+        return self.retry_estimator.estimate_seconds(
+            num_in_flight=current_requests,
+            prefill_backlog_tokens=self.get_num_queued_tokens(),
+        )
 
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
