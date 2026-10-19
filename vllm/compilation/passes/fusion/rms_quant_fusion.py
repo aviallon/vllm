@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, NamedTuple
-
 import os
+from typing import Any, NamedTuple
 
 import torch
 import torch._inductor.pattern_matcher as pm
@@ -33,8 +32,14 @@ from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
-from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from ..vllm_inductor_pass import (
+    VllmInductorPass,
+    VllmPatternMatcherPass,
+    counted_extra_check,
+    log_pattern_match_summary,
+)
 from .matcher_utils import (
+    FusionSiteCensus,
     MatcherQuantFP8,
     MatcherQuantInt8,
 )
@@ -118,7 +123,15 @@ if (
 # TODO: extend rmsnorm quant kernels to support mixed input/weight dtypes,
 # and remove this check.
 def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
-    """Prevent fusion when rms_norm input and weight dtypes differ."""
+    """Prevent fusion when the fused kernel cannot take the site's dtypes.
+
+    ``rms_norm_dynamic_per_token_quant`` accepts input and weight of the same
+    dtype, and -- since the mixed-dtype kernel extension -- also an fp32
+    weight with an fp16/bf16 input (the Gemma-style ``weight.float() + 1.0``
+    form every norm site of the w8a8 qwen3.6 models has). Anything else is
+    rejected here rather than crashing at run time in the kernel's
+    ``TORCH_CHECK(weight.scalar_type() == input.scalar_type())``.
+    """
     for node in match.nodes:
         if node.target == _RMS_NORM_OP:
             # rms_norm(x, weight, epsilon, variance_size)
@@ -129,8 +142,19 @@ def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
         else:
             continue
         if isinstance(x, fx.Node) and isinstance(weight, fx.Node):
-            return x.meta["val"].dtype == weight.meta["val"].dtype
+            x_dtype = x.meta["val"].dtype
+            w_dtype = weight.meta["val"].dtype
+            return w_dtype == x_dtype or (
+                w_dtype == torch.float32
+                and x_dtype in (torch.float16, torch.bfloat16)
+            )
     return True
+
+
+def _counted_dtype_check(pm_pass: PatternMatcherPass, motif_owner: Any) -> Any:
+    """Telemetry-wrapped :func:`_rms_input_weight_dtype_match` for a pattern."""
+    motif = getattr(motif_owner, "motif", type(motif_owner).__name__)
+    return counted_extra_check(pm_pass.pass_name, motif, _rms_input_weight_dtype_match)
 
 
 def empty_bf16(*args: Any, **kwargs: Any) -> torch.Tensor:
@@ -237,6 +261,8 @@ class RMSNormQuantPattern:
 
         assert key in FUSED_OPS, f"unsupported fused rmsnorm+quant op for {key}"
         self.FUSED_OP = FUSED_OPS[key]
+        self.key = key
+        self.motif = f"{type(self).__name__}[{key}]"
 
         self.quant_matcher = (
             MatcherQuantInt8(key.quant)
@@ -301,7 +327,7 @@ class RMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -368,7 +394,7 @@ class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -475,7 +501,7 @@ class FusedAddRMSNormGroupQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -569,7 +595,7 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -628,7 +654,7 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -693,7 +719,7 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -784,7 +810,7 @@ class FusedAddRMSNormNvfp4QuantPattern:
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -828,13 +854,18 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             # Fuse rms_norm + dynamic per-token fp8 quant
             RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
 
-            # Fuse fused_add_rms_norm + dynamic per-token int8 quant
-            # (gated OFF by default: the int8 matcher's auto_functionalized
-            # unpack assumes the fp8 op arity and crashes at trace time on
-            # torch 2.13 - it took down a bf16 model's engine init on
-            # 2026-10-17. The fusions only benefit W8A8 models anyway.
-            # Opt in with VLLM_FUSE_INT8_QUANT=1 after the arity is fixed.)
-            if os.getenv("VLLM_FUSE_INT8_QUANT", "0") == "1":
+            # Fuse fused_add_rms_norm + dynamic per-token int8 quant.
+            # Gated OFF by default. The old blocker (int8 matcher arity crash
+            # at trace time on torch 2.13) is fixed (d7ad0b43a6); what remains
+            # is that the wall gain of the int8 fusions is not established, so
+            # they stay opt-in. Separate sub-gates per motif family:
+            #   VLLM_FUSE_INT8_QUANT       master switch (both families)
+            #   VLLM_FUSE_INT8_QUANT_NORM  norm->quant int8 only
+            #   VLLM_FUSE_INT8_QUANT_ACT   silu_and_mul->quant int8 only
+            # A sub-gate defaults to the master switch's value.
+            if os.getenv(
+                "VLLM_FUSE_INT8_QUANT_NORM", os.getenv("VLLM_FUSE_INT8_QUANT", "0")
+            ) == "1":
                 FusedAddRMSNormDynamicQuantPattern(epsilon, torch.int8).register(
                     self.patterns
                 )
@@ -871,8 +902,12 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        # One-shot census BEFORE rewriting: candidate sites and their shapes
+        # are the ground truth the per-motif match counts are read against.
+        FusionSiteCensus.log(graph)
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
+        log_pattern_match_summary(self.patterns.pass_name, self.matched_count)
 
     def uuid(self) -> str:
         return self.hash_source(

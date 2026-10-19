@@ -8,12 +8,13 @@
 
 namespace vllm {
 
-template <typename scalar_t, typename scalar_out_t, bool has_residual = false>
+template <typename scalar_t, typename scalar_out_t, bool has_residual = false,
+          typename weight_t = scalar_t>
 __device__ void rms_norm_dynamic_per_token_quant_vec(
     scalar_out_t* __restrict__ out,       // [..., hidden_size]
     float* __restrict__ scales,           // [num_tokens]
     scalar_t const* __restrict__ input,   // [..., hidden_size]
-    scalar_t const* __restrict__ weight,  // [hidden_size]
+    weight_t const* __restrict__ weight,  // [hidden_size]
     float const* scale_ub, float const var_epsilon, int32_t const hidden_size,
     int32_t const input_stride, scalar_t* __restrict__ residual = nullptr) {
   float rms = 0.0f;
@@ -46,12 +47,13 @@ __device__ void rms_norm_dynamic_per_token_quant_vec(
 }
 
 // RMS norm + quant kernel
-template <typename scalar_t, typename scalar_out_t, bool has_residual = false>
+template <typename scalar_t, typename scalar_out_t, bool has_residual = false,
+          typename weight_t = scalar_t>
 __global__ void rms_norm_dynamic_per_token_quant_kernel(
     scalar_out_t* __restrict__ out,       // [..., hidden_size]
     float* __restrict__ scales,           // [num_tokens]
     scalar_t const* __restrict__ input,   // [..., hidden_size]
-    scalar_t const* __restrict__ weight,  // [hidden_size]
+    weight_t const* __restrict__ weight,  // [hidden_size]
     float const* scale_ub, float const var_epsilon, int32_t const hidden_size,
     int32_t const input_stride, scalar_t* __restrict__ residual = nullptr) {
   // For vectorization, token_input and token_output pointers need to be
@@ -60,7 +62,7 @@ __global__ void rms_norm_dynamic_per_token_quant_kernel(
 
   if (can_vectorize) {
     return rms_norm_dynamic_per_token_quant_vec<scalar_t, scalar_out_t,
-                                                has_residual>(
+                                                has_residual, weight_t>(
         out, scales, input, weight, scale_ub, var_epsilon, hidden_size,
         input_stride, residual);
   }
@@ -132,7 +134,7 @@ __global__ void rms_norm_per_block_quant_kernel(
 }  // namespace vllm
 
 // Residual add + RMS norm + dynamic per token
-template <typename scalar_in_t>
+template <typename scalar_in_t, typename weight_t = scalar_in_t>
 void rms_norm_dynamic_per_token_quant_dispatch(
     torch::stable::Tensor& out,           // [..., hidden_size]
     torch::stable::Tensor const& input,   // [..., hidden_size]
@@ -156,12 +158,12 @@ void rms_norm_dynamic_per_token_quant_dispatch(
     VLLM_STABLE_DISPATCH_QUANT_TYPES(
         out.scalar_type(), "rms_norm_dynamic_per_token_quant_kernel", [&] {
           vllm::rms_norm_dynamic_per_token_quant_kernel<scalar_in_t, scalar_t,
-                                                        has_residual>
+                                                        has_residual, weight_t>
               <<<grid, block, 0, stream>>>(
                   out.mutable_data_ptr<scalar_t>(),
                   scales.mutable_data_ptr<float>(),
                   input.const_data_ptr<scalar_in_t>(),
-                  weight.const_data_ptr<scalar_in_t>(),
+                  weight.const_data_ptr<weight_t>(),
                   scale_ub.has_value() ? scale_ub->const_data_ptr<float>()
                                        : nullptr,
                   var_epsilon, hidden_size, input_stride,
@@ -191,7 +193,19 @@ void rms_norm_dynamic_per_token_quant(
   if (scale_ub.has_value()) {
     STD_TORCH_CHECK(out.scalar_type() == kFp8Type);
   }
-  STD_TORCH_CHECK(weight.scalar_type() == input.scalar_type());
+  // Weight must match the input dtype, or be fp32 with an fp16/bf16 input:
+  // the Gemma-style `weight.float() + 1.0` norm form of the quantized qwen3.6
+  // models carries an fp32 weight over an fp16/bf16 stream (and keeps the
+  // reference numerics: the weight multiply happens in fp32).
+  STD_TORCH_CHECK(weight.scalar_type() == input.scalar_type() ||
+                      (weight.scalar_type() ==
+                           torch::headeronly::ScalarType::Float &&
+                       (input.scalar_type() ==
+                            torch::headeronly::ScalarType::Half ||
+                        input.scalar_type() ==
+                            torch::headeronly::ScalarType::BFloat16)),
+                  "rms_norm_dynamic_per_token_quant: weight must match the "
+                  "input dtype, or be float32 with a half/bfloat16 input");
   STD_TORCH_CHECK(scales.scalar_type() == torch::headeronly::ScalarType::Float);
   if (residual) {
     STD_TORCH_CHECK(residual->scalar_type() == input.scalar_type());
@@ -200,8 +214,13 @@ void rms_norm_dynamic_per_token_quant(
 
   VLLM_STABLE_DISPATCH_FLOATING_TYPES(
       input.scalar_type(), "rms_norm_dynamic_per_token_quant_dispatch", [&] {
-        rms_norm_dynamic_per_token_quant_dispatch<scalar_t>(
-            out, input, weight, scales, var_epsilon, scale_ub, residual);
+        if (weight.scalar_type() == input.scalar_type()) {
+          rms_norm_dynamic_per_token_quant_dispatch<scalar_t>(
+              out, input, weight, scales, var_epsilon, scale_ub, residual);
+        } else {
+          rms_norm_dynamic_per_token_quant_dispatch<scalar_t, float>(
+              out, input, weight, scales, var_epsilon, scale_ub, residual);
+        }
       });
 }
 

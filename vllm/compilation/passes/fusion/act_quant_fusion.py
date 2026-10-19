@@ -340,11 +340,17 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
         self.register(SiluMulFp8StaticQuantPattern())
 
         if silu_and_mul_per_token_quant_int8_op is not None and os.getenv(
-            "VLLM_FUSE_INT8_QUANT", "0"
+            "VLLM_FUSE_INT8_QUANT_ACT",
+            os.getenv("VLLM_FUSE_INT8_QUANT", "0"),
         ) == "1":
-            # Gated OFF by default (2026-10-17): see the note in
-            # rms_quant_fusion.py - the int8 matcher arity crashes on
-            # torch 2.13 at trace time. W8A8-only benefit.
+            # Gated OFF by default: the int8 arity crash at trace time is
+            # fixed (d7ad0b43a6), but the wall gain is not established, so
+            # this stays opt-in. Sub-gate VLLM_FUSE_INT8_QUANT_ACT controls
+            # this motif family alone (VLLM_FUSE_INT8_QUANT_NORM the norm->
+            # quant family); the master VLLM_FUSE_INT8_QUANT enables both.
+            # NOTE: on models whose MoE/MLP silu lives inside an opaque custom
+            # op (e.g. vllm.moe_forward_shared on qwen3.6), this pattern has
+            # no site at all -- see the fusion site census log.
             self.register(SiluMulInt8QuantPattern())
 
         if silu_and_mul_nvfp4_quant_supported:

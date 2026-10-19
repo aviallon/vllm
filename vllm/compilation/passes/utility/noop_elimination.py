@@ -27,6 +27,13 @@ class NoOpEliminationPass(VllmInductorPass):
       base tensor (input of the first reshape).
       2. A reshape that produces the shape of the input is redundant
       3. A slice that produces the shape of the input is redundant
+      4. A contiguous() call on an already-contiguous input is redundant.
+      This one is load-bearing for the norm->quant fusions: the int8 call
+      sites stack two of them (apply_weights `x.contiguous()` and
+      scaled_int8_quant `input.contiguous()`) between every producer
+      (rms_norm / fused_add_rms_norm / silu) and its quant, so without
+      removing them the fusion patterns see a view chain instead of the
+      producer->quant adjacency they match.
 
     Example graph 1:
     mul_1: "f16[s0, 4096]" = ...
@@ -66,6 +73,7 @@ class NoOpEliminationPass(VllmInductorPass):
     @VllmInductorPass.time_and_log
     def __call__(self, graph: torch.fx.Graph) -> None:
         count = 0
+        contiguous_count = 0
         # Remove no-op reshapes/views:
         for node in graph.nodes:
             if is_func(node, torch.ops.aten.reshape.default):
@@ -101,7 +109,34 @@ class NoOpEliminationPass(VllmInductorPass):
                     graph.erase_node(node)
                     count += 1
 
-        logger.debug("Removed %s no-op reshapes and slices", count)
+            elif is_func(node, torch.ops.aten.contiguous.default):
+                input = node.args[0]
+                val = node.meta.get("val")
+                input_val = (
+                    input.meta.get("val")
+                    if isinstance(input, torch.fx.Node)
+                    else None
+                )
+                if val is None or input_val is None:
+                    continue
+                try:
+                    redundant = input_val.is_contiguous() and (
+                        val.is_contiguous()
+                        and self.all_dims_equivalent(val.shape, input_val.shape)
+                    )
+                except Exception:
+                    # Symbolic-stride query failed: leave the node alone.
+                    redundant = False
+                if redundant:
+                    node.replace_all_uses_with(input)
+                    graph.erase_node(node)
+                    contiguous_count += 1
+
+        logger.debug(
+            "Removed %s no-op reshapes and slices, %s no-op contiguous",
+            count,
+            contiguous_count,
+        )
 
     # ---------------------- Shape comparison helpers ----------------------
     def dims_equivalent(self, dim: int | SymInt, i_dim: int | SymInt) -> bool:
