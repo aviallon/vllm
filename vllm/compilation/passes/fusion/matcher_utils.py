@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import operator
 from abc import ABC, abstractmethod
-from typing import Any
+from collections import defaultdict
+from typing import Any, ClassVar
 
 import torch
+from torch import fx
 from torch._higher_order_ops import auto_functionalized
 from torch._ops import OpOverload
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
@@ -29,6 +33,8 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 ROTARY_OP = torch.ops._C.rotary_embedding.default
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
@@ -676,3 +682,145 @@ class MatcherSiluAndMul(MatcherCustomOp):
         x: torch.Tensor,
     ) -> torch.Tensor:
         return SiluAndMul.forward_native(x)
+
+
+# ---------------------------------------------------------------------------
+# Graph site census -- one-shot proof-of-branching diagnostic.
+#
+# Answers, on the real compiled graph and at match time: how many nodes of the
+# fusion-relevant ops exist, how many candidate producer->quant sites there
+# are, and through what chain the producer reaches the quant. "0 candidates"
+# and "N candidates" are both proof; silence is not.
+# ---------------------------------------------------------------------------
+
+_AUTO_FUNCTIONALIZED_NAMES = ("auto_functionalized", "auto_functionalized_v2")
+
+
+def called_op(node: fx.Node) -> OpOverload | None:
+    """The :class:`OpOverload` a node calls, unwrapping ``auto_functionalized``.
+
+    At post-grad match time mutating custom ops appear as
+    ``auto_functionalized(op, **kwargs)`` HOP calls (``auto_functionalized_v2``
+    on newer torch); both forms are recognised so the census sees the same
+    nodes the fusion patterns match.
+    """
+    if node.op != "call_function":
+        return None
+    target = node.target
+    if isinstance(target, OpOverload):
+        return target
+    if getattr(target, "__name__", "") in _AUTO_FUNCTIONALIZED_NAMES and (
+        node.args and isinstance(node.args[0], OpOverload)
+    ):
+        return node.args[0]
+    return None
+
+
+def op_call_kwargs(node: fx.Node, op: OpOverload) -> dict[str, Any]:
+    """Schema-name -> value for a (possibly functionalized) op call node."""
+    out: dict[str, Any] = {}
+    schema_args = list(op._schema.arguments)
+    if isinstance(node.target, OpOverload):
+        for name, value in zip((a.name for a in schema_args), node.args):
+            out[name] = value
+    out.update(node.kwargs)
+    return out
+
+
+def walk_views(node: Any) -> tuple[Any, int]:
+    """Follow no-op-ish view/cast nodes to the real producer.
+
+    Returns (producer, chain length). Mutating-op outputs (getitem of
+    auto_functionalized) count as producers.
+    """
+    chain = 0
+    while isinstance(node, fx.Node) and node.op == "call_function":
+        target = node.target
+        name = getattr(target, "__name__", "")
+        if name in ("contiguous", "clone", "view", "reshape", "flatten", "to",
+                    "permute", "transpose", "unsqueeze", "squeeze", "_unsafe_view"):
+            node = node.args[0]
+            chain += 1
+            continue
+        if (
+            target is operator.getitem
+            and node.args
+            and isinstance(node.args[0], fx.Node)
+        ):
+            producer = called_op(node.args[0])
+            if producer is not None:
+                # the getitem reads a mutable output of an op call: the real
+                # producer is that op
+                return node.args[0], chain + 1
+            node = node.args[0]
+            chain += 1
+            continue
+        break
+    return node, chain
+
+
+class FusionSiteCensus:
+    """One-shot log of fusion-relevant op counts and candidate sites."""
+
+    _logged: ClassVar[bool] = False
+
+    @classmethod
+    def log(cls, graph: fx.Graph) -> None:
+        if cls._logged:
+            return
+        cls._logged = True
+
+        counts: dict[str, int] = defaultdict(int)
+        candidates: dict[str, int] = defaultdict(int)
+        quant_inputs: dict[Any, Any] = {}
+
+        try:
+            rms_op = torch.ops.vllm_ir.rms_norm.default
+        except AttributeError:
+            rms_op = None
+        try:
+            fused_add_rms_op = torch.ops.vllm_ir.fused_add_rms_norm.default
+        except AttributeError:
+            fused_add_rms_op = None
+
+        tracked: dict[Any, str] = {SILU_MUL_OP: "silu_and_mul"}
+        quant_op = QUANT_OPS.get(kInt8DynamicTokenSym)
+        if quant_op is not None:
+            tracked[quant_op] = "quant_int8_dynamic_token"
+        if rms_op is not None:
+            tracked[rms_op] = "rms_norm"
+        if fused_add_rms_op is not None:
+            tracked[fused_add_rms_op] = "fused_add_rms_norm"
+
+        for node in graph.nodes:
+            op = called_op(node)
+            if op is None:
+                if node.op == "call_function":
+                    target_name = getattr(node.target, "__name__", "")
+                else:
+                    target_name = ""
+                if target_name == "silu":
+                    counts["aten_silu"] += 1
+                continue
+            if op in tracked:
+                counts[tracked[op]] += 1
+            elif op is torch.ops.aten.silu.default:
+                counts["aten_silu"] += 1
+            elif op is torch.ops.aten.contiguous.default:
+                counts["aten_contiguous"] += 1
+            if quant_op is not None and op is quant_op:
+                kwargs = op_call_kwargs(node, op)
+                quant_inputs[node] = kwargs.get("input")
+
+        for qnode, qinput in quant_inputs.items():
+            producer, chain = walk_views(qinput)
+            pop = called_op(producer) if isinstance(producer, fx.Node) else None
+            label = tracked.get(pop, "other")
+            candidates[f"{label}->{'quant_int8'}(view_chain={chain})"] += 1
+
+        logger.info(
+            "fusion site census (real graph, one-shot): ops=%s "
+            "int8_quant_candidates=%s",
+            dict(counts),
+            dict(candidates),
+        )
