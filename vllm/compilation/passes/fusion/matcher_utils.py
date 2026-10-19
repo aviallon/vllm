@@ -619,9 +619,23 @@ class MatcherQuantInt8(MatcherCustomOp):
         scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert scale is None
-        # Mirror the shipping ops.scaled_int8_quant call site: empty_like for
-        # the int8 result, a flattened [num_tokens, 1] float32 scale tensor.
-        result = torch.empty_like(input, dtype=self.quant_key.dtype)
+        # Mirror the shipping ops.scaled_int8_quant call site's allocation --
+        # but in the form the ENGINE's graph actually contains after the
+        # standalone_compile pre-grad decompositions: empty_like is decomposed
+        # to empty(size, layout=strided, pin_memory=False). Reproducing that
+        # exact call (instead of torch.empty_like, which the pattern trace
+        # would decompose into a sym_size-call-bearing form) is what makes
+        # register_replacement's exact re-match pass; with empty_like the
+        # re-traced pattern carried aten.sym_size nodes where the real graph
+        # has a literal dim, and check_fn silently rejected every site
+        # (measured 2026-10-19).
+        result = torch.empty(
+            (input.numel() // input.shape[-1], input.shape[-1]),
+            dtype=self.quant_key.dtype,
+            layout=torch.strided,
+            device=input.device,
+            pin_memory=False,
+        )
         scale = self.make_scale(input)
         ret = auto_functionalized(
             self.QUANT_OP, result=result, input=input, scale=scale, azp=None

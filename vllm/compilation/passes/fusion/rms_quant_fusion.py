@@ -36,7 +36,6 @@ from ..vllm_inductor_pass import (
     VllmInductorPass,
     VllmPatternMatcherPass,
     counted_extra_check,
-    fwd_only_no_decomp,
     log_pattern_match_summary,
 )
 from .matcher_utils import (
@@ -340,7 +339,7 @@ class RMSNormStaticQuantPattern(RMSNormQuantPattern):
             pattern,
             replacement,
             inputs,
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -407,7 +406,7 @@ class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
             pattern,
             replacement,
             inputs,
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -514,7 +513,7 @@ class FusedAddRMSNormGroupQuantPattern(RMSNormQuantPattern):
             pattern,
             replacement,
             inputs,
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -608,7 +607,7 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
                 empty_bf16(16),  # weight
                 self.quant_matcher.empty_f32(1, 1),  # scale
             ],
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -667,7 +666,7 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
                 empty_bf16(5, 16),  # input
                 empty_bf16(16),  # weight
             ],
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -732,7 +731,7 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             pattern,
             replacement,
             inputs,
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )
@@ -823,7 +822,7 @@ class FusedAddRMSNormNvfp4QuantPattern:
             pattern,
             replacement,
             inputs,
-            fwd_only_no_decomp,
+            pm.fwd_only,
             pm_pass,
             extra_check=_counted_dtype_check(pm_pass, self),
         )

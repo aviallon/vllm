@@ -467,7 +467,14 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
 
     @staticmethod
     def _trace_fn(*args: Any, **kwargs: Any) -> fx.GraphModule:
-        gm = fwd_only_no_decomp(*args, **kwargs)
+        # NOTE: pm.fwd_only traces WITH inductor's decomposition table, and
+        # that is load-bearing: the engine's graphs go through the same
+        # decompositions (vLLM compiles via torch._inductor.standalone_compile,
+        # whose pre-grad stage decomposes e.g. empty_like ->
+        # empty.memory_format(..., layout=strided)). A no-decomposition trace
+        # produced aten.empty_like nodes that could not match the real
+        # decomposed form (measured 2026-10-19 on the int8 norm->quant sites).
+        gm = pm.fwd_only(*args, **kwargs)
         _fx_view_to_reshape(gm)
         _remove_noop_permutes(gm)
         return gm
