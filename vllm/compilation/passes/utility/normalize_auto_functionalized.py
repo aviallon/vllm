@@ -69,6 +69,9 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
             elif self._is_raw_mutation_call(node):
                 wrapped += int(self._wrap_raw_call(graph, node))
         if rewritten or wrapped:
+            # The rewrites move values across the graph; lint so a
+            # use-before-def can never pass silently.
+            graph.lint()
             logger.info(
                 "normalize_auto_functionalized: rewrote %d v2 node(s), "
                 "wrapped %d raw mutation call(s) into the v1 call form",
@@ -78,10 +81,15 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
 
     @staticmethod
     def _is_raw_mutation_call(node: fx.Node) -> bool:
-        """A plain ``op(result, input, ...)`` mutation call -- the form AOT
-        leaves behind when auto_functionalized_v2 is disabled (vLLM's
-        inductor_compile_config sets ``enable_auto_functionalized_v2: False``),
-        which is exactly what the real w8a8 engine graph contains."""
+        """A plain ``op(result, input, ...)`` mutation call.
+
+        This is the form inductor's decompose_auto_functionalized leaves in
+        the FINAL graph, and the form some pipelines produce before the vLLM
+        hook (observed 2026-10-19 in an in-pod capture that ran the full
+        post_grad_passes). The w8a8 engine's hook graph currently carries v1
+        nodes (fusion site census: quant_call_forms={'auto_functionalized':
+        110}); this branch is defensive canonicalisation so the matchers see
+        ONE form regardless of which stage/pipeline produced the call."""
         if node.op != "call_function" or not isinstance(node.target, OpOverload):
             return False
         schema = node.target._schema
@@ -153,19 +161,24 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
                 return self._refuse(node, "mutated buffer also used as non-mutated arg")
 
         v1_kwargs: dict[str, Any] = dict(values)
-        new_node = graph.call_function(
-            auto_functionalized, args=(op,), kwargs=v1_kwargs
-        )
+        # Insert at the replaced node's position (fx appends to the end by
+        # default, which would leave the rewired consumers reading a node
+        # defined after them -- a use-before-def that graph.lint() rejects).
+        with graph.inserting_before(node):
+            new_node = graph.call_function(
+                auto_functionalized, args=(op,), kwargs=v1_kwargs
+            )
         new_node.meta.update(
             {k: v for k, v in node.meta.items() if k != "eager_input_vals"}
         )
 
         k_returns = len(schema.returns) or 1
         getitems: dict[str, fx.Node] = {}
-        for pos, name in enumerate(mutable):
-            getitems[name] = graph.call_function(
-                operator.getitem, args=(new_node, k_returns + pos)
-            )
+        with graph.inserting_after(new_node):
+            for pos, name in enumerate(mutable):
+                getitems[name] = graph.call_function(
+                    operator.getitem, args=(new_node, k_returns + pos)
+                )
 
         for user, base in moves:
             # find which mutated value this user read
@@ -288,10 +301,12 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
                 new_idx = k_returns + tail_map[base_pos]
             remap.append((user, new_idx))
 
-        # All checks passed: rewrite.
-        new_node = graph.call_function(
-            auto_functionalized, args=(op,), kwargs=v1_kwargs
-        )
+        # All checks passed: rewrite. Insert at the replaced node's position
+        # (fx appends by default -> use-before-def for the rewired users).
+        with graph.inserting_before(node):
+            new_node = graph.call_function(
+                auto_functionalized, args=(op,), kwargs=v1_kwargs
+            )
         # Carry the meta over, EXCEPT eager_input_vals: that one describes the
         # ORIGINAL v2 call's (args, kwargs) and inductor's decompose handler
         # tree-maps it against the node's own args/kwargs -- keeping the stale

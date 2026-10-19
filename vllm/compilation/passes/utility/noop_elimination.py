@@ -78,10 +78,11 @@ class NoOpEliminationPass(VllmInductorPass):
         # .view() (e.g. qwen3_next's hidden_states.view(-1, hidden_dim), a
         # same-shape no-op that sat between every norm and its int8 quant and
         # kept the fusion patterns from matching 68/70 sites), while the cases
-        # below handle reshape/slice.
-        from torch._inductor.fx_passes.post_grad import view_to_reshape
+        # below handle reshape/slice. (This pass therefore also rewrites
+        # view->reshape graph-wide, not only removes no-ops.)
+        from ..vllm_inductor_pass import _fx_view_to_reshape
 
-        view_to_reshape(graph.owning_module)
+        _fx_view_to_reshape(graph.owning_module)
         # Remove no-op reshapes/views:
         for node in graph.nodes:
             if is_func(node, torch.ops.aten.reshape.default):

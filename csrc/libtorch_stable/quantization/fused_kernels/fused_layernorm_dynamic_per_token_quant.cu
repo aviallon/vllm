@@ -195,8 +195,12 @@ void rms_norm_dynamic_per_token_quant(
   }
   // Weight must match the input dtype, or be fp32 with an fp16/bf16 input:
   // the Gemma-style `weight.float() + 1.0` norm form of the quantized qwen3.6
-  // models carries an fp32 weight over an fp16/bf16 stream (and keeps the
-  // reference numerics: the weight multiply happens in fp32).
+  // models carries an fp32 weight over an fp16/bf16 stream.
+  // NOTE on numerics (NOT bit-identical to the unfused chain): this kernel
+  // rounds x*rms to the INPUT dtype before the fp32 weight multiply, then
+  // quantises from fp32; the unfused chain multiplies in fp32 and rounds the
+  // PRODUCT to bf16 before quantising. Same class of difference as the
+  // fused silu+quant kernel (documented there); never claim parity.
   STD_TORCH_CHECK(weight.scalar_type() == input.scalar_type() ||
                       (weight.scalar_type() ==
                            torch::headeronly::ScalarType::Float &&
