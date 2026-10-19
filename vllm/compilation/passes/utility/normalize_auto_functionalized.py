@@ -80,20 +80,37 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
             return False
         if _v2_hop is not None and node.target == _v2_hop:
             return True
-        return getattr(node.target, "__name__", "") == "auto_functionalized_v2"
+        name = getattr(node.target, "__name__", "")
+        cls_name = type(node.target).__name__
+        return name == "auto_functionalized_v2" or cls_name == "AutoFunctionalizedV2"
+
+    _refusal_logged: set[str] = set()
+
+    def _refuse(self, node: fx.Node, reason: str) -> bool:
+        key = f"{getattr(node.target, '__name__', node.target)}:{reason}"
+        if key not in NormalizeAutoFunctionalizedPass._refusal_logged:
+            NormalizeAutoFunctionalizedPass._refusal_logged.add(key)
+            logger.warning(
+                "normalize_auto_functionalized: cannot rewrite %s node (%s); "
+                "fusion patterns will not match it. node=%r",
+                getattr(node.target, "__name__", node.target),
+                reason,
+                node,
+            )
+        return False
 
     def _normalize_one(self, graph: fx.Graph, node: fx.Node) -> bool:
         """Rewrite one v2 node. Returns False (graph untouched) if the node is
         a v2 shape this rewrite does not understand."""
         if not node.args or not isinstance(node.args[0], OpOverload):
-            return False
+            return self._refuse(node, "first arg is not an OpOverload")
         op = node.args[0]
         mutable = _mutable_arg_names(op)
         kwargs = dict(node.kwargs)
 
         all_bases = kwargs.pop("_all_bases", None)
-        if not isinstance(all_bases, (list, tuple)):
-            return False
+        if all_bases is None or not hasattr(all_bases, "__getitem__"):
+            return self._refuse(node, "missing/invalid _all_bases")
 
         # Collect base index indirection; refuse complex forms (list-valued
         # bases and ViewInfo extras have no v1 equivalent).
@@ -101,12 +118,12 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
         for name in mutable:
             key = f"_{name}_base_index"
             if key not in kwargs:
-                return False
+                return self._refuse(node, f"missing {key}")
             idx = kwargs.pop(key)
             if idx is not None and not isinstance(idx, int):
-                return False
+                return self._refuse(node, f"non-int {key}")
             if idx is not None and not (0 <= idx < len(all_bases)):
-                return False
+                return self._refuse(node, f"out-of-range {key}")
             base_index[name] = idx
 
         # Any kwarg that is not a schema name and not already-handled
@@ -114,7 +131,7 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
         schema_names = [arg.name for arg in op._schema.arguments]
         infra = {"_only_clone_these_tensors", "_op_schema"}
         if set(kwargs) - set(schema_names) - infra:
-            return False
+            return self._refuse(node, "unrecognised extra kwargs")
 
         # Build the v1 call: every schema arg as a named kwarg, mutated args
         # taking their base tensor (or None).
@@ -130,7 +147,8 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
                 try:
                     v1_kwargs[name] = arg.default_value
                 except Exception:
-                    return False  # required non-mutated arg missing from call
+                    # required non-mutated arg missing from the v2 call
+                    return self._refuse(node, "missing required non-mutated arg")
 
         # v2 tail index (base position) -> v1 tail index (schema position)
         k_returns = len(op._schema.returns) or 1
@@ -145,16 +163,16 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
         remap: list[tuple[fx.Node, int]] = []
         for user in node.users:
             if user.op != "call_function" or user.target is not operator.getitem:
-                return False
+                return self._refuse(node, "non-getitem consumer")
             old_idx = user.args[1]
             if not isinstance(old_idx, int) or old_idx < 0:
-                return False
+                return self._refuse(node, "non-int getitem index")
             if old_idx < k_returns:
                 new_idx = old_idx
             else:
                 base_pos = old_idx - k_returns
                 if base_pos not in tail_map:
-                    return False
+                    return self._refuse(node, "getitem index not mappable")
                 new_idx = k_returns + tail_map[base_pos]
             remap.append((user, new_idx))
 
@@ -162,7 +180,15 @@ class NormalizeAutoFunctionalizedPass(VllmInductorPass):
         new_node = graph.call_function(
             auto_functionalized, args=(op,), kwargs=v1_kwargs
         )
-        new_node.meta.update(node.meta)
+        # Carry the meta over, EXCEPT eager_input_vals: that one describes the
+        # ORIGINAL v2 call's (args, kwargs) and inductor's decompose handler
+        # tree-maps it against the node's own args/kwargs -- keeping the stale
+        # v2 shape there made replace_by_example raise
+        # "Node arity mismatch; expected 4, but got 5" on every rewritten node
+        # that survived to decompose_auto_functionalized.
+        new_node.meta.update(
+            {k: v for k, v in node.meta.items() if k != "eager_input_vals"}
+        )
         for user, new_idx in remap:
             user.update_arg(0, new_node)
             user.update_arg(1, new_idx)

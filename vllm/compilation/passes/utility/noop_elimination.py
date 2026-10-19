@@ -74,6 +74,14 @@ class NoOpEliminationPass(VllmInductorPass):
     def __call__(self, graph: torch.fx.Graph) -> None:
         count = 0
         contiguous_count = 0
+        # Normalise aten.view to aten.reshape first: the model call sites use
+        # .view() (e.g. qwen3_next's hidden_states.view(-1, hidden_dim), a
+        # same-shape no-op that sat between every norm and its int8 quant and
+        # kept the fusion patterns from matching 68/70 sites), while the cases
+        # below handle reshape/slice.
+        from torch._inductor.fx_passes.post_grad import view_to_reshape
+
+        view_to_reshape(graph.owning_module)
         # Remove no-op reshapes/views:
         for node in graph.nodes:
             if is_func(node, torch.ops.aten.reshape.default):

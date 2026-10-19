@@ -779,6 +779,7 @@ class FusionSiteCensus:
 
         counts: dict[str, int] = defaultdict(int)
         candidates: dict[str, int] = defaultdict(int)
+        quant_forms: dict[str, int] = defaultdict(int)
         quant_inputs: dict[Any, Any] = {}
 
         try:
@@ -814,16 +815,38 @@ class FusionSiteCensus:
             if quant_op is not None and op is quant_op:
                 kwargs = op_call_kwargs(node, op)
                 quant_inputs[node] = kwargs.get("input")
+                if isinstance(node.target, OpOverload):
+                    quant_forms["raw_call"] += 1
+                else:
+                    quant_forms[op_base_name(node.target)] += 1
 
+        first_site: list[str] = []
         for qnode, qinput in quant_inputs.items():
             producer, chain = walk_views(qinput)
             pop = called_op(producer) if isinstance(producer, fx.Node) else None
             label = tracked.get(pop, "other")
             candidates[f"{label}->{'quant_int8'}(view_chain={chain})"] += 1
+            if not first_site and label in ("rms_norm", "fused_add_rms_norm"):
+                # one-shot site dump: the exact nodes between the producer and
+                # the quant (the form the matchers must reproduce)
+                cursor = qinput
+                first_site.append(repr(qnode))
+                seen = 0
+                while isinstance(cursor, fx.Node) and seen < 6:
+                    first_site.append(repr(cursor))
+                    if called_op(cursor) is not None or not cursor.args:
+                        break
+                    cursor = cursor.args[0]
+                    seen += 1
 
         logger.info(
             "fusion site census (real graph, one-shot): ops=%s "
-            "int8_quant_candidates=%s",
+            "quant_call_forms=%s int8_quant_candidates=%s",
             dict(counts),
+            dict(quant_forms),
             dict(candidates),
         )
+        if first_site:
+            logger.info(
+                "fusion site census: first norm->quant site nodes=%s", first_site
+            )
