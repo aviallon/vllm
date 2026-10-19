@@ -727,6 +727,13 @@ def op_call_kwargs(node: fx.Node, op: OpOverload) -> dict[str, Any]:
     return out
 
 
+def op_base_name(target: Any) -> str:
+    """'contiguous' for aten.contiguous.default, 'silu' for aten.silu, ..."""
+    if isinstance(target, OpOverload):
+        return target.name().split("::")[-1].split(".")[0]
+    return getattr(target, "__name__", "")
+
+
 def walk_views(node: Any) -> tuple[Any, int]:
     """Follow no-op-ish view/cast nodes to the real producer.
 
@@ -736,7 +743,7 @@ def walk_views(node: Any) -> tuple[Any, int]:
     chain = 0
     while isinstance(node, fx.Node) and node.op == "call_function":
         target = node.target
-        name = getattr(target, "__name__", "")
+        name = op_base_name(target)
         if name in ("contiguous", "clone", "view", "reshape", "flatten", "to",
                     "permute", "transpose", "unsqueeze", "squeeze", "_unsafe_view"):
             node = node.args[0]
@@ -795,16 +802,12 @@ class FusionSiteCensus:
         for node in graph.nodes:
             op = called_op(node)
             if op is None:
-                if node.op == "call_function":
-                    target_name = getattr(node.target, "__name__", "")
-                else:
-                    target_name = ""
-                if target_name == "silu":
+                if node.op == "call_function" and op_base_name(node.target) == "silu":
                     counts["aten_silu"] += 1
                 continue
             if op in tracked:
                 counts[tracked[op]] += 1
-            elif op is torch.ops.aten.silu.default:
+            elif op_base_name(op) == "silu":
                 counts["aten_silu"] += 1
             elif op is torch.ops.aten.contiguous.default:
                 counts["aten_contiguous"] += 1

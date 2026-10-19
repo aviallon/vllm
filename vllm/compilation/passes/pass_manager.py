@@ -63,6 +63,7 @@ from .inductor_pass import (
 )
 from .utility.fix_functionalization import FixFunctionalizationPass
 from .utility.noop_elimination import NoOpEliminationPass
+from .utility.normalize_auto_functionalized import NormalizeAutoFunctionalizedPass
 
 logger = init_logger(__name__)
 
@@ -153,6 +154,12 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
+            # ALWAYS FIRST: every fusion matcher targets the
+            # auto_functionalized (v1) call form; on torch >= 2.13 the graph
+            # carries auto_functionalized_v2 nodes instead and nothing can
+            # match until they are normalised.
+            self.passes += [NormalizeAutoFunctionalizedPass(config)]
+
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 

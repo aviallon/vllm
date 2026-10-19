@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Normalise ``auto_functionalized_v2`` HOP calls to the ``auto_functionalized``
+(v1) form.
+
+Why this exists
+---------------
+On torch >= 2.13, AOTAutograd emits ``auto_functionalized_v2`` for custom ops
+with mutable arguments: the mutated tensors travel as ``_all_bases`` with
+``_<name>_base_index`` indirection instead of named kwargs. Every vLLM fusion
+matcher traces the **v1** call convention
+(``auto_functionalized(op, result=..., input=..., scale=..., azp=None)``), and
+``FixFunctionalizationPass`` looks for v1 nodes too -- so on this torch **no
+fusion pattern can match the real graph at all** (measured 2026-10-19: the int8
+norm->quant patterns matched 0 of 70 candidate sites on the real w8a8 qwen3.6
+graph, on production torch 2.13.0+git733fca1, purely because of this form
+difference -- the site census showed every site present).
+
+The pass rewrites each simple v2 node into the equivalent v1 node before the
+fusion passes run. Complex v2 nodes (list-valued mutated args, ViewInfo
+entries) are left untouched -- they are not forms any matcher targets.
+
+Output-index mapping: v2 returns ``(op_returns..., *bases in _all_bases
+order)``, v1 returns ``(op_returns..., *mutated args in schema order)``;
+consumers are ``getitem`` calls, so their indices are remapped by base name.
+"""
+
+import operator
+
+import torch
+from torch import fx
+from torch._higher_order_ops import auto_functionalized
+from torch._ops import OpOverload
+
+from vllm.logger import init_logger
+
+from ..vllm_inductor_pass import VllmInductorPass
+
+logger = init_logger(__name__)
+
+_v2_hop = getattr(torch.ops.higher_order, "auto_functionalized_v2", None)
+
+
+def _mutable_arg_names(op: OpOverload) -> list[str]:
+    return [
+        arg.name
+        for arg in op._schema.arguments
+        if arg.alias_info is not None and arg.alias_info.is_write
+    ]
+
+
+class NormalizeAutoFunctionalizedPass(VllmInductorPass):
+    """Rewrite simple auto_functionalized_v2 nodes into auto_functionalized.
+
+    Runs first in the post-grad pass manager, before every fusion matcher.
+    A no-op on torch versions that emit v1 (or none at all).
+    """
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        if _v2_hop is None:
+            return
+        count = 0
+        for node in list(graph.nodes):
+            if not self._is_v2(node):
+                continue
+            if self._normalize_one(graph, node):
+                count += 1
+        if count:
+            logger.info(
+                "normalize_auto_functionalized: rewrote %d "
+                "auto_functionalized_v2 node(s) to the v1 call form",
+                count,
+            )
+
+    @staticmethod
+    def _is_v2(node: fx.Node) -> bool:
+        if node.op != "call_function":
+            return False
+        if _v2_hop is not None and node.target == _v2_hop:
+            return True
+        return getattr(node.target, "__name__", "") == "auto_functionalized_v2"
+
+    def _normalize_one(self, graph: fx.Graph, node: fx.Node) -> bool:
+        """Rewrite one v2 node. Returns False (graph untouched) if the node is
+        a v2 shape this rewrite does not understand."""
+        if not node.args or not isinstance(node.args[0], OpOverload):
+            return False
+        op = node.args[0]
+        mutable = _mutable_arg_names(op)
+        kwargs = dict(node.kwargs)
+
+        all_bases = kwargs.pop("_all_bases", None)
+        if not isinstance(all_bases, (list, tuple)):
+            return False
+
+        # Collect base index indirection; refuse complex forms (list-valued
+        # bases and ViewInfo extras have no v1 equivalent).
+        base_index: dict[str, int | None] = {}
+        for name in mutable:
+            key = f"_{name}_base_index"
+            if key not in kwargs:
+                return False
+            idx = kwargs.pop(key)
+            if idx is not None and not isinstance(idx, int):
+                return False
+            if idx is not None and not (0 <= idx < len(all_bases)):
+                return False
+            base_index[name] = idx
+
+        # Any kwarg that is not a schema name and not already-handled
+        # infrastructure keys means a v2 shape we do not understand.
+        schema_names = [arg.name for arg in op._schema.arguments]
+        infra = {"_only_clone_these_tensors", "_op_schema"}
+        if set(kwargs) - set(schema_names) - infra:
+            return False
+
+        # Build the v1 call: every schema arg as a named kwarg, mutated args
+        # taking their base tensor (or None).
+        v1_kwargs: dict[str, object] = {}
+        for arg in op._schema.arguments:
+            name = arg.name
+            if name in mutable:
+                idx = base_index[name]
+                v1_kwargs[name] = None if idx is None else all_bases[idx]
+            elif name in kwargs:
+                v1_kwargs[name] = kwargs[name]
+            else:
+                try:
+                    v1_kwargs[name] = arg.default_value
+                except Exception:
+                    return False  # required non-mutated arg missing from call
+
+        # v2 tail index (base position) -> v1 tail index (schema position)
+        k_returns = len(op._schema.returns) or 1
+        tail_map: dict[int, int] = {}
+        for schema_pos, name in enumerate(mutable):
+            idx = base_index[name]
+            if idx is not None and idx not in tail_map:
+                tail_map[idx] = schema_pos
+
+        # Pre-validate consumers BEFORE mutating anything: every user must be
+        # a getitem whose index we can remap.
+        remap: list[tuple[fx.Node, int]] = []
+        for user in node.users:
+            if user.op != "call_function" or user.target is not operator.getitem:
+                return False
+            old_idx = user.args[1]
+            if not isinstance(old_idx, int) or old_idx < 0:
+                return False
+            if old_idx < k_returns:
+                new_idx = old_idx
+            else:
+                base_pos = old_idx - k_returns
+                if base_pos not in tail_map:
+                    return False
+                new_idx = k_returns + tail_map[base_pos]
+            remap.append((user, new_idx))
+
+        # All checks passed: rewrite.
+        new_node = graph.call_function(
+            auto_functionalized, args=(op,), kwargs=v1_kwargs
+        )
+        new_node.meta.update(node.meta)
+        for user, new_idx in remap:
+            user.update_arg(0, new_node)
+            user.update_arg(1, new_idx)
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
+        return True

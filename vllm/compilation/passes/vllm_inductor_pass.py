@@ -168,6 +168,21 @@ def counted_extra_check(
     return PatternMatchTelemetry(pass_name, motif, base)
 
 
+def fwd_only_no_decomp(
+    fn: Callable[..., Any], args: Any, get_decomp_fn: Any = None
+) -> fx.GraphModule:
+    """``pm.fwd_only`` trace_fn WITHOUT inductor's decomposition table.
+
+    Patterns must match the graph as it is at post-grad pass time -- after
+    AOTAutograd functionalisation but BEFORE inductor lowers/decomposes aten
+    ops. With the default (decomposed) trace, e.g. the call sites'
+    ``aten.empty_like.default`` is traced as ``empty.memory_format`` on the
+    pattern side while the real graph keeps ``empty_like``, and the pattern
+    can never match (measured 2026-10-19 on the int8 norm->quant sites).
+    """
+    return pm.fwd_only(fn, args, get_decomp_fn=lambda: {})
+
+
 def log_pattern_match_summary(pass_name: str, matched_total: int) -> None:
     """One-shot-per-run summary of per-motif matches for one pass invocation.
 
@@ -452,7 +467,7 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
 
     @staticmethod
     def _trace_fn(*args: Any, **kwargs: Any) -> fx.GraphModule:
-        gm = pm.fwd_only(*args, **kwargs)
+        gm = fwd_only_no_decomp(*args, **kwargs)
         _fx_view_to_reshape(gm)
         _remove_noop_permutes(gm)
         return gm
