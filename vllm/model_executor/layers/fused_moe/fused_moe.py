@@ -611,7 +611,11 @@ def fused_moe_kernel(
     # Cast once at the end to the desired compute/output dtype.
     # The fused top-k sum keeps fp32: the contributions are added across
     # workgroups before the single final rounding on the host side.
-    tl.static_assert(not (FUSE_MOE_SUM and naive_block_assignment))
+    # NB: naive_block_assignment is supported -- there offs_token is still a
+    # row of the token*top_k+slot space (one row per workgroup), so the
+    # division below yields the token just the same.  A compile-time assert
+    # here broke engine startup on small chunks (the naive path activates at
+    # num_tokens*top_k*4 <= num_experts, i.e. warmup/dummy runs).
     if FUSE_MOE_SUM:
         offs_crow = offs_token // SUM_TOPK
     else:
