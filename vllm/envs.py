@@ -93,6 +93,13 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
+    # Fuse the MoE top-k reduction (moe_sum) into the second fused_moe_kernel
+    # (down-projection) epilogue: its routed, weighted expert rows are
+    # atomically accumulated (fp32) into the final per-token output, so the
+    # [M, topk, K] intermediate and the separate moe_sum pass never exist.
+    # Opt-in experiment (gfx90a/w8a8): the atomic accumulation changes the
+    # FP addition order (and removes a bf16 rounding of the partials).
+    VLLM_MOE_SUM_FUSION: bool = False
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -643,6 +650,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
     ),
+    "VLLM_MOE_SUM_FUSION": lambda: bool(int(os.getenv("VLLM_MOE_SUM_FUSION", "0"))),
     # If set, enable GPU<->CPU synchronization checking around the worker's
     # `execute_model` and `sample_tokens` calls, via PyTorch's sync debug mode
     # plus wrappers flagging `non_blocking` CPU<->CUDA copies that silently

@@ -351,6 +351,13 @@ def fused_moe_kernel(
     SWAP_AB: tl.constexpr,
     # Tensor-descriptor path for the A gather and B load in the K-loop.
     USE_TD: tl.constexpr = False,
+    # Fused top-k reduction (moe_sum): when set, C is a ZERO-INITIALISED fp32
+    # [M, N] accumulator (not the [M, topk, N] row cache) and the epilogue
+    # atomically adds each routed, weighted expert row into its token's row
+    # (row // SUM_TOPK), summing the top-k contributions across workgroups.
+    # The output rows then never leave fp32 before the final (host-side) cast.
+    FUSE_MOE_SUM: tl.constexpr = False,
+    SUM_TOPK: tl.constexpr = 1,
 ):
     """Implements the fused computation for a Mixture of Experts (MOE) using
     token and expert matrices.
@@ -420,6 +427,10 @@ def fused_moe_kernel(
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     if off_experts == -1:
+        if FUSE_MOE_SUM:
+            # A dropped expert contributes nothing to the top-k sum; the fp32
+            # accumulator was zero-initialised on the host side.
+            return
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
         # in the current expert parallel rank.
@@ -598,14 +609,26 @@ def fused_moe_kernel(
 
     # Final precision conversion:
     # Cast once at the end to the desired compute/output dtype.
-    accumulator = accumulator.to(compute_type)
+    # The fused top-k sum keeps fp32: the contributions are added across
+    # workgroups before the single final rounding on the host side.
+    tl.static_assert(not (FUSE_MOE_SUM and naive_block_assignment))
+    if FUSE_MOE_SUM:
+        offs_crow = offs_token // SUM_TOPK
+    else:
+        accumulator = accumulator.to(compute_type)
+        offs_crow = offs_token
 
     # -----------------------------------------------------------
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + stride_cm * offs_crow[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if FUSE_MOE_SUM:
+        # Atomic, because one token's top-k rows are computed by different
+        # workgroups (different experts) in arbitrary order.
+        tl.atomic_add(c_ptrs, accumulator, mask=c_mask)
+    else:
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 # NOTE(zyongye): we can remove all the wna16 kernel
@@ -779,6 +802,8 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    fuse_moe_sum: bool = False,
+    sum_topk: int = 1,
 ):
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
@@ -861,6 +886,16 @@ def invoke_fused_moe_triton_kernel(
     if A_scale is not None and A_scale.ndim == 0:
         A_scale = A_scale.reshape(1)
 
+    if fuse_moe_sum:
+        # C is the fp32 [M, N] top-k-sum accumulator, not the [M, topk, N]
+        # row cache: its flattened row stride is stride(0), not stride(1).
+        assert C.dim() == 2 and C.dtype == torch.float32, (
+            "fuse_moe_sum expects a 2-D fp32 accumulator"
+        )
+        stride_cm, stride_cn = C.stride(0), C.stride(1)
+    else:
+        stride_cm, stride_cn = C.stride(1), C.stride(2)
+
     fused_moe_kernel[grid](
         A,
         B,
@@ -881,8 +916,8 @@ def invoke_fused_moe_triton_kernel(
         B.stride(0),
         B.stride(2),
         B.stride(1),
-        C.stride(1),
-        C.stride(2),
+        stride_cm,
+        stride_cn,
         A_scale.stride(0) if A_scale is not None and A_scale.ndim == 2 else 0,
         A_scale.stride(1) if A_scale is not None and A_scale.ndim == 2 else 0,
         B_scale.stride(0) if B_scale is not None and B_scale.ndim >= 2 else 0,
@@ -904,6 +939,8 @@ def invoke_fused_moe_triton_kernel(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         SWAP_AB=SWAP_AB,
         USE_TD=use_td,
+        FUSE_MOE_SUM=fuse_moe_sum,
+        SUM_TOPK=sum_topk,
         **config,
     )
 

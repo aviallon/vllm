@@ -6,6 +6,8 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm import envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -63,6 +65,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+logger = init_logger(__name__)
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -557,11 +561,32 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # sorted_token_ids_lora computed above. Same dual-stream pattern as
         # the w13 pair: base GEMM on default stream, LoRA delta on aux,
         # join via .add_() into intermediate_cache3.
+        # Optional fused top-k reduction (VLLM_MOE_SUM_FUSION): gemm2's
+        # epilogue accumulates the routed, weighted expert rows directly into
+        # a zero-initialised fp32 [num_tokens, K] output with atomics, so the
+        # [M, topk, K] intermediate write and the separate moe_sum pass never
+        # happen. Restricted to the plain path: LoRA adds a delta into
+        # intermediate_cache3 and the EP path uses the pad-aware moe_sum.
+        fuse_moe_sum = (
+            envs.VLLM_MOE_SUM_FUSION and lora_context is None and expert_map is None
+        )
+        if fuse_moe_sum:
+            out_acc = torch.zeros(
+                (num_tokens, K), dtype=torch.float32, device=output.device
+            )
+            logger.info_once(
+                "moe_sum fusion ACTIVE (VLLM_MOE_SUM_FUSION=1): the fused_moe "
+                "down-projection epilogue accumulates the weighted top-k rows "
+                "into a fp32 output (atomic add) and moe_sum is not launched"
+            )
+        else:
+            out_acc = intermediate_cache3
+
         def _base_w2_fn():
             invoke_fused_moe_triton_kernel(
                 qintermediate_cache2,
                 w2,
-                intermediate_cache3,
+                out_acc,
                 a2q_scale,
                 self.w2_scale,
                 topk_weights,
@@ -579,6 +604,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 per_channel_quant=self.per_act_token_quant,
                 block_shape=self.block_shape,
                 B_bias=self.w2_bias,
+                fuse_moe_sum=fuse_moe_sum,
+                sum_topk=top_k_num,
             )
 
         if lora_context is not None and lora_context.aux_stream is not None:
@@ -628,8 +655,12 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                     top_k_num=top_k_num,
                 )
 
-        # separate function is required for MoE + LoRA
-        self.moe_sum(intermediate_cache3, output, topk_ids, expert_map)
+        if fuse_moe_sum:
+            # fp32 -> model dtype; the single final rounding of the top-k sum.
+            output.copy_(out_acc)
+        else:
+            # separate function is required for MoE + LoRA
+            self.moe_sum(intermediate_cache3, output, topk_ids, expert_map)
 
     def moe_sum(
         self,
