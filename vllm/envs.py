@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ROCM_TRITON_ATTN_BLOCK_M: int = 0
+    VLLM_ROCM_TRITON_ATTN_INT8_PV: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1476,6 +1477,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # are ignored (the wrapper keeps its own choice).
     "VLLM_ROCM_TRITON_ATTN_BLOCK_M": lambda: int(
         os.getenv("VLLM_ROCM_TRITON_ATTN_BLOCK_M", "0") or 0
+    ),
+    # Full-int8 PV in the triton_attn per-token-head reader: keep the V tile
+    # in int8, requantise P to int8 per row and run the PV dot as
+    # int8 x int8 -> i32 (with USE_INT8_QK that makes the whole reader
+    # int8-native).  Default off = PV stays bf16 (the measured shipping
+    # behaviour); requires --kv-cache-dtype int8_per_token_head to matter.
+    "VLLM_ROCM_TRITON_ATTN_INT8_PV": lambda: (
+        os.getenv("VLLM_ROCM_TRITON_ATTN_INT8_PV", "False").lower() in ("true", "1")
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),
