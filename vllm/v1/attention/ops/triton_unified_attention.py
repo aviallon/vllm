@@ -343,6 +343,16 @@ def kernel_unified_attention(
             KV_QUANT_MODE == 2,
             "USE_INT8_PV requires KV_QUANT_MODE == 2 (INT8 per-token-head)",
         )
+        # The PV dot's i32 -> fp32 cast is lossless while the per-dot
+        # accumulation bound TILE_SIZE * 127 * 128 <= 2^24 (the contracting
+        # dimension of the PV dot is TILE_SIZE, not HEAD_SIZE).  Asserted like
+        # the QK bound: a hypothetical wider KV tile must not silently start
+        # rounding the PV accumulator cast.
+        tl.static_assert(
+            TILE_SIZE * 127 * 128 <= 1 << 24,
+            "USE_INT8_PV requires TILE_SIZE * 127 * 128 <= 2^24 for the "
+            "exact i32->fp32 PV dot cast",
+        )
 
     if USE_TD:
         tl.static_assert(
@@ -711,19 +721,28 @@ def kernel_unified_attention(
             # Precision surface (the honest one): the quantiser step is
             # max(P_v)/127 per row, so P_v elements below max/254 round to
             # zero (relative error up to 100 % on the tail, absolute error
-            # <= step/2 per element).  This is the same error class as the
-            # per-token-head KV quantisation already in production, one
-            # stage more of it; the end-to-end coherence gates (B7 / ppl /
-            # AIME) are the arbiter, not a dtype floor.  i32 accumulation is
-            # exact (TILE_SIZE * 127 * 128 <= 2^24) and the i32 -> fp32 cast
-            # below is lossless.  The 1e-6 floor on the row scale is a real
-            # guard, not decoration: a fully-masked row has max 0 (and a row
-            # of denormal P has a denormal max), so without it 1/scale would
-            # overflow fp32 and NaN-poison the requant; with it the row
-            # quantises to zeros and the tracked scale stays consistent
-            # (acc is 0 on those rows).
+            # <= step/2 per element).  With the floor active (masked or
+            # denormal rows) the effective step is max(max/127, 1e-6), so the
+            # absolute error gains a 5e-7*|V| floor term on those rows — one
+            # quantisation stage more on top of the per-token-head KV
+            # quantisation already in production.  The end-to-end coherence
+            # gates (B7 / ppl / AIME) are the arbiter, not a dtype floor.
+            # Accumulation exactness and cast losslessness are two DIFFERENT
+            # bounds: each PV dot accumulates exactly in i32 (|c| <=
+            # TILE_SIZE * 127 * 128 = 520 k at T=32), its i32 -> fp32 cast is
+            # lossless while that is <= 2^24 (static_assert above), and the
+            # ACROSS-tile accumulation happens in fp32 (there is no i32
+            # accumulator between tiles).
             P_v = P * v_token_head_scales[None, :]
             p_row_max = tl.max(P_v, axis=1)
+            # The 1e-6 floor on the row scale is a real guard, not
+            # decoration: a fully-masked row has max 0 (and a row of
+            # denormal P has a denormal max), so without it 1/scale would
+            # overflow fp32 and NaN-poison the requant.  With it, such rows
+            # quantise to zeros and the tracked scale stays consistent (acc
+            # is 0 there in the fully-masked case; a LATER floored tile keeps
+            # a non-zero acc consistent through the tracked scale — the
+            # factor rescales it to the new unit).
             p_row_scale = tl.maximum(p_row_max / 127.0, 1e-6)
             p_scaled = P_v * (1.0 / p_row_scale[:, None]) + 0.5
             P_i8 = tl.clamp(p_scaled, 0.0, 127.0).to(tl.int8)
@@ -1039,7 +1058,13 @@ def _log_tile_config_once(
         int8_qk,
         int8_pv,
     )
-    if key in _TILE_CONFIG_LOGGED or len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP:
+    if key in _TILE_CONFIG_LOGGED:
+        return
+    # The cap must never swallow the int8_pv line: it is the branching proof
+    # of the full-int8 path (a pod that already logged 8 other configs would
+    # otherwise drop it silently).  int8_pv configs bypass the cap — there is
+    # at most a handful of distinct ones.
+    if len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP and not int8_pv:
         return
     _TILE_CONFIG_LOGGED.add(key)
 
