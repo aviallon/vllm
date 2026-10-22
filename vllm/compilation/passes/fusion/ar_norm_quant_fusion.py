@@ -85,10 +85,14 @@ def _decode_regime(match: pm.Match) -> bool:
     """
     for node in match.nodes:
         if called_op(node) is _AR_OP:
-            inp = op_call_kwargs(node, _AR_OP).get("input")
+            # schema: vllm::all_reduce(Tensor tensor, str group_name)
+            kwargs = op_call_kwargs(node, _AR_OP)
+            inp = kwargs.get("tensor", kwargs.get("input"))
         elif node.target is _FUSED_ADD_RMS_NORM_OP:
             inp = node.args[0]
         else:
+            continue
+        if inp is None:
             continue
         try:
             val = inp.meta["val"]

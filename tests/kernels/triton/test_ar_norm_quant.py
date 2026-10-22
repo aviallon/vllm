@@ -484,6 +484,7 @@ class TestPatternWiring:
     def test_ar_pattern_traces_the_ar_node(self):
         _ensure_c_stubs()
         import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
 
         import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
         from vllm.compilation.passes.inductor_pass import enable_fake_mode
@@ -500,23 +501,53 @@ class TestPatternWiring:
             @enable_fake_mode
             def _build():
                 pr = f.ArNormQuantInt8Pattern(1e-6)
-                return pm.fwd_only(pr.pattern, pr.get_inputs())
+                # register WITH the composite extra_check: this is what the
+                # pass does, and a wrong kwarg name in _decode_regime would
+                # silently decline every site (measured 2026-10-22: the
+                # all_reduce schema arg is 'tensor', not 'input').
+                pr.extra_check = f._composite_check(pr.quant_op)
+                pm_pass = PatternMatcherPass(pass_name="test_ar_norm_quant3")
+                pm.register_replacement(
+                    pr.pattern,
+                    pr.replacement,
+                    pr.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass,
+                    extra_check=pr.extra_check,
+                )
+                gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                # inspect the PRE-rewrite graph here
+                pre_ops = {
+                    f.called_op(n)
+                    for n in gm.graph.nodes
+                    if n.op == "call_function"
+                }
+                # apply INSIDE the patch window: register_replacement's
+                # exact re-match re-traces the pattern at apply time
+                matched = pm_pass.apply(gm.graph)
+                return gm, matched, pre_ops
 
             try:
-                gm = _build()
+                gm, matched, ops = _build()
             finally:
                 f.tensor_model_parallel_all_reduce = orig
-        ops = {
-            f.called_op(n)
-            for n in gm.graph.nodes
-            if n.op == "call_function"
-        }
         assert f._AR_OP in ops, f"AR node missing from 3-way pattern: {ops}"
         assert f._FUSED_ADD_RMS_NORM_OP in ops
         assert any(
             o is not None and "dynamic_scaled_int8_quant" in str(o)
             for o in ops
         ), f"quant node missing: {ops}"
+        assert matched >= 1, (
+            "3-way pattern did not match its own traced chain "
+            "(extra_check declining?)"
+        )
+        fused_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in fused_ops
+        ), f"fused 3-way op absent after rewrite: {fused_ops}"
 
     def test_pass_config_flags_exist(self):
         from vllm.config.compilation import PassConfig
