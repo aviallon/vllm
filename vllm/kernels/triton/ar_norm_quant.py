@@ -105,10 +105,14 @@ def _norm_quant_int8_kernel(
     # int64 scalar args -> pointers (the peer buffers arrive as raw addresses
     # opened from hipIpc handles; the 2026-10-22 probe proved this exact cast
     # form on gfx90a). All zero when PEER=0, never dereferenced there.
-    slot_p = tl.cast(slot_ptr, tl.pointer_type(tl.bfloat16))
-    peer_p = tl.cast(peer_ptr, tl.pointer_type(tl.bfloat16))
-    flag_p = tl.cast(flag_ptr, tl.pointer_type(tl.int32))
-    pflag_p = tl.cast(peer_flag_ptr, tl.pointer_type(tl.int32))
+    # The explicit promotion to i64 is load-bearing: the Triton JIT infers a
+    # Python int argument as i32 when it fits (the PEER=0 dummies are 0), and
+    # tt.int_to_ptr REJECTS an i32 operand (measured 2026-10-22 on aragorn:
+    # "'tt.int_to_ptr' op operand #0 must be 64-bit signless integer").
+    slot_p = tl.cast(slot_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
+    peer_p = tl.cast(peer_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
+    flag_p = tl.cast(flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
+    pflag_p = tl.cast(peer_flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
 
     # ---- phase 0 (PEER): publish my row, then release my flag, then wait
     # for the peer's flag. Order is load-bearing: data stores strictly before
@@ -198,7 +202,7 @@ def _norm_quant_int8_kernel(
 
 @triton.jit
 def _zero_kernel(ptr, n, BLOCK: tl.constexpr):
-    p = tl.cast(ptr, tl.pointer_type(tl.int32))
+    p = tl.cast(ptr.to(tl.int64), tl.pointer_type(tl.int32))
     offs = tl.arange(0, BLOCK)
     for base in range(0, n, BLOCK):
         o = base + offs

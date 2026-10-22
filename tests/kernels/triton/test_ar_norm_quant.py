@@ -157,44 +157,49 @@ class TestGfx90aCodegen:
         from triton.backends.compiler import GPUTarget
         from triton.compiler import ASTSource, compile as triton_compile
 
-        sig = {
-            "x_ptr": "*bf16",
-            "res_ptr": "*bf16",
-            "weight_ptr": "*fp32",
-            "out_ptr": "*i8",
-            "scale_ptr": "*fp32",
-            "slot_ptr": "i64",
-            "peer_ptr": "i64",
-            "flag_ptr": "i64",
-            "peer_flag_ptr": "i64",
-            "eps": "fp32",
-            "stride_x": "i32",
-            "stride_res": "i32",
-            "stride_out": "i32",
-            "stride_slot": "i32",
-        }
-        for peer in (0, 1):
-            src = ASTSource(
-                fn=k._norm_quant_int8_kernel,
-                signature=sig,
-                constexprs={
-                    "H": 2048,
-                    "BLOCK_H": 2048,
-                    "PEER": peer,
-                    "FLAG_STRIDE": 32,
-                },
-            )
-            compiled = triton_compile(
-                src, target=GPUTarget("hip", "gfx90a", 32),
-                options={"num_warps": 8},
-            )
-            asm = compiled.asm.get("amdgcn", "")
-            assert len(asm) > 1000
-            # the contract's rounding primitive: rint -> v_rndne_f32
-            assert "v_rndne_f32" in asm
-            if peer:
-                # the barrier primitives must survive lowering
-                assert "global_atomic" in asm
+        for ptr_ty in ("i64", "i32"):
+            # "i32" is what the JIT really infers for Python int args that
+            # fit (the PEER=0 dummies are 0): tt.int_to_ptr rejects i32 unless
+            # the kernel promotes to i64 itself (regression for the 2026-10-22
+            # aragorn failure: "operand #0 must be 64-bit signless integer").
+            sig = {
+                "x_ptr": "*bf16",
+                "res_ptr": "*bf16",
+                "weight_ptr": "*fp32",
+                "out_ptr": "*i8",
+                "scale_ptr": "*fp32",
+                "slot_ptr": ptr_ty,
+                "peer_ptr": ptr_ty,
+                "flag_ptr": ptr_ty,
+                "peer_flag_ptr": ptr_ty,
+                "eps": "fp32",
+                "stride_x": "i32",
+                "stride_res": "i32",
+                "stride_out": "i32",
+                "stride_slot": "i32",
+            }
+            for peer in (0, 1):
+                src = ASTSource(
+                    fn=k._norm_quant_int8_kernel,
+                    signature=sig,
+                    constexprs={
+                        "H": 2048,
+                        "BLOCK_H": 2048,
+                        "PEER": peer,
+                        "FLAG_STRIDE": 32,
+                    },
+                )
+                compiled = triton_compile(
+                    src, target=GPUTarget("hip", "gfx90a", 32),
+                    options={"num_warps": 8},
+                )
+                asm = compiled.asm.get("amdgcn", "")
+                assert len(asm) > 1000
+                # the contract's rounding primitive: rint -> v_rndne_f32
+                assert "v_rndne_f32" in asm
+                if peer:
+                    # the barrier primitives must survive lowering
+                    assert "global_atomic" in asm
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +294,38 @@ class TestKernelExecution:
         assert torch.equal(out2.cpu(), q_ref.cpu())
 
 
+def _two_rank_worker(rank, world, port, outq):
+    """Module-level so spawn can pickle it (a nested closure cannot be
+    pickled -- measured 2026-10-22 in the gpu-test session)."""
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    torch.cuda.set_device(rank)
+    dev = f"cuda:{rank}"
+    rows, hidden = 32, 2048
+    torch.manual_seed(7)
+    # SAME weight and residual on both ranks, different x shards
+    w = torch.randn(hidden, device=dev).to(torch.float32)
+    res = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
+    torch.manual_seed(100 + rank)
+    x = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
+    comm = k.ArNormQuantComm(dist.group.WORLD, k.MAX_ROWS, hidden)
+    result = torch.empty((rows, hidden), dtype=torch.int8, device=dev)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=dev)
+    k._decision = {"enabled": True, "reason": "test", "comm": comm}
+    try:
+        k._ar_norm_quant_int8_impl(result, x, w, scale, 1e-6, res)
+    finally:
+        k._decision = None
+    torch.cuda.synchronize()
+    outq.put(
+        (rank, result.cpu(), scale.cpu(), res.cpu(), x.cpu(), w.cpu())
+    )
+    dist.destroy_process_group()
+
+
 @needs_2gpu
 class TestTwoRankOneShot:
     """The 3-way barrier + peer-load data path, end to end, on 2 ranks.
@@ -305,39 +342,18 @@ class TestTwoRankOneShot:
     def test_ar_norm_quant_two_ranks(self):
         import torch.multiprocessing as mp
 
-        def worker(rank, world, port, outq):
-            import torch.distributed as dist
+        try:
+            import vllm._custom_ops as _ops
 
-            os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = str(port)
-            dist.init_process_group("gloo", rank=rank, world_size=world)
-            torch.cuda.set_device(rank)
-            dev = f"cuda:{rank}"
-            rows, hidden = 32, 2048
-            torch.manual_seed(7)
-            # SAME weight and residual on both ranks, different x shards
-            w = torch.randn(hidden, device=dev).to(torch.float32)
-            res = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
-            torch.manual_seed(100 + rank)
-            x = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
-            comm = k.ArNormQuantComm(dist.group.WORLD, k.MAX_ROWS, hidden)
-            result = torch.empty((rows, hidden), dtype=torch.int8, device=dev)
-            scale = torch.empty((rows, 1), dtype=torch.float32, device=dev)
-            k._decision = {"enabled": True, "reason": "test", "comm": comm}
-            try:
-                k._ar_norm_quant_int8_impl(result, x, w, scale, 1e-6, res)
-            finally:
-                k._decision = None
-            torch.cuda.synchronize()
-            outq.put(
-                (rank, result.cpu(), scale.cpu(), res.cpu(), x.cpu(), w.cpu())
-            )
-            dist.destroy_process_group()
-
+            if not hasattr(_ops, "allocate_shared_buffer_and_handle"):
+                pytest.skip("vllm._C lacks the shared-buffer IPC ops")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"vllm._custom_ops unavailable: {exc}")
         ctx = mp.get_context("spawn")
         outq = ctx.Queue()
         procs = [
-            ctx.Process(target=worker, args=(r, 2, 29517, outq)) for r in (0, 1)
+            ctx.Process(target=_two_rank_worker, args=(r, 2, 29517, outq))
+            for r in (0, 1)
         ]
         for p in procs:
             p.start()
