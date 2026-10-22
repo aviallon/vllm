@@ -42,6 +42,8 @@ from .matcher_utils import (
     FusionSiteCensus,
     MatcherQuantFP8,
     MatcherQuantInt8,
+    called_op,
+    op_call_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -169,6 +171,64 @@ def _counted_dtype_check(pm_pass: PatternMatcherPass, motif_owner: Any) -> Any:
     """Telemetry-wrapped :func:`_rms_input_weight_dtype_match` for a pattern."""
     motif = getattr(motif_owner, "motif", type(motif_owner).__name__)
     return counted_extra_check(pm_pass.pass_name, motif, _rms_input_weight_dtype_match)
+
+
+def _int8_alloc_conform(quant_op: Any, match: Any) -> bool:
+    """Guard for the buffer-as-input int8 patterns (see MatcherQuantInt8).
+
+    The allocs are pattern inputs -- wildcards -- so nothing constrains their
+    shape at match time; the fused kernel writes ``result`` as the quant input
+    shape and ``scale`` as one float32 per token, exactly like the quant call
+    it replaces. Reject (loudly, one-shot) the rare site whose buffers would
+    not satisfy that contract instead of writing out of bounds.
+    """
+    for node in match.nodes:
+        if called_op(node) is not quant_op:
+            continue
+        kwargs = op_call_kwargs(node, quant_op)
+        result, scale, inp = (
+            kwargs.get("result"),
+            kwargs.get("scale"),
+            kwargs.get("input"),
+        )
+        try:
+            r_val, s_val, i_val = (
+                result.meta["val"],
+                scale.meta["val"],
+                inp.meta["val"],
+            )
+        except (AttributeError, KeyError, TypeError):
+            logger.warning(
+                "rms+quant int8 fusion rejected: buffers without meta vals "
+                "(one-shot)"
+            )
+            return False
+        rows = i_val.numel() // i_val.shape[-1]
+        ok = (
+            r_val.dtype == torch.int8
+            and s_val.dtype == torch.float32
+            and r_val.numel() == i_val.numel()
+            and s_val.numel() == rows
+        )
+        if not ok:
+            key = (
+                f"alloc_conform:{r_val.dtype}/{tuple(r_val.shape)}/"
+                f"{s_val.dtype}/{tuple(s_val.shape)}/{tuple(i_val.shape)}"
+            )
+            if key not in _dtype_check_logged:
+                _dtype_check_logged.add(key)
+                logger.warning(
+                    "rms+quant int8 fusion rejected by alloc guard: result=%s%s "
+                    "scale=%s%s input=%s%s (one-shot)",
+                    r_val.dtype,
+                    tuple(r_val.shape),
+                    s_val.dtype,
+                    tuple(s_val.shape),
+                    i_val.dtype,
+                    tuple(i_val.shape),
+                )
+        return ok
+    return True
 
 
 def empty_bf16(*args: Any, **kwargs: Any) -> torch.Tensor:
