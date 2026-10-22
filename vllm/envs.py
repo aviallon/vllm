@@ -161,6 +161,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_TRITON_ATTN_BLOCK_M: int = 0
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1402,6 +1403,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_SKINNY_GEMM", "True").lower() in ("true", "1")
+    ),
+    # BLOCK_M override for the int8 KV prefill reader (0 = auto/C3).  The
+    # KV read amplification is in 1/BLOCK_Q = 8/BLOCK_M, so 64 halves the
+    # reader's HBM traffic vs the shipping 32.  Values other than 16/32/64
+    # are ignored (the wrapper keeps its own choice).
+    "VLLM_ROCM_TRITON_ATTN_BLOCK_M": lambda: int(
+        os.getenv("VLLM_ROCM_TRITON_ATTN_BLOCK_M", "0") or 0
     ),
     # Pad the fp8 weights to 256 bytes for ROCm
     "VLLM_ROCM_FP8_PADDING": lambda: bool(int(os.getenv("VLLM_ROCM_FP8_PADDING", "1"))),

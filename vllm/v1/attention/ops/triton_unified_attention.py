@@ -1219,6 +1219,15 @@ def unified_attention(
         launch_num_warps = 4
         launch_num_stages = 2
         tile_config_branch = "c3_int8"
+        # Optional BLOCK_M override for the int8 KV prefill path (the
+        # "halve the reader's KV reads" lever: traffic is in 1/BLOCK_Q).
+        # Measured-null unless set; the branch name carries the effective
+        # value so the launch log is its own branching proof.
+        _bm_env = envs.VLLM_ROCM_TRITON_ATTN_BLOCK_M
+        if _bm_env in (16, 32, 64):
+            BLOCK_M = _bm_env
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+            tile_config_branch = f"c3_int8_bm{BLOCK_M}"
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
