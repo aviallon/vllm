@@ -84,9 +84,12 @@ def _3way_can_own(norm_node: Any) -> bool:
     if len(x_val.shape) != 2 or x_val.dtype != torch.bfloat16:
         return False
     rows = x_val.shape[0]
-    if not isinstance(rows, int) or rows > MAX_ROWS:
-        # symbolic or out-of-regime: the 3-way does not own it
+    if isinstance(rows, int) and rows > MAX_ROWS:
+        # concretely out-of-regime: the 3-way does not own it
         return False
+    # symbolic rows: the 3-way CAN own it (its runtime per-call bound keeps
+    # the fused kernel in regime and falls back to the exact chain above) --
+    # same rule as ArNormQuantFusionPass._decode_regime.
     return w_val.dtype == torch.float32
 
 

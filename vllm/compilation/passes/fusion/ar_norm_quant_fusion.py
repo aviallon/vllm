@@ -101,9 +101,15 @@ def _decode_regime(match: pm.Match) -> bool:
         if len(val.shape) != 2:
             return False
         rows = val.shape[0]
-        if not isinstance(rows, int) or rows > MAX_ROWS:
-            # symbolic or out-of-regime: leave the site on its chain
+        if isinstance(rows, int) and rows > MAX_ROWS:
+            # concretely out of the fused regime: leave the site on its chain
             return False
+        # Symbolic rows are ACCEPTED (measured 2026-10-22: the prod engine
+        # compiles backed-dynamic -- one graph serves rows 1..4096 -- and
+        # refusing symbolic dims silently cut the reach to 10/68 sites). The
+        # per-call bound in get_decision/_norm_gate enforces the regime at
+        # runtime (fused at rows <= comm.rows, the exact-chain fallback above),
+        # so the node is safe at every shape and every decode size fuses.
         if val.dtype != torch.bfloat16:
             return False
         return True

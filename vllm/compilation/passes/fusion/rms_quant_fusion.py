@@ -210,6 +210,13 @@ def _int8_alloc_conform(quant_op: Any, match: Any) -> bool:
             and r_val.numel() == i_val.numel()
             and s_val.numel() == rows
         )
+        try:
+            ok = bool(ok)  # SymBool on backed-dynamic graphs
+        except Exception:  # noqa: BLE001 - symbolic equality not decidable
+            # shape-polymorphic site: the dims are the same expressions on
+            # both sides (numel of the same arg) -- defer to the runtime
+            # contract checks instead of silently rejecting the site.
+            ok = True
         if not ok:
             key = (
                 f"alloc_conform:{r_val.dtype}/{tuple(r_val.shape)}/"

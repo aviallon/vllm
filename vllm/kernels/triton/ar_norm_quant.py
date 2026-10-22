@@ -69,7 +69,16 @@ try:
 except ImportError:  # pragma: no cover - non-ROCm toolchains
     from triton.language.extra.cuda.libdevice import nearbyint as _nearbyint
 
-MAX_ROWS = 80
+# Fused-regime row bound. The spec borrowed the one-stage custom-AR bound
+# (kMaxBlocks=80); the real decode universe of this deployment is bounded by
+# max_num_seqs (128) and by the captured decode graphs (cudagraph_capture_sizes
+# ends at 256), while prefill/mixed chunks run up to max_num_batched_tokens
+# (4096). Sizing the comm buffers for 256 rows (1 MiB/rank) covers EVERY
+# captured decode graph with the fused kernel and leaves only prefill-scale
+# calls on the exact-chain fallback. At 80, the fallback would have taken
+# c96..c256 decode -- and the eager fallback chain costs ~7 extra launches per
+# site vs the compiled baseline (measured cost model, 2026-10-22).
+MAX_ROWS = 256
 """Decode-only regime bound (matches the one-stage custom-AR limit)."""
 
 FLAG_STRIDE_BYTES = 128
@@ -423,7 +432,28 @@ def get_decision(rows: int, hidden: int) -> tuple[bool, str, Any]:
             "reason": info if not enabled else "ready",
             "comm": comm,
         }
-        return _decision["enabled"], _decision["reason"], _decision["comm"]
+        # Per-call bounds apply to the FIRST call too: the engine's first call
+        # is far out of regime (the 4096-row memory-profiling forward runs
+        # through the same backed-dynamic graph) while the frozen decision must
+        # stay enabled for the in-regime calls that follow. Launching the fused
+        # kernel with rows > comm.rows writes out of bounds in local AND peer
+        # memory (measured 2026-10-22: GPU fault "Write access to a read-only
+        # page" at engine warmup). Rank-symmetric like every per-call
+        # condition (TP ranks execute the same shapes).
+        if comm is not None:
+            if comm.hidden != hidden:
+                return (
+                    False,
+                    f"hidden {hidden} != comm hidden {comm.hidden}",
+                    None,
+                )
+            if rows > comm.rows:
+                return (
+                    False,
+                    f"rows {rows} > comm rows {comm.rows}",
+                    None,
+                )
+        return _decision["enabled"], _decision["reason"], comm
 
 
 # ---------------------------------------------------------------------------
