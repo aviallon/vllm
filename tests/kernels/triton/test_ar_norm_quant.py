@@ -227,8 +227,9 @@ class TestKernelExecution:
         res = s.to(torch.bfloat16)
         x = torch.zeros(rows, hidden, dtype=torch.bfloat16, device="cuda")
         w = torch.randn(hidden, device="cuda").to(torch.float32)
-        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 0.0)
+        # reference FIRST: the op mutates res in place
         q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(x, res, w, 0.0)
+        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 0.0)
         assert torch.equal(res_out.cpu(), res_ref.cpu()), "res_out not bit-exact"
         assert torch.equal(scale.cpu(), scale_ref.cpu()), "scale not bit-exact"
         assert torch.equal(out.cpu(), q_ref.cpu()), "quant not bit-exact"
@@ -239,8 +240,11 @@ class TestKernelExecution:
         x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
         res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
         w = torch.randn(hidden, device="cuda").to(torch.float32)
-        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 1e-6)
+        # the op mutates res IN PLACE: the reference must see the ORIGINAL
+        # residual (compute it first / from a clone -- measured 2026-10-22:
+        # referencing the mutated res made res_out look wildly wrong)
         q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(x, res, w, 1e-6)
+        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 1e-6)
         assert torch.equal(res_out.cpu(), res_ref.cpu())
         # scale: class-3 only (var reduction order may move y by ~1e-7 rel)
         assert torch.allclose(scale.cpu(), scale_ref.cpu(), rtol=1e-4, atol=1e-8)
@@ -294,9 +298,15 @@ class TestKernelExecution:
         assert torch.equal(out2.cpu(), q_ref.cpu())
 
 
-def _two_rank_worker(rank, world, port, outq):
+def _two_rank_worker(rank, world, port, outdir):
     """Module-level so spawn can pickle it (a nested closure cannot be
-    pickled -- measured 2026-10-22 in the gpu-test session)."""
+    pickled -- measured 2026-10-22 in the gpu-test session).
+
+    Results are written as FILES, not sent through a multiprocessing Queue:
+    torch's queue reductions share storages via file descriptors and the
+    parent's rebuild races the worker's exit (EOFError on the resource
+    sharer -- measured in the same session).
+    """
     import torch.distributed as dist
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -320,8 +330,16 @@ def _two_rank_worker(rank, world, port, outq):
     finally:
         k._decision = None
     torch.cuda.synchronize()
-    outq.put(
-        (rank, result.cpu(), scale.cpu(), res.cpu(), x.cpu(), w.cpu())
+    torch.save(
+        {
+            "rank": rank,
+            "result": result.cpu(),
+            "scale": scale.cpu(),
+            "res": res.cpu(),
+            "x": x.cpu(),
+            "w": w.cpu(),
+        },
+        f"{outdir}/rank{rank}.pt",
     )
     dist.destroy_process_group()
 
@@ -350,30 +368,36 @@ class TestTwoRankOneShot:
         except Exception as exc:  # noqa: BLE001
             pytest.skip(f"vllm._custom_ops unavailable: {exc}")
         ctx = mp.get_context("spawn")
-        outq = ctx.Queue()
+        outdir = os.environ.get("AR_NORM_QUANT_TEST_OUT", "/tmp/ar-v2-2rank")
+        os.makedirs(outdir, exist_ok=True)
         procs = [
-            ctx.Process(target=_two_rank_worker, args=(r, 2, 29517, outq))
+            ctx.Process(target=_two_rank_worker, args=(r, 2, 29517, outdir))
             for r in (0, 1)
         ]
         for p in procs:
             p.start()
-        got = {}
-        for _ in range(2):
-            rank, result, scale, res, x, w = outq.get(timeout=300)
-            got[rank] = (result, scale, res, x, w)
         for p in procs:
-            p.join(timeout=60)
+            p.join(timeout=300)
         assert all(not p.is_alive() for p in procs), "worker did not terminate"
+        assert all(p.exitcode == 0 for p in procs), (
+            f"worker exit codes: {[p.exitcode for p in procs]}"
+        )
+        got = {}
+        for r in (0, 1):
+            got[r] = torch.load(f"{outdir}/rank{r}.pt", weights_only=False)
 
-        x0, res0, w0 = got[0][3], got[0][2], got[0][4]
-        x1 = got[1][3]
+        x0, res0, w0 = got[0]["x"], got[0]["res"], got[0]["w"]
         for rank in (0, 1):
-            x_self = got[rank][3]
-            x_peer = got[1 - rank][3]
+            x_self = got[rank]["x"]
+            x_peer = got[1 - rank]["x"]
             q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(
                 x_self, res0, w0, 1e-6, peer=x_peer
             )
-            result, scale, res_out = got[rank][0], got[rank][1], got[rank][2]
+            result, scale, res_out = (
+                got[rank]["result"],
+                got[rank]["scale"],
+                got[rank]["res"],
+            )
             assert torch.equal(scale, scale_ref), f"rank {rank}: scale mismatch"
             assert torch.equal(res_out, res_ref), f"rank {rank}: res mismatch"
             flips = (result.int() - q_ref.int()).abs()
@@ -383,8 +407,12 @@ class TestTwoRankOneShot:
                 f"{int((flips > 0).sum())}/{flips.numel()}"
             )
         # both ranks must have the SAME outputs (the AR sums both shards)
-        assert torch.equal(got[0][0], got[1][0]), "ranks disagree on quant"
-        assert torch.equal(got[0][1], got[1][1]), "ranks disagree on scale"
+        assert torch.equal(got[0]["result"], got[1]["result"]), (
+            "ranks disagree on quant"
+        )
+        assert torch.equal(got[0]["scale"], got[1]["scale"]), (
+            "ranks disagree on scale"
+        )
 
 
 # ---------------------------------------------------------------------------
