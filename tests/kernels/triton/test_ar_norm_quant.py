@@ -170,6 +170,7 @@ class TestGfx90aCodegen:
                 "weight_ptr": "*fp32",
                 "out_ptr": "*i8",
                 "scale_ptr": "*fp32",
+                "normed_ptr": "*bf16",
                 "slot_ptr": ptr_ty,
                 "peer_ptr": ptr_ty,
                 "flag_ptr": ptr_ty,
@@ -178,6 +179,7 @@ class TestGfx90aCodegen:
                 "stride_x": "i32",
                 "stride_res": "i32",
                 "stride_out": "i32",
+                "stride_normed": "i32",
                 "stride_slot": "i32",
             }
             for peer in (0, 1):
@@ -235,6 +237,25 @@ class TestKernelExecution:
         assert torch.equal(res_out.cpu(), res_ref.cpu()), "res_out not bit-exact"
         assert torch.equal(scale.cpu(), scale_ref.cpu()), "scale not bit-exact"
         assert torch.equal(out.cpu(), q_ref.cpu()), "quant not bit-exact"
+
+    def test_normed_output_is_the_quant_input(self):
+        # The op RETURNS the normed value (the chain it replaces produces it
+        # for other consumers): it must be exactly the tensor the quant
+        # consumed -- scale == amax(normed)/127 is the observable contract.
+        torch.manual_seed(1)
+        rows, hidden = 8, 2048
+        x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        result = torch.empty((rows, hidden), dtype=torch.int8, device=x.device)
+        scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+        normed = k._norm_quant_int8_impl(result, x, w, scale, 1e-6, res)
+        assert normed.dtype == torch.bfloat16
+        assert normed.shape == x.shape
+        amax = normed.to(torch.float32).abs().amax(dim=-1, keepdim=True)
+        assert torch.equal(
+            scale.cpu(), (amax / 127.0).cpu()
+        ), "scale is not amax(normed)/127 -- normed is not the quant input"
 
     def test_random_rows_class3_and_flip_count(self):
         torch.manual_seed(1)

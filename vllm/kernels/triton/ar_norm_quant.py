@@ -96,6 +96,7 @@ def _norm_quant_int8_kernel(
     weight_ptr,
     out_ptr,
     scale_ptr,
+    normed_ptr,
     slot_ptr,
     peer_ptr,
     flag_ptr,
@@ -104,6 +105,7 @@ def _norm_quant_int8_kernel(
     stride_x,
     stride_res,
     stride_out,
+    stride_normed,
     stride_slot,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
@@ -220,6 +222,12 @@ def _norm_quant_int8_kernel(
         q = _nearbyint(yb.to(tl.float32) * inv_s)
         q = tl.minimum(tl.maximum(q, -128.0), 127.0)
         tl.store(out_ptr + row * stride_out + offs, q.to(tl.int8), mask=m)
+        # emit the normed value too: the chain this kernel replaces produces
+        # it for OTHER consumers (a second quant of the same y at the GDN
+        # sites, the shared-expert alias) -- without this store the motif
+        # cannot take any site whose norm output has a second user (measured
+        # 2026-10-22: 10/68 sites reachable otherwise).
+        tl.store(normed_ptr + row * stride_normed + offs, yb, mask=m)
         tl.store(res_ptr + row * stride_res + offs, s.to(tl.bfloat16), mask=m)
 
 
@@ -465,6 +473,7 @@ def _launch(
     weight: torch.Tensor,
     scale: torch.Tensor,
     residual: torch.Tensor,
+    normed: torch.Tensor,
     epsilon: float,
     comm: ArNormQuantComm | None,
 ) -> None:
@@ -490,6 +499,7 @@ def _launch(
         weight,
         result,
         scale,
+        normed,
         slot_ptr,
         peer_ptr,
         flag_ptr,
@@ -498,6 +508,7 @@ def _launch(
         input.stride(0),
         residual.stride(0),
         result.stride(0),
+        normed.stride(0),
         hidden,  # stride_slot: the comm slot is contiguous [MAX_ROWS, hidden]
         H=hidden,
         BLOCK_H=block,
@@ -515,7 +526,7 @@ def _fallback_norm_quant(
     residual: torch.Tensor,
     epsilon: float,
     reduced: torch.Tensor | None = None,
-) -> None:
+) -> torch.Tensor:
     """The exact chain this op replaces, executed inside the single node:
     (all-reduce +) the native fused_add_rms_norm decomposition
     (vllm/ir/ops/layernorm.py, expression for expression) +
@@ -534,10 +545,11 @@ def _fallback_norm_quant(
     var = (s * s).mean(dim=-1, keepdim=True)
     y = s * torch.rsqrt(var + epsilon)
     y = y.to(weight.dtype) * weight
-    normed = y.to(orig_dtype)
+    normed_val = y.to(orig_dtype)
     torch.ops._C.dynamic_scaled_int8_quant(
-        result=result, input=normed, scale=scale, azp=None
+        result=result, input=normed_val, scale=scale, azp=None
     )
+    return normed_val
 
 
 # ---------------------------------------------------------------------------
@@ -569,7 +581,15 @@ def _norm_quant_int8_impl(
     scale: torch.Tensor,
     epsilon: float,
     residual: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
+    """Mutates result/scale/residual in place; RETURNS the normed value.
+
+    The return is load-bearing: the chain this op replaces produces the
+    normed value as a graph value with OTHER consumers (a second quant of the
+    same y at the GDN sites, the shared-expert alias at the attn-out sites) --
+    without emitting it the motif cannot take any site whose norm output has
+    a second user (measured 2026-10-22: 10/68 sites reachable otherwise).
+    """
     rows, hidden = input.shape
     use, reason = _norm_gate(rows)
     if not use or not _contract_ok(result, input, weight, scale, residual):
@@ -581,14 +601,19 @@ def _norm_quant_int8_impl(
             f"(one-shot): {reason}",
             "warning",
         )
-        _fallback_norm_quant(result, input, weight, scale, residual, epsilon)
-        return
+        return _fallback_norm_quant(
+            result, input, weight, scale, residual, epsilon
+        )
     _log_once(
         "active_norm",
         f"triton_norm_quant_int8 path ACTIVE (one-shot; shape="
         f"{tuple(input.shape)})",
     )
-    _launch(result, input, weight, scale, residual, epsilon, None)
+    normed = torch.empty(
+        (rows, hidden), dtype=input.dtype, device=input.device
+    )
+    _launch(result, input, weight, scale, residual, normed, epsilon, None)
+    return normed
 
 
 def _norm_quant_int8_fake(
@@ -598,9 +623,9 @@ def _norm_quant_int8_fake(
     scale: torch.Tensor,
     epsilon: float,
     residual: torch.Tensor,
-) -> None:
-    # Mutating op: the buffers carry the metas, nothing to return.
-    return None
+) -> torch.Tensor:
+    # Mutated buffers carry their metas; the normed value is returned.
+    return torch.empty_like(input)
 
 
 def _ar_norm_quant_int8_impl(
@@ -610,7 +635,7 @@ def _ar_norm_quant_int8_impl(
     scale: torch.Tensor,
     epsilon: float,
     residual: torch.Tensor,
-) -> None:
+) -> torch.Tensor:
     rows, hidden = input.shape
     use, reason, comm = get_decision(rows, hidden)
     if not use or comm is None or not _contract_ok(
@@ -627,16 +652,19 @@ def _ar_norm_quant_int8_impl(
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         reduced = tensor_model_parallel_all_reduce(input)
-        _fallback_norm_quant(
+        return _fallback_norm_quant(
             result, input, weight, scale, residual, epsilon, reduced=reduced
         )
-        return
     _log_once(
         "active_ar",
         f"triton_ar_norm_quant_int8 path ACTIVE (one-shot; shape="
         f"{tuple(input.shape)})",
     )
-    _launch(result, input, weight, scale, residual, epsilon, comm)
+    normed = torch.empty(
+        (rows, hidden), dtype=input.dtype, device=input.device
+    )
+    _launch(result, input, weight, scale, residual, normed, epsilon, comm)
+    return normed
 
 
 def _ar_norm_quant_int8_fake(
@@ -646,8 +674,8 @@ def _ar_norm_quant_int8_fake(
     scale: torch.Tensor,
     epsilon: float,
     residual: torch.Tensor,
-) -> None:
-    return None
+) -> torch.Tensor:
+    return torch.empty_like(input)
 
 
 direct_register_custom_op(

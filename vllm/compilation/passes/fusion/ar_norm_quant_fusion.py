@@ -153,7 +153,7 @@ class _TritonNormQuantPatternBase(VllmPatternReplacement):
         weight: torch.Tensor,
         scale_buf: torch.Tensor,
         residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         at = auto_functionalized(
             self.quant_op,
             result=result_buf,
@@ -164,7 +164,12 @@ class _TritonNormQuantPatternBase(VllmPatternReplacement):
             residual=residual,
         )
         outs = functionalized_mutable_args(self.quant_op, at)
-        return outs["result"], outs["residual"], outs["scale"]
+        # at[0] is the op's return value = the normed value (see the op
+        # docstring: the sites whose norm output has OTHER consumers need it
+        # kept alive as a graph value).
+        values = at if isinstance(at, tuple) else (at,)
+        normed = values[0]
+        return outs["result"], outs["residual"], outs["scale"], normed
 
 
 class ArNormQuantInt8Pattern(_TritonNormQuantPatternBase):
@@ -182,7 +187,7 @@ class ArNormQuantInt8Pattern(_TritonNormQuantPatternBase):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             allreduce_output = tensor_model_parallel_all_reduce(input)
             rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
                 allreduce_output, residual, weight, self.epsilon
@@ -190,7 +195,10 @@ class ArNormQuantInt8Pattern(_TritonNormQuantPatternBase):
             result, scale = self.quant_matcher(
                 rms, result_buf=result_buf, scale_buf=scale_buf
             )
-            return result, residual_out, scale
+            # rms is returned too: the sites whose norm output feeds OTHER
+            # consumers (a second quant, the shared-expert alias) must keep
+            # receiving it -- that is what makes those sites matchable.
+            return result, residual_out, scale, rms
 
         return _pattern
 
@@ -232,11 +240,11 @@ class ArNormQuantInt8OutputOnlyPattern(ArNormQuantInt8Pattern):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            result, _, scale = inner(
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result, _, scale, rms = inner(
                 residual, input, weight, result_buf, scale_buf
             )
-            return result, scale
+            return result, scale, rms
 
         return _pattern
 
@@ -250,11 +258,11 @@ class ArNormQuantInt8OutputOnlyPattern(ArNormQuantInt8Pattern):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            result, _, scale = inner(
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result, _, scale, rms = inner(
                 residual, input, weight, result_buf, scale_buf
             )
-            return result, scale
+            return result, scale, rms
 
         return _replacement
 
@@ -278,14 +286,15 @@ class NormQuantInt8Pattern(_TritonNormQuantPatternBase):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
                 input, residual, weight, self.epsilon
             )
             result, scale = self.quant_matcher(
                 rms, result_buf=result_buf, scale_buf=scale_buf
             )
-            return result, residual_out, scale
+            # rms kept alive for the site's other consumers (see the 3-way)
+            return result, residual_out, scale, rms
 
         return _pattern
 
@@ -326,11 +335,11 @@ class NormQuantInt8OutputOnlyPattern(NormQuantInt8Pattern):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            result, _, scale = inner(
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result, _, scale, rms = inner(
                 residual, input, weight, result_buf, scale_buf
             )
-            return result, scale
+            return result, scale, rms
 
         return _pattern
 
@@ -344,11 +353,11 @@ class NormQuantInt8OutputOnlyPattern(NormQuantInt8Pattern):
             weight: torch.Tensor,
             result_buf: torch.Tensor,
             scale_buf: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            result, _, scale = inner(
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result, _, scale, rms = inner(
                 residual, input, weight, result_buf, scale_buf
             )
-            return result, scale
+            return result, scale, rms
 
         return _replacement
 
