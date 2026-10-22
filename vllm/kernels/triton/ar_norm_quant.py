@@ -18,6 +18,12 @@ the target is the chain the engine *executes* at the w8a8 decode sites:
     inv_s  = 0 if amax == 0 else 127 / amax      # zero special-case, 1 division
     q      = clamp(rint(y_bf16 * inv_s), -128, 127)   # nearbyint, half-to-even
 
+Only the reduction order of ``var`` (class-3, ~1e-7) and the ``rsqrt``
+primitive may differ from the baseline: the baseline's ``torch.rsqrt`` is
+inductor-compiled, and pinning its exact lowering against ours
+(``tl.math.rsqrt`` -> ``v_rsq_f32``) is the still-open S0 item (REPORT
+section 2). Everything else is bit-exact by construction.
+
 This mirrors, expression for expression, the native
 ``vllm/ir/ops/layernorm.py::fused_add_rms_norm`` decomposition followed by
 ``_C.dynamic_scaled_int8_quant`` (``csrc/libtorch_stable/quantization/w8a8/
@@ -129,7 +135,15 @@ def _norm_quant_int8_kernel(
         seq = cur + 1
         tl.atomic_xchg(flag_p + f_off, seq, sem="release", scope="sys")
         # spin on the PEER's flag with an atomic RMW: effects-bearing, so
-        # neither Triton's LICM nor LLVM may hoist it out of the loop
+        # neither Triton's LICM nor LLVM may hoist it out of the loop.
+        # `!= seq` (fail loud) rather than the spec's `< seq` (fail silent):
+        # if the peer were ever a full call ahead on this row's monotone
+        # counter (its next-call xchg lands between my xchg and my first
+        # spin read -- a microsecond-scale window needing my wave to be
+        # descheduled for the peer's whole next kernel), `!=` hangs both
+        # ranks while `<` would silently read the NEXT call's slot data.
+        # Hang beats silent corruption here (the spec's own doctrine); the
+        # window is documented in REPORT section 3 note 9.
         v = tl.atomic_add(pflag_p + f_off, 0, sem="acquire", scope="sys")
         while v != seq:
             v = tl.atomic_add(
@@ -277,11 +291,9 @@ def _log_once(key: str, msg: str, level: str = "info") -> None:
     getattr(logger, level)(msg)
 
 
-def _local_readiness(rows: int) -> tuple[bool, str, Any]:
+def _local_readiness() -> tuple[bool, str, Any]:
     if torch.distributed.get_world_size(group=None) != 2:
         return False, "world_size != 2", None
-    if rows > MAX_ROWS:
-        return False, f"rows {rows} > {MAX_ROWS} (decode-only regime)", None
     try:
         from vllm.distributed import get_tp_group
 
@@ -301,6 +313,31 @@ def _local_readiness(rows: int) -> tuple[bool, str, Any]:
     return True, "ready", cpu_group
 
 
+def _collective_and(local_yes: bool, cpu_group: Any) -> bool:
+    """Collective AND over the TP group. MUST be called on every first
+    decision path, even for a local 'no' (send 0): a rank that skips the
+    vote leaves the peer blocked in the collective. On ANY collective
+    failure both sides freeze fallback (fail loud: one-shot WARN)."""
+    if cpu_group is None:
+        return False
+    try:
+        import torch.distributed as dist  # noqa: PLC0415
+
+        flag = torch.tensor(
+            [1 if local_yes else 0], dtype=torch.int32, device="cpu"
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=cpu_group)
+        return bool(flag.item())
+    except Exception as e:  # noqa: BLE001 - never crash on the critical path
+        _log_once(
+            "collective_failed",
+            f"triton_ar_norm_quant collective readiness vote failed: {e} "
+            f"(one-shot) -- falling back everywhere",
+            "warning",
+        )
+        return False
+
+
 def _norm_gate(rows: int) -> tuple[bool, str]:
     """Local gate for the rank-local norm+quant kernel. No collective needed:
     nothing here couples the ranks (a local fallback changes only which
@@ -316,45 +353,71 @@ def get_decision(rows: int, hidden: int) -> tuple[bool, str, Any]:
     Both TP ranks must take the same branch at every call site: a rank running
     the fused kernel against a rank running the fallback would spin forever on
     a flag nobody writes (GPU hang in a captured graph). So the decision is
-    frozen at first (eager) use and evaluated collectively (all-reduce MIN of
-    the local readiness): either both ranks get the fused path, or neither
-    does. Per-call shape/dtype conditions are checked separately and are
-    rank-symmetric by construction (TP ranks execute the same graphs with the
-    same shapes -- the all-reduce itself requires it).
+    frozen at first (eager) use and voted on collectively TWICE:
+
+    1. a readiness vote (all-reduce MIN over the TP group), ALWAYS run, even
+       for a local 'no' -- a rank that skips the vote deadlocks the peer;
+    2. a second vote after the shared-buffer init, because that init can
+       fail on ONE rank only -- freezing 'fused' on one side and 'fallback'
+       on the other is the exact hang class spec section 3.7 forbids.
+
+    Any collective failure freezes FALLBACK on both sides (one-shot WARN).
+    A first call during graph capture is a voted fallback too.
+
+    Per-call shape/dtype conditions are checked separately and are
+    rank-symmetric by construction (TP ranks execute the same graphs with
+    the same shapes -- the all-reduce itself requires it); the rows/hidden
+    bound against the comm buffer is re-checked on EVERY call (never launch
+    out of bounds into local and peer memory).
     """
     global _decision
     with _lock:
         if _decision is not None:
-            # the comm is sized for the hidden of the first fused call; a
-            # later call with a different hidden falls back (symmetric on
-            # both ranks -- same model, same graphs)
-            if _decision["comm"] is not None and _decision["comm"].hidden != hidden:
-                return (
-                    False,
-                    f"hidden {hidden} != comm hidden {_decision['comm'].hidden}",
-                    None,
-                )
-            return _decision["enabled"], _decision["reason"], _decision["comm"]
-        enabled, info, cpu_group = _local_readiness(rows)
-        # Collective AND over the TP group (both ranks agree).
-        if enabled and cpu_group is not None:
-            import torch.distributed as dist  # noqa: PLC0415
-
-            flag = torch.tensor(
-                [1 if enabled else 0], dtype=torch.int32, device="cpu"
-            )
-            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=cpu_group)
-            enabled = bool(flag.item())
-            if not enabled:
-                info = "peer rank not ready (collective decision)"
+            comm = _decision["comm"]
+            if comm is not None:
+                if comm.hidden != hidden:
+                    return (
+                        False,
+                        f"hidden {hidden} != comm hidden {comm.hidden}",
+                        None,
+                    )
+                if rows > comm.rows:
+                    return (
+                        False,
+                        f"rows {rows} > comm rows {comm.rows}",
+                        None,
+                    )
+            return _decision["enabled"], _decision["reason"], comm
+        # FIRST CALL (warmup: eager, before any graph capture)
+        ready, info, cpu_group = _local_readiness()
+        try:
+            if (
+                torch.cuda.is_available()
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                ready = False
+                info = "first call during graph capture"
+        except Exception:  # noqa: BLE001 - no CUDA context: not capturing
+            pass
+        # vote 1: ALWAYS collective (send 0 when not ready)
+        voted = _collective_and(ready, cpu_group)
+        if ready and not voted:
+            info = "peer rank not ready (collective decision)"
         comm = None
-        if enabled:
+        if voted:
             try:
                 comm = ArNormQuantComm(cpu_group, MAX_ROWS, hidden)
             except Exception as e:  # noqa: BLE001
-                enabled = False
                 info = f"shared-buffer init failed: {e}"
                 comm = None
+        # vote 2: the comm-init outcome is voted too (it can fail on ONE
+        # rank only -- see the docstring)
+        final = _collective_and(comm is not None, cpu_group)
+        if comm is not None and not final:
+            # one side failed -> NOBODY runs fused
+            comm = None
+            info = "peer comm init failed (collective decision)"
+        enabled = bool(final)
         _decision = {
             "enabled": enabled,
             "reason": info if not enabled else "ready",
@@ -378,6 +441,7 @@ def _launch(
     rows, hidden = input.shape
     block = min(triton.next_power_of_2(hidden), 2048)
     grid = (rows,)
+    assert scale.stride(0) == 1, "scale must be [rows, 1] contiguous"
     if comm is None:
         slot_ptr = 0
         peer_ptr = 0
@@ -404,7 +468,7 @@ def _launch(
         input.stride(0),
         residual.stride(0),
         result.stride(0),
-        hidden,
+        hidden,  # stride_slot: the comm slot is contiguous [MAX_ROWS, hidden]
         H=hidden,
         BLOCK_H=block,
         PEER=comm is not None,
@@ -427,6 +491,10 @@ def _fallback_norm_quant(
     (vllm/ir/ops/layernorm.py, expression for expression) +
     ``_C.dynamic_scaled_int8_quant`` into the same buffers. No extra kernels
     over the unfused graph beyond the chain itself.
+
+    Note: the expressions are identical to the baseline chain, but this
+    fallback runs EAGER torch while the baseline is inductor-compiled --
+    the same class-3 reduction-order caveat (~1e-7) applies between them.
     """
     x_in = input if reduced is None else reduced
     orig_dtype = x_in.dtype

@@ -100,7 +100,9 @@ def _decode_regime(match: pm.Match) -> bool:
             return False
         if len(val.shape) != 2:
             return False
-        if val.shape[0] > MAX_ROWS:
+        rows = val.shape[0]
+        if not isinstance(rows, int) or rows > MAX_ROWS:
+            # symbolic or out-of-regime: leave the site on its chain
             return False
         if val.dtype != torch.bfloat16:
             return False
@@ -363,23 +365,29 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
 
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config, pass_name="ar_norm_quant_fusion_pass")
+        pass_config = config.compilation_config.pass_config
+        want_ar = bool(pass_config.fuse_ar_norm_quant)
+        want_norm = bool(pass_config.fuse_norm_quant_triton)
+        # The 3-way needs TP=2 (the kernel's scope): at other world sizes
+        # ``tensor_model_parallel_all_reduce`` traces to no op at all
+        # (world_size == 1) or to a shape the kernel does not cover, so its
+        # patterns are simply not registered there (its flag then matches
+        # nothing -- documented, predictable).
+        tp2 = get_tensor_model_parallel_world_size() == 2
         for epsilon in (1e-5, 1e-6):
             # 3-way FIRST: within one PatternMatcherPass, patterns keyed at
-            # the same output nodes are tried in registration order. The
-            # 3-way needs TP=2 (the kernel's scope): at other world sizes
-            # ``tensor_model_parallel_all_reduce`` traces to no op at all
-            # (world_size == 1) or to a shape the kernel does not cover, so
-            # only the norm+quant patterns are registered there.
+            # the same output nodes are tried in registration order.
             classes: list[type] = []
-            if get_tensor_model_parallel_world_size() == 2:
+            if want_ar and tp2:
                 classes += [
                     ArNormQuantInt8Pattern,
                     ArNormQuantInt8OutputOnlyPattern,
                 ]
-            classes += [
-                NormQuantInt8Pattern,
-                NormQuantInt8OutputOnlyPattern,
-            ]
+            if want_norm:
+                classes += [
+                    NormQuantInt8Pattern,
+                    NormQuantInt8OutputOnlyPattern,
+                ]
             for cls in classes:
                 pr = cls(epsilon)
                 pr.extra_check = _composite_check(pr.quant_op)

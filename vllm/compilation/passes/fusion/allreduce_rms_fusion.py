@@ -63,8 +63,36 @@ _NOOP_FORWARD = {
 }
 
 
+def _3way_can_own(norm_node: Any) -> bool:
+    """Would a 3-way motif (Triton, or the AITER int8 epilogue) actually
+    take this site? Mirrors ArNormQuantFusionPass's ownership: the decode
+    regime gate (2D, rows <= 80, bf16) and the fp32-weight contract.
+
+    Declining a site NO 3-way can own would silently remove the 2-way
+    AR+RMS fusion there -- arm A vs arm B drift at prefill / large batches,
+    breaking the non-regression gate's "no change outside the regime".
+    """
+    try:
+        from vllm.kernels.triton.ar_norm_quant import MAX_ROWS
+    except Exception:  # noqa: BLE001 - no Triton module: own nothing
+        return False
+    x, w = norm_node.args[0], norm_node.args[2]
+    try:
+        x_val, w_val = x.meta["val"], w.meta["val"]
+    except (AttributeError, KeyError, TypeError):
+        return False
+    if len(x_val.shape) != 2 or x_val.dtype != torch.bfloat16:
+        return False
+    rows = x_val.shape[0]
+    if not isinstance(rows, int) or rows > MAX_ROWS:
+        # symbolic or out-of-regime: the 3-way does not own it
+        return False
+    return w_val.dtype == torch.float32
+
+
 def _norm_output_not_int8_quant(match: pm.Match) -> bool:
-    """Decline AR+RMS sites whose normed output feeds a per-token int8 quant.
+    """Decline AR+RMS sites whose normed output feeds a per-token int8 quant
+    AND which a 3-way motif would take.
 
     Those sites belong to the 3-way AR+RMS+quant motif. Inductor dispatches
     patterns per OUTPUT-node target, so the 2-way patterns (keyed at the norm
@@ -73,7 +101,7 @@ def _norm_output_not_int8_quant(match: pm.Match) -> bool:
     leaving the quant unfused (measured 2026-10-21: 69/80 sites stolen from
     the 3-way by this exact mechanism). With this guard the 2-way declines and
     the 3-way takes the whole chain; sites with no int8 quant (bf16 consumers)
-    are unaffected. Attached only when the 3-way patterns are registered.
+    are unaffected. Attached only when a 3-way owner is registered.
     """
     try:
         quant_op = torch.ops._C.dynamic_scaled_int8_quant.default
@@ -94,7 +122,7 @@ def _norm_output_not_int8_quant(match: pm.Match) -> bool:
                     kwargs = op_call_kwargs(user, quant_op)
                     producer, _ = walk_views(kwargs.get("input"))
                     if producer is node:
-                        return False
+                        return not _3way_can_own(node)
                 if user.target is operator.getitem or (
                     op_base_name(user.target) in _NOOP_FORWARD
                 ):

@@ -23,13 +23,15 @@ Layers, in order of how much machinery they need:
 5. **two-rank one-shot AR** (needs 2 GPUs + gloo): the barrier + peer-load
    data path of the 3-way, end to end, vs the peer-sum reference.
 6. **pattern wiring** (CPU): the Inductor patterns trace, register and fuse a
-   small chain graph -- the S1 "kernel passed through the motif" sub-test.
+   small chain graph -- structural only. This is NOT the spec S1 (iii)
+   class-4 sub-test (kernel through the motif + functionalization vs kernel
+   nu, numeric): that one needs a running engine and is a run-gate item
+   (REPORT section 4).
 
 Run: pytest tests/kernels/triton/test_ar_norm_quant.py -v
 """
 
 import os
-import sys
 
 import pytest
 import torch
@@ -555,3 +557,227 @@ class TestPatternWiring:
         cfg = PassConfig()
         assert hasattr(cfg, "fuse_ar_norm_quant")
         assert hasattr(cfg, "fuse_norm_quant_triton")
+
+
+class TestPatternPriority:
+    """Regression for the v1 priority bug (69/80 sites stolen by 2-way AR+RMS
+    patterns): with the ownership guard the 2-way must DECLINE the int8-quant
+    sites, without it it consumes AR+norm and the 3-way never sees the chain."""
+
+    def _chain_gm(self, f):
+        import torch._inductor.pattern_matcher as pm
+
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        def fake_ar(inp):
+            return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+        orig = f.tensor_model_parallel_all_reduce
+        f.tensor_model_parallel_all_reduce = fake_ar
+
+        @enable_fake_mode
+        def _build():
+            pr3 = f.ArNormQuantInt8Pattern(1e-6)
+            return pm.fwd_only(pr3.pattern, pr3.get_inputs())
+
+        try:
+            return _build()
+        finally:
+            f.tensor_model_parallel_all_reduce = orig
+
+    def test_2way_steals_without_guard_and_declines_with_it(self):
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        guard = pytest.importorskip(
+            "vllm.compilation.passes.fusion.allreduce_rms_fusion"
+        )._norm_output_not_int8_quant
+        cfg_ctx = TestPatternWiring._cfg_ctx()
+        import vllm  # noqa: F401 - vllm.ir.ops must be a resolvable name
+        import vllm.ir.ops  # noqa: F401
+
+        def make_2way(extra_check):
+            # minimal stand-in for the AR+RMS 2-way patterns: same keying
+            # (outputs at the norm nodes), same risk profile
+            def pattern(residual, input, weight):
+                rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                    input, residual, weight, 1e-6
+                )
+                return rms, residual_out
+
+            def replacement(residual, input, weight):
+                return input, residual
+
+            pm_pass = PatternMatcherPass(pass_name="test_2way")
+
+            @enable_fake_mode
+            def _register():
+                # example inputs must be created INSIDE fake mode
+                inputs = [
+                    torch.empty((5, 16), dtype=torch.bfloat16, device="cpu"),
+                    torch.empty((5, 16), dtype=torch.bfloat16, device="cpu"),
+                    torch.empty((16,), dtype=torch.float32, device="cpu"),
+                ]
+                pm.register_replacement(
+                    pattern,
+                    replacement,
+                    inputs,
+                    pm.fwd_only,
+                    pm_pass,
+                    extra_check=extra_check or (lambda m: True),
+                )
+
+            _register()
+            return pm_pass
+
+        with cfg_ctx:
+            # without the guard: the 2-way consumes AR+norm (the v1 bug)
+            gm = self._chain_gm(f)
+            stolen = make_2way(None).apply(gm.graph)
+            assert stolen >= 1, "2-way should steal without the guard (sanity)"
+
+            # with the guard: it declines, and the 3-way then takes the chain
+            gm = self._chain_gm(f)
+            stolen = make_2way(guard).apply(gm.graph)
+            assert stolen == 0, "guard failed: 2-way consumed a 3-way site"
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+
+            @enable_fake_mode
+            def _register3():
+                pr3 = f.ArNormQuantInt8Pattern(1e-6)
+                pr3.extra_check = f._composite_check(pr3.quant_op)
+                pm_pass3 = PatternMatcherPass(pass_name="test_3way")
+                pm.register_replacement(
+                    pr3.pattern,
+                    pr3.replacement,
+                    pr3.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass3,
+                    extra_check=pr3.extra_check,
+                )
+                return pm_pass3
+
+            try:
+                pm_pass3 = _register3()
+                matched3 = pm_pass3.apply(gm.graph)
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched3 >= 1, "3-way did not take the site the guard reserved"
+
+
+class TestCollectiveDecision:
+    """The frozen fused-vs-fallback decision must be voted on collectively
+    (spec 3.7): a rank that decides alone can leave the peer spinning forever
+    in a captured graph."""
+
+    def _reset(self):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        kk._decision = None
+        kk._logged.clear()
+
+    def test_asymmetric_comm_init_falls_back_everywhere(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+        votes = []
+
+        class FakeGroup:
+            pass
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            votes.append(int(tensor.item()))
+            # vote 1 (readiness): everyone ready; vote 2 (comm init): the
+            # PEER failed -> MIN says no
+            tensor.fill_(1 if len(votes) == 1 else 0)
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (True, "ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(
+            kk, "ArNormQuantComm", lambda *a, **k: type("C", (), {"hidden": a[2], "rows": a[1]})()
+        )
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            assert len(votes) == 2, f"expected 2 collective votes, got {votes}"
+            assert enabled is False, "asymmetric comm init must freeze fallback"
+            assert comm is None
+            assert "peer comm init failed" in reason
+        finally:
+            self._reset()
+
+    def test_collective_failure_freezes_fallback(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+
+        class FakeGroup:
+            pass
+
+        def boom(tensor, op=None, group=None):
+            raise RuntimeError("gloo timeout")
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (True, "ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", boom)
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            assert enabled is False, "collective failure must freeze fallback"
+            assert comm is None
+        finally:
+            self._reset()
+
+    def test_rows_over_comm_buffer_falls_back_per_call(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+
+        class FakeComm:
+            hidden = 2048
+            rows = kk.MAX_ROWS
+
+        try:
+            kk._decision = {"enabled": True, "reason": "ready", "comm": FakeComm()}
+            enabled, reason, comm = kk.get_decision(kk.MAX_ROWS + 1, 2048)
+            assert enabled is False and comm is None
+            assert "rows" in reason
+            # in-regime calls still take the fused path
+            enabled, _, comm = kk.get_decision(8, 2048)
+            assert enabled is True and comm is not None
+            # a different hidden falls back instead of mis-indexing the slots
+            enabled, reason, comm = kk.get_decision(8, 4096)
+            assert enabled is False and comm is None and "hidden" in reason
+        finally:
+            self._reset()
+
+    def test_readiness_no_skips_nothing(self, monkeypatch):
+        """Even a local 'no' must run the collective vote (BLOCKER-2 class)."""
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+        votes = []
+
+        class FakeGroup:
+            pass
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            votes.append(int(tensor.item()))
+            tensor.fill_(0)
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (False, "not ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", fake_all_reduce)
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            # exactly 2 votes even for a local 'no': vote COUNTS must match
+            # across ranks too, or the peer blocks in an unmatched collective
+            assert votes == [0, 0], f"a local 'no' must still vote twice, got {votes}"
+            assert enabled is False and comm is None
+        finally:
+            self._reset()
