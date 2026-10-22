@@ -319,6 +319,7 @@ def _two_rank_worker(rank, world, port, outdir):
     # SAME weight and residual on both ranks, different x shards
     w = torch.randn(hidden, device=dev).to(torch.float32)
     res = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
+    res_orig = res.clone()  # the op mutates res in place: keep the original
     torch.manual_seed(100 + rank)
     x = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
     comm = k.ArNormQuantComm(dist.group.WORLD, k.MAX_ROWS, hidden)
@@ -336,6 +337,7 @@ def _two_rank_worker(rank, world, port, outdir):
             "result": result.cpu(),
             "scale": scale.cpu(),
             "res": res.cpu(),
+            "res_orig": res_orig.cpu(),
             "x": x.cpu(),
             "w": w.cpu(),
         },
@@ -386,7 +388,7 @@ class TestTwoRankOneShot:
         for r in (0, 1):
             got[r] = torch.load(f"{outdir}/rank{r}.pt", weights_only=False)
 
-        x0, res0, w0 = got[0]["x"], got[0]["res"], got[0]["w"]
+        x0, res0, w0 = got[0]["x"], got[0]["res_orig"], got[0]["w"]
         for rank in (0, 1):
             x_self = got[rank]["x"]
             x_peer = got[1 - rank]["x"]
