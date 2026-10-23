@@ -286,10 +286,14 @@ def scaled_mm_fused_quant_kernel(
 
     # ------------------------------------------------------------------
     # Pass 2 — quantize each A chunk in registers (VALU) and accumulate with
-    # the int8 weights (MFMA).  The VALU work of chunk k+1 sits between the
-    # tl.dot of chunk k and its wait, i.e. exactly in the MFMA/load bubbles.
+    # the int8 weights (MFMA).  tl.range(num_stages=) software-pipelines the
+    # loads across iterations: without it the load->quant->dot chain exposes
+    # the memory latency of EVERY chunk (measured +4.5 us at M<=32 and +39 us
+    # at M=256 vs the shipped chain in mk-quant-gemm-b2/b3).  With it, the
+    # VALU work of chunk k+1 sits in the MFMA/load bubbles of chunk k — the
+    # VALU/MFMA overlap the campaign asked for.
     # ------------------------------------------------------------------
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=4):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
         a_f = tl.load(a_ptrs, mask=masks_a, other=0.0)
