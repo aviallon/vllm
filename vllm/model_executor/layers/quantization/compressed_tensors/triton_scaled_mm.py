@@ -720,8 +720,14 @@ def _triton_scaled_mm_fused_quant_op(
     # The decision is taken INSIDE the custom op, at runtime, where the dims
     # are concrete ints — comparing them under torch.compile would create
     # guards (pitfall M9).
-    if input.shape[0] > FUSED_QUANT_MAX_ROWS:
-        x_q, x_s, _ = _scaled_int8_quant_chain(input, bias is not None)
+    if not fused_quant_regime(input.shape[0], input.shape[1]):
+        # The shipped two-kernel chain, verbatim (symmetric dynamic
+        # per-token — the eligibility gate in the caller guarantees that is
+        # the scheme in effect).  ⚠ Do NOT derive `symmetric` from anything
+        # but True here: passing `bias is not None` once dispatched the
+        # ASYMMETRIC quantizer and dropped the zero-point (found by the GLM
+        # review, 2026-10-23 — wrong prefill outputs, gate ON).
+        x_q, x_s, _ = _scaled_int8_quant_chain(input, symmetric=True)
         out = _triton_scaled_mm_impl(x_q, weight, x_s, scale_b, out_dtype, bias)
         return out, x_s
     return _triton_scaled_mm_fused_quant_impl(input, weight, scale_b, out_dtype, bias)
@@ -730,10 +736,21 @@ def _triton_scaled_mm_fused_quant_op(
 FUSED_QUANT_MAX_ROWS = 32
 
 
-def fused_quant_regime(M: int) -> bool:
+def fused_quant_regime(M: int, K: int) -> bool:
     """Regime policy (wall-measured 2026-10-23): the fused path at M<=32
-    (decode), the shipped chain above (prefill regressed ~13% fused)."""
-    return M <= FUSED_QUANT_MAX_ROWS
+    (decode), the shipped chain above (prefill regressed ~13% fused).
+
+    K must be a multiple of the fused tile's BLOCK_SIZE_K (256 at the M<=32
+    tiles): the kernel masks a partial tail correctly, but bit-exactness
+    there is the one OPEN question of the campaign (REPORT §0.1), so partial
+    K keeps the shipped chain until it is closed.  The dims are CONCRETE at
+    this point (inside the custom op, at runtime) — never move this check to
+    the torch.compile caller (pitfall M9).
+    """
+    return M <= FUSED_QUANT_MAX_ROWS and K % FUSED_QUANT_BLOCK_K == 0
+
+
+FUSED_QUANT_BLOCK_K = 256
 
 
 def _triton_scaled_mm_fused_quant_op_fake(

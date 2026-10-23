@@ -253,12 +253,51 @@ def test_fused_quant_transposed_weight():
 
 def test_regime_policy():
     """The wall-measured regime: fused at M<=32 (decode win), chain above
-    (prefill regressed ~13% fused).  Must stay in lockstep with the
+    (prefill regressed ~13% fused), and chain at partial K (the one open
+    bit-exactness question of the campaign).  Must stay in lockstep with the
     wall evidence in research/megakernel-campaign-2026-10-23/REPORT.md."""
     for m in (1, 4, 32):
-        assert fused_quant_regime(m), f"M={m} must use the fused path"
+        assert fused_quant_regime(m, 2048), f"M={m} must use the fused path"
     for m in (33, 256, 4096):
-        assert not fused_quant_regime(m), f"M={m} must keep the shipped chain"
+        assert not fused_quant_regime(m, 2048), f"M={m} must keep the shipped chain"
+    for k in (1024, 2016, 3000):
+        assert not fused_quant_regime(32, k), f"K={k} partial must keep the chain"
+
+
+def test_partial_k_quant_matches_chain():
+    """CLOSES the open partial-K question in the kernel's favour if green.
+
+    The CHAIN's quantization is well-defined at partial K (only its GEMM tail
+    is undefined), so compare the fused kernel's output against an EXACT
+    (fp64) GEMM of the chain's own quantized values: equal => the fused
+    quantized values are the chain's, bit for bit, even at partial K.
+    """
+    M, K, N = 5, 2016, 96
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    out, s_fused = fused_quant_kernel(x, w_q, scale_b, torch.float32)
+    q_chain, s_chain = scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
+    assert torch.equal(s_fused, s_chain), "scales: fused vs chain differ at partial K"
+    acc = (q_chain.to(torch.float64) @ w_q.to(torch.float64)).to(torch.float32)
+    ref = (s_chain * acc) * scale_b.t()
+    if not torch.equal(out, ref):
+        diff = (out.float() - ref.float()).abs()
+        raise AssertionError(
+            f"fused quant != chain quant at K={K}: {int((diff > 0).sum())} elems, "
+            f"max|d|={diff.max().item():.6g}"
+        )
+
+
+def test_op_dispatch_m_gt_32_is_the_chain():
+    """The regime fallback inside the custom op must be the SHIPPED chain
+    (bit-exact against it) — this is the path every prefill takes with the
+    gate ON (a wrong `symmetric` there produced wrong outputs, GLM review
+    2026-10-23)."""
+    for M, K, N in [(33, 2048, 1024), (256, 2048, 2048), (4096, 2048, 512)]:
+        x, w_q, scale_b = _make_inputs(M, K, N)
+        ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
+        out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+        assert torch.equal(s, ref_s), f"scales differ at ({M},{K},{N})"
+        assert torch.equal(out, ref_out), f"op dispatch M>32 output differs at ({M},{K},{N})"
 
 
 def test_gate_decision_table(monkeypatch):
@@ -325,7 +364,9 @@ def _main() -> int:
     run("transposed weight (prod layout)", test_fused_quant_transposed_weight)
     run("partial K vs cpu", test_fused_quant_partial_k_vs_cpu)
     run("oracle is the chain?", test_partial_k_oracle_is_the_chain)
-    run("regime policy (M<=32)", test_regime_policy)
+    run("regime policy (M<=32, K%256)", test_regime_policy)
+    run("partial-K quant == chain quant", test_partial_k_quant_matches_chain)
+    run("op dispatch M>32 == chain", test_op_dispatch_m_gt_32_is_the_chain)
     run("vllm quant reference", test_fused_quant_scale_convention_matches_vllm_reference)
     mp = _MonkeyPatch()
     run("gate decision table", test_gate_decision_table, mp)
