@@ -347,7 +347,22 @@ def rocm_unquantized_gemm_impl(
         # The skinny kernels assume contiguous K elements. A shape-preserving
         # reshape can retain a transposed activation's non-contiguous strides.
         # Note: Only build that view inside the branches that consume it.
-        if (m == 1 or m > 8) and 0 < n <= 5:
+        #
+        # n == 5 is excluded deliberately: wvSplitK's N_p2=8 regime is
+        # pathological at exactly 5 input rows while n=1..4 win (measured on
+        # MI210/gfx90a, mins of 20x10, aragorn
+        # research/gdn-profile-2026-10-17/gdn_gemm_results.json):
+        #   in_proj 6144x2048  n=5: 254.2us vs 42.6us F.linear (6.0x slower)
+        #   in_proj 12288x2048 n=5: 479.2us vs 63.8us (7.5x slower)
+        #   out_proj 2048x4096 n=5:  58.3us vs 42.4us (1.4x slower)
+        # while out_proj 2048x2048 (34.5 vs 42.7) and ba 64x2048 (13.4 vs
+        # 41.2) still win at n=5 and regress by falling back (+8.2us and
+        # +27.8us per call). Net measured at TP=2 GDN projection shapes is
+        # -175.6us per layer per decode step at 5 tokens/GPU, so n=5 goes to
+        # the same tgemm/torch fallback prod already uses for n>=6. Restore
+        # n=5 here once wvSplitK's n=5 shard choice is fixed (see the audit
+        # research/int8-kernel-audit-2026-10-18/REPORT.md, item 2).
+        if (m == 1 or m > 8) and 0 < n <= 4:
             x_view = x.reshape(-1, x.size(-1)).contiguous()
             cu_count = num_compute_units()
             out = ops.wvSplitK(weight, x_view, cu_count, bias)

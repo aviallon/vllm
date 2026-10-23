@@ -2,11 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from fastapi import Request
-from starlette.responses import JSONResponse
 
 from vllm.logger import init_logger
 
-from ..error_response import create_error_response
+from ..error_response import create_error_response, error_response_to_json_response
 
 logger = init_logger(__name__)
 
@@ -20,5 +19,4 @@ async def exception_handler(req: Request, exc: Exception):
             else None,
         )
 
-    err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return error_response_to_json_response(create_error_response(exc))

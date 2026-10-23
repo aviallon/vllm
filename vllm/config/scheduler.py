@@ -132,6 +132,20 @@ class SchedulerConfig:
     prompts under chunked prefill; short prompts that prefill in a
     single iteration are unaffected."""
 
+    retry_after_on_overload: bool = False
+    """Return HTTP 429 (Too Many Requests) with a ``Retry-After`` hint
+    instead of HTTP 503 when admission control rejects a request (see
+    ``max_num_queued_reqs`` and ``max_num_queued_tokens``). The estimate is
+    also included in the error body (``error.retry_after``) so streaming
+    responses — whose HTTP status is already sent — can carry it.
+
+    Off by default: a plain HTTP 503 is the right answer when a load
+    balancer should retry the request on a different instance. Turn it on
+    when clients should back off and retry this instance instead; the
+    delay is estimated from the in-flight request count, the prefill
+    backlog and recently observed throughput (see
+    ``vllm.v1.engine.admission_control.RetryAfterEstimator``)."""
+
     enable_chunked_prefill: bool = True
     """If True, prefill requests can be chunked based
     on the remaining `max_num_batched_tokens`.

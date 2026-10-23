@@ -131,6 +131,15 @@ class PassConfig:
     """Fuse the custom SiluMul + quant ops."""
     fuse_attn_quant: bool = None  # type: ignore[assignment]
     """Fuse the custom Attention and MLAAttention + quant ops."""
+    fuse_norm_quant_triton: bool = None  # type: ignore[assignment]
+    """Fuse fused_add_rms_norm + per-token int8 quant into a stock-Triton
+    kernel (the "norm+quant only" scope; no all-reduce in the motif).
+    Decode-only (<= 80 rows). See ArNormQuantFusionPass."""
+    fuse_ar_norm_quant: bool = None  # type: ignore[assignment]
+    """Fuse all_reduce + fused_add_rms_norm + per-token int8 quant into a
+    single stock-Triton kernel (one-shot 2-rank all-reduce inside the kernel).
+    Decode-only (<= 80 rows) and TP=2; outside the regime the node runs the
+    unfused chain it replaces. See ArNormQuantFusionPass."""
     eliminate_noops: bool = Field(default=True)
     """Eliminate no-op ops."""
     enable_sp: bool = None  # type: ignore[assignment]
@@ -231,6 +240,8 @@ class PassConfig:
         "fuse_norm_quant",
         "fuse_act_quant",
         "fuse_attn_quant",
+        "fuse_norm_quant_triton",
+        "fuse_ar_norm_quant",
         "enable_sp",
         "fuse_gemm_comms",
         "fuse_allreduce_rms",

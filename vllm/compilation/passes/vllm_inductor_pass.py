@@ -91,6 +91,130 @@ def get_match_table() -> dict[str, int]:
     return dict(VllmPatternMatcherPass.match_table)
 
 
+def _match_site_repr(match: Any, limit: int = 6) -> str:
+    """Compact ``[(name, op), ...]`` repr of a match's nodes, for logging."""
+    parts = []
+    for node in list(match.nodes)[:limit]:
+        target = getattr(node, "target", None)
+        name = getattr(target, "__name__", str(target))
+        parts.append(f"{getattr(node, 'name', '?')}:{name}")
+    return "[" + ", ".join(parts) + "]"
+
+
+class PatternMatchTelemetry:
+    """Per-motif match counting for fusion pattern passes.
+
+    Inductor invokes a pattern's ``extra_check`` exactly once per confirmed
+    match, immediately before applying the replacement
+    (``PatternMatcherPass.apply``: ``if is_match(m) and
+    guard_or_false(entry.extra_check(m)): count += 1; entry.apply(...)``).
+    Counting accepted calls therefore counts applied replacements -- the
+    per-motif ``matched_count`` the pass-level counter cannot provide.
+
+    Every motif logs one one-shot proof-of-branching line on its first match
+    (pass, motif, running count, first matched sites); totals live in
+    :attr:`counts` and are reported per pass run by
+    :func:`log_pattern_match_summary` (including explicit zeros, so "the pass
+    ran and matched nothing" is visible rather than silent).
+    """
+
+    counts: ClassVar[defaultdict[str, int]] = defaultdict(int)
+    """(pass_name:motif) -> accepted match count."""
+
+    registered: ClassVar[defaultdict[str, list[str]]] = defaultdict(list)
+    """pass_name -> motif names registered (to report explicit zeros)."""
+
+    _logged: ClassVar[set[str]] = set()
+    _summarized: ClassVar[set[str]] = set()
+    _prev_summed: ClassVar[defaultdict[str, int]] = defaultdict(int)
+
+    def __init__(
+        self,
+        pass_name: str,
+        motif: str,
+        base: Callable[..., bool] | None = None,
+    ) -> None:
+        self.pass_name = pass_name
+        self.motif = motif
+        self.base = base
+        if motif not in PatternMatchTelemetry.registered[pass_name]:
+            PatternMatchTelemetry.registered[pass_name].append(motif)
+
+    @property
+    def key(self) -> str:
+        return f"{self.pass_name}:{self.motif}"
+
+    @classmethod
+    def reset(cls) -> None:
+        """Clear ALL telemetry state together (counts, one-shot sets, summary
+        deltas). Clearing only ``counts`` desynchronises ``_prev_summed`` and
+        makes log_pattern_match_summary report bogus 'telemetry mismatch'
+        warnings -- seen 7x in the 2026-10-19 probe logs for exactly that
+        reason. Tests/tools that restart measuring must call this."""
+        cls.counts.clear()
+        cls._prev_summed.clear()
+        cls._logged.clear()
+        cls._summarized.clear()
+
+    def __call__(self, match: Any) -> bool:
+        if self.base is not None and not self.base(match):
+            return False
+        PatternMatchTelemetry.counts[self.key] += 1
+        if self.key not in PatternMatchTelemetry._logged:
+            PatternMatchTelemetry._logged.add(self.key)
+            logger.info(
+                "pattern-match proof: pass=%s pattern=%s matched (count=%d) "
+                "first_sites=%s",
+                self.pass_name,
+                self.motif,
+                PatternMatchTelemetry.counts[self.key],
+                _match_site_repr(match),
+            )
+        return True
+
+
+def counted_extra_check(
+    pass_name: str, motif: str, base: Callable[..., bool] | None = None
+) -> PatternMatchTelemetry:
+    """Telemetry-wrapped ``extra_check`` for ``pm.register_replacement``."""
+    return PatternMatchTelemetry(pass_name, motif, base)
+
+
+def log_pattern_match_summary(pass_name: str, matched_total: int) -> None:
+    """One-shot-per-run summary of per-motif matches for one pass invocation.
+
+    Logged on the first invocation of each pass (explicit zeros) and on every
+    invocation that matched something. The per-motif sum and the pass's own
+    ``apply()`` total are both printed: if they ever disagree, the telemetry
+    hook missed matches and the numbers must not be trusted silently.
+    """
+    motifs = PatternMatchTelemetry.registered.get(pass_name, [])
+    per_motif = {
+        m: PatternMatchTelemetry.counts.get(f"{pass_name}:{m}", 0) for m in motifs
+    }
+    first = pass_name not in PatternMatchTelemetry._summarized
+    PatternMatchTelemetry._summarized.add(pass_name)
+    if not first and matched_total == 0:
+        return
+    summed = sum(per_motif.values())
+    delta = summed - PatternMatchTelemetry._prev_summed[pass_name]
+    PatternMatchTelemetry._prev_summed[pass_name] = summed
+    logger.info(
+        "pattern-match summary: pass=%s matched_this_run=%d per_motif=%s",
+        pass_name,
+        matched_total,
+        per_motif,
+    )
+    if matched_total and delta != matched_total:
+        logger.warning(
+            "pattern-match telemetry mismatch: pass=%s apply_total=%d "
+            "summed_motifs_this_run=%d",
+            pass_name,
+            matched_total,
+            delta,
+        )
+
+
 class VllmPatternMatcherPass(VllmInductorPass):
     """A VllmInductorPass that uses the Inductor pattern matcher.
     Provides pattern registration with match counting, debug dumping, and logging.
@@ -328,6 +452,7 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
             pr.get_inputs(),
             self._trace_fn,
             self.pm_pass,
+            extra_check=counted_extra_check(self.pass_name, type(pr).__name__),
         )
         self._pattern_replacements.append(pr)
 
@@ -339,6 +464,13 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
 
     @staticmethod
     def _trace_fn(*args: Any, **kwargs: Any) -> fx.GraphModule:
+        # NOTE: pm.fwd_only traces WITH inductor's decomposition table, and
+        # that is load-bearing: the engine's graphs go through the same
+        # decompositions (vLLM compiles via torch._inductor.standalone_compile,
+        # whose pre-grad stage decomposes e.g. empty_like ->
+        # empty.memory_format(..., layout=strided)). A no-decomposition trace
+        # produced aten.empty_like nodes that could not match the real
+        # decomposed form (measured 2026-10-19 on the int8 norm->quant sites).
         gm = pm.fwd_only(*args, **kwargs)
         _fx_view_to_reshape(gm)
         _remove_noop_permutes(gm)
@@ -348,3 +480,4 @@ class VllmFusionPatternMatcherPass(VllmPatternMatcherPass):
     def __call__(self, graph: torch.fx.Graph) -> None:
         self.matched_count = self.pm_pass.apply(graph)
         VllmPatternMatcherPass.match_table[self.pass_name] += self.matched_count
+        log_pattern_match_summary(self.pass_name, self.matched_count)

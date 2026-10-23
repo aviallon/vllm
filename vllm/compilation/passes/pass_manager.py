@@ -40,6 +40,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
 
 if current_platform.is_cuda_alike():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
+    from .fusion.ar_norm_quant_fusion import ArNormQuantFusionPass
     from .fusion.attn_quant_fusion import AttnQuantFusionPass
     from .fusion.collective_fusion import AsyncTPPass
     from .fusion.mla_attn_quant_fusion import MLAAttnQuantFusionPass
@@ -63,6 +64,7 @@ from .inductor_pass import (
 )
 from .utility.fix_functionalization import FixFunctionalizationPass
 from .utility.noop_elimination import NoOpEliminationPass
+from .utility.normalize_auto_functionalized import NormalizeAutoFunctionalizedPass
 
 logger = init_logger(__name__)
 
@@ -153,6 +155,12 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         # Set the current vllm config to allow tracing CustomOp instances
         with set_current_vllm_config(config, check_compile=False):
+            # ALWAYS FIRST: every fusion matcher targets the
+            # auto_functionalized (v1) call form; on torch >= 2.13 the graph
+            # carries auto_functionalized_v2 nodes instead and nothing can
+            # match until they are normalised.
+            self.passes += [NormalizeAutoFunctionalizedPass(config)]
+
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 
@@ -163,6 +171,19 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
             if enable_transformers_norm_canonicalization:
                 self.passes += [AddRMSNormFusionPass(config)]
+
+            # Triton AR+norm+quant / norm+quant fusions first: they own the
+            # all_reduce -> fused_add_rms_norm -> int8 quant chains, and
+            # Inductor dispatches patterns per output-node target, so a pass
+            # running later would rewrite the AR+norm half first (v1 lesson:
+            # 69/80 sites stolen by the 2-way patterns). The 2-way AR+RMS
+            # patterns additionally decline int8-quant sites whenever this
+            # pass is enabled (see _norm_output_not_int8_quant).
+            if (
+                self.pass_config.fuse_ar_norm_quant
+                or self.pass_config.fuse_norm_quant_triton
+            ):
+                self.passes += [ArNormQuantFusionPass(config)]
 
             if self.pass_config.fuse_act_padding and (
                 rocm_aiter_ops.is_enabled() or rocm_aiter_ops.is_rdna_aiter_enabled()

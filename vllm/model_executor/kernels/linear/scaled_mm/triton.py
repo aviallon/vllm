@@ -5,6 +5,10 @@
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
 )
@@ -121,18 +125,25 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
         symmetric = azp_adj is None
-        x_q, x_s, x_zp = ops.scaled_int8_quant(
-            x.contiguous(), i_s, i_zp, symmetric=symmetric
-        )
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            x_q, x_s, x_zp = qa.data, qa.scale, None
+            orig_dtype = qa.orig_dtype
+        else:
+            assert isinstance(x, torch.Tensor)
+            x_q, x_s, x_zp = ops.scaled_int8_quant(
+                x.contiguous(), i_s, i_zp, symmetric=symmetric
+            )
+            orig_dtype = x.dtype
 
         out = triton_scaled_mm(
-            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
+            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=orig_dtype, bias=bias
         )
 
         if azp_adj is not None:
@@ -148,10 +159,10 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
             if not static and x_zp is not None:
                 # Dynamic per-token: azp is per-token, azp_adj is per-channel
                 # x_zp: [M, 1], azp_adj: [1, N]
-                out -= x_s * w_s_row * (x_zp * azp_adj).to(x.dtype)
+                out -= x_s * w_s_row * (x_zp * azp_adj).to(orig_dtype)
             else:
                 # Static per-tensor: azp already folded into azp_adj
-                out -= (x_s * w_s_row * azp_adj).to(x.dtype)
+                out -= (x_s * w_s_row * azp_adj).to(orig_dtype)
 
         return out
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import operator
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -42,12 +43,94 @@ from ..vllm_inductor_pass import (
     VllmPatternMatcherPass,
     VllmPatternReplacement,
 )
-from .matcher_utils import MatcherQuantFP8
+from .matcher_utils import (
+    MatcherQuantFP8,
+    called_op,
+    op_base_name,
+    op_call_kwargs,
+    walk_views,
+)
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
 _IR_RMS_NORM_OP = torch.ops.vllm_ir.rms_norm.default
 _IR_FUSED_ADD_RMS_NORM_OP = torch.ops.vllm_ir.fused_add_rms_norm.default
+
+
+_NOOP_FORWARD = {
+    "contiguous", "clone", "view", "reshape", "flatten", "to", "permute",
+    "transpose", "unsqueeze", "squeeze", "_unsafe_view",
+}
+
+
+def _3way_can_own(norm_node: Any) -> bool:
+    """Would a 3-way motif (Triton, or the AITER int8 epilogue) actually
+    take this site? Mirrors ArNormQuantFusionPass's ownership: the decode
+    regime gate (2D, rows <= 80, bf16) and the fp32-weight contract.
+
+    Declining a site NO 3-way can own would silently remove the 2-way
+    AR+RMS fusion there -- arm A vs arm B drift at prefill / large batches,
+    breaking the non-regression gate's "no change outside the regime".
+    """
+    try:
+        from vllm.kernels.triton.ar_norm_quant import MAX_ROWS
+    except Exception:  # noqa: BLE001 - no Triton module: own nothing
+        return False
+    x, w = norm_node.args[0], norm_node.args[2]
+    try:
+        x_val, w_val = x.meta["val"], w.meta["val"]
+    except (AttributeError, KeyError, TypeError):
+        return False
+    if len(x_val.shape) != 2 or x_val.dtype != torch.bfloat16:
+        return False
+    rows = x_val.shape[0]
+    if isinstance(rows, int) and rows > MAX_ROWS:
+        # concretely out-of-regime: the 3-way does not own it
+        return False
+    # symbolic rows: the 3-way CAN own it (its runtime per-call bound keeps
+    # the fused kernel in regime and falls back to the exact chain above) --
+    # same rule as ArNormQuantFusionPass._decode_regime.
+    return w_val.dtype == torch.float32
+
+
+def _norm_output_not_int8_quant(match: pm.Match) -> bool:
+    """Decline AR+RMS sites whose normed output feeds a per-token int8 quant
+    AND which a 3-way motif would take.
+
+    Those sites belong to the 3-way AR+RMS+quant motif. Inductor dispatches
+    patterns per OUTPUT-node target, so the 2-way patterns (keyed at the norm
+    outputs) are visited at the norm node -- earlier in graph order than the
+    quant node keying the 3-way -- and would consume the AR+norm nodes first,
+    leaving the quant unfused (measured 2026-10-21: 69/80 sites stolen from
+    the 3-way by this exact mechanism). With this guard the 2-way declines and
+    the 3-way takes the whole chain; sites with no int8 quant (bf16 consumers)
+    are unaffected. Attached only when a 3-way owner is registered.
+    """
+    try:
+        quant_op = torch.ops._C.dynamic_scaled_int8_quant.default
+    except AttributeError:
+        return True
+    for node in match.nodes:
+        if node.target not in (_IR_RMS_NORM_OP, _IR_FUSED_ADD_RMS_NORM_OP):
+            continue
+        frontier = [node]
+        seen: set[int] = set()
+        while frontier:
+            cur = frontier.pop()
+            for user in cur.users:
+                if id(user) in seen:
+                    continue
+                seen.add(id(user))
+                if called_op(user) is quant_op:
+                    kwargs = op_call_kwargs(user, quant_op)
+                    producer, _ = walk_views(kwargs.get("input"))
+                    if producer is node:
+                        return not _3way_can_own(node)
+                if user.target is operator.getitem or (
+                    op_base_name(user.target) in _NOOP_FORWARD
+                ):
+                    frontier.append(user)
+    return True
 
 
 def _view_nvfp4_scale_out_for_flashinfer(
@@ -1632,27 +1715,38 @@ class RocmAiterAllReduceFusionPass(VllmFusionPatternMatcherPass):
                     )
                 )
 
-            self.register(
-                AiterAllreduceFusedRMSNormPattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                )
+            # 2-way AR+RMS variants. When a 3-way owner is registered (on this
+            # lineage: the Triton AR+norm+quant pass gated by
+            # ``pass_config.fuse_ar_norm_quant`` -- the AITER int8 epilogue of
+            # the gfx90a-rebase lineage does not exist here), these must
+            # DECLINE the sites it owns (see _norm_output_not_int8_quant):
+            # inductor dispatches per output-node target, so without the guard
+            # the 2-way patterns are tried first at the norm node and steal the
+            # AR+norm half of the 3-way's chain (measured: 69/80 sites).
+            _rms_only = AiterAllreduceFusedRMSNormPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
             )
-            self.register(
-                AiterAllreduceFusedAddRMSNormPattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                )
+            _add_rms = AiterAllreduceFusedAddRMSNormPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
             )
-            self.register(
-                AiterAllreduceFusedAddRMSNormOutputOnlyPattern(
-                    epsilon,
-                    self.model_dtype,
-                    self.device,
-                )
+            _add_rms_out_only = AiterAllreduceFusedAddRMSNormOutputOnlyPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
             )
+            owns_int8_3way = bool(
+                config.compilation_config.pass_config.fuse_ar_norm_quant
+            )
+            if owns_int8_3way:
+                for _pr in (_rms_only, _add_rms, _add_rms_out_only):
+                    _pr.extra_check = _norm_output_not_int8_quant
+            self.register(_rms_only)
+            self.register(_add_rms)
+            self.register(_add_rms_out_only)
 
             # WARNING: This is a hack to clear the pattern matcher cache
             # and allow multiple values of epsilon.

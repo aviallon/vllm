@@ -1,0 +1,804 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Tests for the Triton AR+norm+quant / norm+quant kernel (v2).
+
+Layers, in order of how much machinery they need:
+
+1. **numeric contract** (CPU, no GPU): the reference implementation of the
+   executed-baseline contract (research/ar-rms-quant-v2-spec-2026-10-22.md
+   section 3.2) against hand-computed values -- scale = absmax/127 without
+   clamp, the absmax==0 special case, half-to-even ``rint`` (never
+   half-away).
+2. **gfx90a codegen** (needs triton only): a real ``triton_compile`` of the
+   kernel for ``GPUTarget("hip", "gfx90a", 32)`` -- the check v1's
+   ``-fsyntax-only`` faked. Catches "needs target feature" and similar
+   codegen-time failures without a GPU.
+3. **kernel execution** (needs 1 GPU): kernel vs reference. The quant path
+   must be bit-exact on inputs where the fp32 variance sum is exact (integer
+   rows); on random data only the reduction order of ``var`` may differ
+   (class-3, ~1e-7) and at most a few ``q`` values may flip by +/-1 LSB --
+   the flip COUNT is asserted, not just "close".
+4. **fallback parity** (needs 1 GPU): the op's in-node fallback chain must
+   equal the unfused native chain bit-for-bit.
+5. **two-rank one-shot AR** (needs 2 GPUs + gloo): the barrier + peer-load
+   data path of the 3-way, end to end, vs the peer-sum reference.
+6. **pattern wiring** (CPU): the Inductor patterns trace, register and fuse a
+   small chain graph -- structural only. This is NOT the spec S1 (iii)
+   class-4 sub-test (kernel through the motif + functionalization vs kernel
+   nu, numeric): that one needs a running engine and is a run-gate item
+   (REPORT section 4).
+
+Run: pytest tests/kernels/triton/test_ar_norm_quant.py -v
+"""
+
+import os
+
+import pytest
+import torch
+
+# ---------------------------------------------------------------------------
+# test-only stubs: without the compiled vllm._C extension (CPU-only dev
+# boxes, CI without a ROCm build) the fusion modules cannot import. The
+# stubs mirror the C++ schemas and are ONLY registered when the real ops are
+# absent -- on a real image the compiled ops are used.
+# ---------------------------------------------------------------------------
+_C_STUBS = [
+    "rotary_embedding(Tensor query, Tensor key, Tensor cos_sin_cache, "
+    "Tensor positions, Tensor! q_out, Tensor! k_out, bool is_neox) -> ()",
+    "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> ()",
+    "dynamic_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale) -> ()",
+    "dynamic_per_token_scaled_fp8_quant(Tensor! result, Tensor input, "
+    "Tensor! scale, Tensor? scale_ub) -> ()",
+    "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
+    "Tensor? azp) -> ()",
+    "silu_and_mul(Tensor! result, Tensor input) -> ()",
+    "rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> ()",
+    "fused_add_rms_norm(Tensor! result, Tensor! residual, Tensor weight, "
+    "float epsilon) -> ()",
+    "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, "
+    "Tensor scale, float epsilon, Tensor? scale_ub, Tensor? residual) -> ()",
+    "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+    "Tensor weight, Tensor scale, float epsilon, Tensor? scale_ub, "
+    "Tensor? residual) -> ()",
+    "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
+    "Tensor weight, Tensor! scale, float epsilon, Tensor? scale_ub, "
+    "Tensor? residual) -> ()",
+    "rms_norm_per_block_quant(Tensor! result, Tensor input, Tensor weight, "
+    "Tensor! scale, float epsilon, Tensor? scale_ub, Tensor? residual) -> ()",
+]
+
+
+_STUB_LIB = None
+_USING_STUBS = False
+
+
+def _ensure_c_stubs() -> bool:
+    """Returns True if stubs were installed (no real vllm._C in this env)."""
+    global _STUB_LIB, _USING_STUBS
+    if hasattr(torch.ops._C, "dynamic_scaled_int8_quant"):
+        return False  # real extension: nothing to stub
+    if _STUB_LIB is not None:
+        return True
+    _USING_STUBS = True
+    lib = torch.library.Library("_C", "FRAGMENT")
+    for spec in _C_STUBS:
+        name = spec.split("(")[0]
+        try:
+            lib.define(spec)
+            lib.impl(name, lambda *a, **k: None, "CompositeExplicitAutograd")
+        except Exception:  # noqa: BLE001 - already defined is fine
+            pass
+    # keep the Library object alive for the process lifetime
+    _STUB_LIB = lib
+    return True
+
+from vllm.kernels.triton import ar_norm_quant as k  # noqa: E402
+
+HAS_GPU = torch.cuda.is_available() and torch.cuda.device_count() >= 1
+HAS_2GPU = torch.cuda.is_available() and torch.cuda.device_count() >= 2
+needs_gpu = pytest.mark.skipif(not HAS_GPU, reason="needs a GPU")
+needs_2gpu = pytest.mark.skipif(not HAS_2GPU, reason="needs 2 GPUs")
+
+
+# ---------------------------------------------------------------------------
+# 1. numeric contract (CPU)
+# ---------------------------------------------------------------------------
+class TestNumericContract:
+    def test_scale_is_absmax_over_127_without_clamp(self):
+        # a row with a tiny absmax: the OTHER kernel's contract would clamp
+        # scale to min_scaling_factor; ours must NOT.
+        x = torch.full((1, 4), 1e-6, dtype=torch.bfloat16)
+        res = torch.zeros_like(x)
+        w = torch.ones(4, dtype=torch.float32)
+        q, scale, _ = k.reference_norm_quant_int8(x, res, w, 0.0)
+        # constant row -> y = w = 1 exactly -> amax = 1 -> scale = 1/127
+        assert scale.item() == pytest.approx(1.0 / 127.0, rel=1e-6)
+        assert q.abs().max().item() == 127
+
+    def test_zero_row_special_case(self):
+        x = torch.zeros(1, 8, dtype=torch.bfloat16)
+        res = torch.zeros_like(x)
+        w = torch.ones(8, dtype=torch.float32)
+        q, scale, res_out = k.reference_norm_quant_int8(x, res, w, 1e-6)
+        assert scale.item() == 0.0  # absmax / 127, no clamp, no epsilon floor
+        assert torch.all(q == 0)  # inv_s = 0 -> rint(0 * 0) = 0
+        assert torch.all(res_out == 0)
+
+    def test_rint_is_half_to_even(self):
+        # Build rows whose y_bf16 * inv_s lands exactly on x.5: x=0,
+        # residual=[[1,1]] -> s=[1,1], var=1, rstd=1 -> y = w exactly.
+        # With w=[v, 127] the amax is 127 and inv_s = 1 exactly, so
+        # q[0] = rint(v) -- and rint is half-to-EVEN: 2.5->2, 3.5->4,
+        # -2.5->-2. A half-away or half-up implementation fails these.
+        for value, want in ((2.5, 2), (3.5, 4), (-2.5, -2), (0.5, 0), (1.5, 2)):
+            x = torch.zeros(1, 2, dtype=torch.bfloat16)
+            res = torch.ones(1, 2, dtype=torch.bfloat16)
+            w = torch.tensor([value, 127.0], dtype=torch.float32)
+            q, scale, _ = k.reference_norm_quant_int8(x, res, w, 0.0)
+            assert q[0, 1].item() == 127
+            got = q[0, 0].item()
+            assert got == want, f"rint({value}) = {got}, expected {want}"
+
+    def test_quant_saturates(self):
+        # y_bf16 * inv_s is bounded by 127 by construction of inv_s, so the
+        # saturating cast only guards fp32 rounding of the product.
+        w = torch.tensor([127.0, 127.0], dtype=torch.float32)
+        x = torch.zeros(1, 2, dtype=torch.bfloat16)
+        res = torch.ones(1, 2, dtype=torch.bfloat16)
+        q, scale, _ = k.reference_norm_quant_int8(x, res, w, 0.0)
+        assert q.abs().max().item() <= 127
+        assert q[0, 0].item() == 127
+
+
+# ---------------------------------------------------------------------------
+# 2. gfx90a codegen (the v1 "-fsyntax-only" lesson: real compilation)
+# ---------------------------------------------------------------------------
+class TestGfx90aCodegen:
+    def test_kernel_compiles_for_gfx90a(self):
+        triton = pytest.importorskip("triton")
+        from triton.backends.compiler import GPUTarget
+        from triton.compiler import ASTSource, compile as triton_compile
+
+        for ptr_ty in ("i64", "i32"):
+            # "i32" is what the JIT really infers for Python int args that
+            # fit (the PEER=0 dummies are 0): tt.int_to_ptr rejects i32 unless
+            # the kernel promotes to i64 itself (regression for the 2026-10-22
+            # aragorn failure: "operand #0 must be 64-bit signless integer").
+            sig = {
+                "x_ptr": "*bf16",
+                "res_ptr": "*bf16",
+                "weight_ptr": "*fp32",
+                "out_ptr": "*i8",
+                "scale_ptr": "*fp32",
+                "normed_ptr": "*bf16",
+                "slot_ptr": ptr_ty,
+                "peer_ptr": ptr_ty,
+                "flag_ptr": ptr_ty,
+                "peer_flag_ptr": ptr_ty,
+                "eps": "fp32",
+                "stride_x": "i32",
+                "stride_res": "i32",
+                "stride_out": "i32",
+                "stride_normed": "i32",
+                "stride_slot": "i32",
+            }
+            for peer in (0, 1):
+                src = ASTSource(
+                    fn=k._norm_quant_int8_kernel,
+                    signature=sig,
+                    constexprs={
+                        "H": 2048,
+                        "BLOCK_H": 2048,
+                        "PEER": peer,
+                        "FLAG_STRIDE": 32,
+                    },
+                )
+                compiled = triton_compile(
+                    src, target=GPUTarget("hip", "gfx90a", 32),
+                    options={"num_warps": 8},
+                )
+                asm = compiled.asm.get("amdgcn", "")
+                assert len(asm) > 1000
+                # the contract's rounding primitive: rint -> v_rndne_f32
+                assert "v_rndne_f32" in asm
+                if peer:
+                    # the barrier primitives must survive lowering
+                    assert "global_atomic" in asm
+
+
+# ---------------------------------------------------------------------------
+# 3/4/5. GPU execution
+# ---------------------------------------------------------------------------
+def _run_op(op, x, res, w, eps):
+    rows, hidden = x.shape
+    result = torch.empty((rows, hidden), dtype=torch.int8, device=x.device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    op(result, x, w, scale, eps, res)
+    return result, scale, res
+
+
+@needs_gpu
+class TestKernelExecution:
+    def test_unit_variance_rows_are_bit_exact(self):
+        # rows with |s| = 1 everywhere -> sum(s*s) = 2048 -> var = 1 exactly
+        # in ANY reduction order, rstd = 1 exactly even on approximate
+        # hardware rsqrt. So y, y_bf16, amax, scale, inv_s and q are exact:
+        # the whole quant path must be BIT-EXACT vs the reference. This is
+        # the S1 gate (i): "quant bit-exact given y identical".
+        torch.manual_seed(0)
+        rows, hidden = 80, 2048
+        s = torch.randint(0, 2, (rows, hidden), device="cuda") * 2 - 1  # +-1
+        res = s.to(torch.bfloat16)
+        x = torch.zeros(rows, hidden, dtype=torch.bfloat16, device="cuda")
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        # reference FIRST: the op mutates res in place
+        q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(x, res, w, 0.0)
+        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 0.0)
+        assert torch.equal(res_out.cpu(), res_ref.cpu()), "res_out not bit-exact"
+        assert torch.equal(scale.cpu(), scale_ref.cpu()), "scale not bit-exact"
+        assert torch.equal(out.cpu(), q_ref.cpu()), "quant not bit-exact"
+
+    def test_normed_output_is_the_quant_input(self):
+        # The op RETURNS the normed value (the chain it replaces produces it
+        # for other consumers): it must be exactly the tensor the quant
+        # consumed -- scale == amax(normed)/127 is the observable contract.
+        torch.manual_seed(1)
+        rows, hidden = 8, 2048
+        x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        result = torch.empty((rows, hidden), dtype=torch.int8, device=x.device)
+        scale = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+        normed = k._norm_quant_int8_impl(result, x, w, scale, 1e-6, res)
+        assert normed.dtype == torch.bfloat16
+        assert normed.shape == x.shape
+        amax = normed.to(torch.float32).abs().amax(dim=-1, keepdim=True)
+        assert torch.equal(
+            scale.cpu(), (amax / 127.0).cpu()
+        ), "scale is not amax(normed)/127 -- normed is not the quant input"
+
+    def test_random_rows_class3_and_flip_count(self):
+        torch.manual_seed(1)
+        rows, hidden = 16, 2048
+        x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        # the op mutates res IN PLACE: the reference must see the ORIGINAL
+        # residual (compute it first / from a clone -- measured 2026-10-22:
+        # referencing the mutated res made res_out look wildly wrong)
+        q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(x, res, w, 1e-6)
+        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 1e-6)
+        assert torch.equal(res_out.cpu(), res_ref.cpu())
+        # scale: class-3 only (var reduction order may move y by ~1e-7 rel)
+        assert torch.allclose(scale.cpu(), scale_ref.cpu(), rtol=1e-4, atol=1e-8)
+        diff = (out.cpu().int() - q_ref.cpu().int()).abs()
+        flips = int((diff > 0).sum())
+        assert (diff <= 1).all(), f"q diverged by more than 1 LSB: {diff.max()}"
+        # measured 2026-10-22 in the S1 gate spec: flips are rare; assert a
+        # generous ceiling and archive the real count in the test output
+        print(f"q +/-1 LSB flips: {flips}/{diff.numel()}")
+        assert flips <= diff.numel() // 100
+
+    def test_zero_row(self):
+        x = torch.zeros(4, 256, dtype=torch.bfloat16, device="cuda")
+        res = torch.zeros_like(x)
+        w = torch.ones(256, dtype=torch.float32, device="cuda")
+        out, scale, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 1e-6)
+        assert torch.all(scale == 0)
+        assert torch.all(out == 0)
+
+    def test_residual_in_place_is_aliasing_safe(self):
+        torch.manual_seed(2)
+        rows, hidden = 4, 256
+        x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        res_clone = res.clone()
+        _, _, res_out = _run_op(k._norm_quant_int8_impl, x, res, w, 1e-6)
+        _, _, res_ref = k.reference_norm_quant_int8(x, res_clone, w, 1e-6)
+        assert res_out.data_ptr() == res.data_ptr()  # mutated in place
+        assert torch.equal(res_out.cpu(), res_ref.cpu())
+
+    def test_fallback_chain_equals_reference_contract(self):
+        # the in-node fallback must reproduce the unfused chain EXACTLY
+        # (same expressions as vllm/ir/ops/layernorm.py + the _C quant kernel).
+        # Needs the real _C quant kernel (a stub would no-op the write).
+        _ensure_c_stubs()
+        if _USING_STUBS:
+            pytest.skip("needs the compiled vllm._C extension")
+        torch.manual_seed(3)
+        rows, hidden = 4, 512
+        x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+        w = torch.randn(hidden, device="cuda").to(torch.float32)
+        out2 = torch.empty((rows, hidden), dtype=torch.int8, device="cuda")
+        scale2 = torch.empty((rows, 1), dtype=torch.float32, device="cuda")
+        res2 = res.clone()
+        k._fallback_norm_quant(out2, x, w, scale2, res2, 1e-6)
+        q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(x, res, w, 1e-6)
+        assert torch.equal(res2.cpu(), res_ref.cpu())
+        assert torch.equal(scale2.cpu(), scale_ref.cpu())
+        assert torch.equal(out2.cpu(), q_ref.cpu())
+
+
+def _two_rank_worker(rank, world, port, outdir):
+    """Module-level so spawn can pickle it (a nested closure cannot be
+    pickled -- measured 2026-10-22 in the gpu-test session).
+
+    Results are written as FILES, not sent through a multiprocessing Queue:
+    torch's queue reductions share storages via file descriptors and the
+    parent's rebuild races the worker's exit (EOFError on the resource
+    sharer -- measured in the same session).
+    """
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    torch.cuda.set_device(rank)
+    dev = f"cuda:{rank}"
+    rows, hidden = 32, 2048
+    torch.manual_seed(7)
+    # SAME weight and residual on both ranks, different x shards
+    w = torch.randn(hidden, device=dev).to(torch.float32)
+    res = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
+    res_orig = res.clone()  # the op mutates res in place: keep the original
+    torch.manual_seed(100 + rank)
+    x = torch.randn(rows, hidden, device=dev).to(torch.bfloat16)
+    comm = k.ArNormQuantComm(dist.group.WORLD, k.MAX_ROWS, hidden)
+    result = torch.empty((rows, hidden), dtype=torch.int8, device=dev)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=dev)
+    k._decision = {"enabled": True, "reason": "test", "comm": comm}
+    try:
+        k._ar_norm_quant_int8_impl(result, x, w, scale, 1e-6, res)
+    finally:
+        k._decision = None
+    torch.cuda.synchronize()
+    torch.save(
+        {
+            "rank": rank,
+            "result": result.cpu(),
+            "scale": scale.cpu(),
+            "res": res.cpu(),
+            "res_orig": res_orig.cpu(),
+            "x": x.cpu(),
+            "w": w.cpu(),
+        },
+        f"{outdir}/rank{rank}.pt",
+    )
+    dist.destroy_process_group()
+
+
+@needs_2gpu
+class TestTwoRankOneShot:
+    """The 3-way barrier + peer-load data path, end to end, on 2 ranks.
+
+    Opt-in (env ``AR_NORM_QUANT_2GPU_TEST=1``) because it needs an XGMI (or
+    otherwise peer-atomic-capable) pair: on a PCIe pair the MI200/XGMI
+    integer-atomic guarantee does not hold and the test would spin forever.
+    """
+
+    @pytest.mark.skipif(
+        os.environ.get("AR_NORM_QUANT_2GPU_TEST") != "1",
+        reason="set AR_NORM_QUANT_2GPU_TEST=1 on an XGMI pair",
+    )
+    def test_ar_norm_quant_two_ranks(self):
+        import torch.multiprocessing as mp
+
+        try:
+            import vllm._custom_ops as _ops
+
+            if not hasattr(_ops, "allocate_shared_buffer_and_handle"):
+                pytest.skip("vllm._C lacks the shared-buffer IPC ops")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"vllm._custom_ops unavailable: {exc}")
+        ctx = mp.get_context("spawn")
+        outdir = os.environ.get("AR_NORM_QUANT_TEST_OUT", "/tmp/ar-v2-2rank")
+        os.makedirs(outdir, exist_ok=True)
+        procs = [
+            ctx.Process(target=_two_rank_worker, args=(r, 2, 29517, outdir))
+            for r in (0, 1)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=300)
+        assert all(not p.is_alive() for p in procs), "worker did not terminate"
+        assert all(p.exitcode == 0 for p in procs), (
+            f"worker exit codes: {[p.exitcode for p in procs]}"
+        )
+        got = {}
+        for r in (0, 1):
+            got[r] = torch.load(f"{outdir}/rank{r}.pt", weights_only=False)
+
+        x0, res0, w0 = got[0]["x"], got[0]["res_orig"], got[0]["w"]
+        for rank in (0, 1):
+            x_self = got[rank]["x"]
+            x_peer = got[1 - rank]["x"]
+            q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(
+                x_self, res0, w0, 1e-6, peer=x_peer
+            )
+            result, scale, res_out = (
+                got[rank]["result"],
+                got[rank]["scale"],
+                got[rank]["res"],
+            )
+            assert torch.equal(scale, scale_ref), f"rank {rank}: scale mismatch"
+            assert torch.equal(res_out, res_ref), f"rank {rank}: res mismatch"
+            flips = (result.int() - q_ref.int()).abs()
+            assert (flips <= 1).all(), f"rank {rank}: q off by >1 LSB"
+            print(
+                f"rank {rank}: q +/-1 LSB flips: "
+                f"{int((flips > 0).sum())}/{flips.numel()}"
+            )
+        # both ranks must have the SAME outputs (the AR sums both shards)
+        assert torch.equal(got[0]["result"], got[1]["result"]), (
+            "ranks disagree on quant"
+        )
+        assert torch.equal(got[0]["scale"], got[1]["scale"]), (
+            "ranks disagree on scale"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. pattern wiring (CPU): the motif must trace and fuse
+# ---------------------------------------------------------------------------
+class TestPatternWiring:
+    @staticmethod
+    def _cfg_ctx():
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.config.device import DeviceConfig
+
+        import vllm.compilation.passes.vllm_inductor_pass as _vip
+
+        if not _vip.DEVICE_TYPE:  # GPU-less dev box: trace on CPU
+            _vip.DEVICE_TYPE = "cpu"
+        return set_current_vllm_config(
+            VllmConfig(device_config=DeviceConfig(device="cpu")),
+            check_compile=False,
+        )
+
+    def test_norm_quant_pattern_registers_and_fuses(self):
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        with self._cfg_ctx():
+
+            @enable_fake_mode
+            def _build():
+                pr = f.NormQuantInt8Pattern(1e-6)
+                pm_pass = PatternMatcherPass(pass_name="test_ar_norm_quant")
+                pm.register_replacement(
+                    pr.pattern,
+                    pr.replacement,
+                    pr.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass,
+                )
+                # the same chain, traced as the engine's graph carries it
+                gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                return gm, pm_pass
+
+            gm, pm_pass = _build()
+        ops = {
+            f.called_op(n)
+            for n in gm.graph.nodes
+            if n.op == "call_function"
+        }
+        assert f._FUSED_ADD_RMS_NORM_OP in ops
+        assert any(
+            o is not None and "dynamic_scaled_int8_quant" in str(o)
+            for o in ops
+        ), f"quant node missing: {ops}"
+        matched = pm_pass.apply(gm.graph)
+        assert matched >= 1, "pattern did not re-match its own traced chain"
+        fused_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_norm_quant_int8" in str(o)
+            for o in fused_ops
+        ), f"fused op absent after rewrite: {fused_ops}"
+
+    def test_ar_pattern_traces_the_ar_node(self):
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        with self._cfg_ctx():
+            # tp==1 (no distributed here) traces the collective to a no-op;
+            # emit the exact node form a TP=2 engine graph carries instead.
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+
+            @enable_fake_mode
+            def _build():
+                pr = f.ArNormQuantInt8Pattern(1e-6)
+                # register WITH the composite extra_check: this is what the
+                # pass does, and a wrong kwarg name in _decode_regime would
+                # silently decline every site (measured 2026-10-22: the
+                # all_reduce schema arg is 'tensor', not 'input').
+                pr.extra_check = f._composite_check(pr.quant_op)
+                pm_pass = PatternMatcherPass(pass_name="test_ar_norm_quant3")
+                pm.register_replacement(
+                    pr.pattern,
+                    pr.replacement,
+                    pr.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass,
+                    extra_check=pr.extra_check,
+                )
+                gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                # inspect the PRE-rewrite graph here
+                pre_ops = {
+                    f.called_op(n)
+                    for n in gm.graph.nodes
+                    if n.op == "call_function"
+                }
+                # apply INSIDE the patch window: register_replacement's
+                # exact re-match re-traces the pattern at apply time
+                matched = pm_pass.apply(gm.graph)
+                return gm, matched, pre_ops
+
+            try:
+                gm, matched, ops = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert f._AR_OP in ops, f"AR node missing from 3-way pattern: {ops}"
+        assert f._FUSED_ADD_RMS_NORM_OP in ops
+        assert any(
+            o is not None and "dynamic_scaled_int8_quant" in str(o)
+            for o in ops
+        ), f"quant node missing: {ops}"
+        assert matched >= 1, (
+            "3-way pattern did not match its own traced chain "
+            "(extra_check declining?)"
+        )
+        fused_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in fused_ops
+        ), f"fused 3-way op absent after rewrite: {fused_ops}"
+
+    def test_pass_config_flags_exist(self):
+        from vllm.config.compilation import PassConfig
+
+        cfg = PassConfig()
+        assert hasattr(cfg, "fuse_ar_norm_quant")
+        assert hasattr(cfg, "fuse_norm_quant_triton")
+
+
+class TestPatternPriority:
+    """Regression for the v1 priority bug (69/80 sites stolen by 2-way AR+RMS
+    patterns): with the ownership guard the 2-way must DECLINE the int8-quant
+    sites, without it it consumes AR+norm and the 3-way never sees the chain."""
+
+    def _chain_gm(self, f):
+        import torch._inductor.pattern_matcher as pm
+
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        def fake_ar(inp):
+            return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+        orig = f.tensor_model_parallel_all_reduce
+        f.tensor_model_parallel_all_reduce = fake_ar
+
+        @enable_fake_mode
+        def _build():
+            pr3 = f.ArNormQuantInt8Pattern(1e-6)
+            return pm.fwd_only(pr3.pattern, pr3.get_inputs())
+
+        try:
+            return _build()
+        finally:
+            f.tensor_model_parallel_all_reduce = orig
+
+    def test_2way_steals_without_guard_and_declines_with_it(self):
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        guard = pytest.importorskip(
+            "vllm.compilation.passes.fusion.allreduce_rms_fusion"
+        )._norm_output_not_int8_quant
+        cfg_ctx = TestPatternWiring._cfg_ctx()
+        import vllm  # noqa: F401 - vllm.ir.ops must be a resolvable name
+        import vllm.ir.ops  # noqa: F401
+
+        def make_2way(extra_check):
+            # minimal stand-in for the AR+RMS 2-way patterns: same keying
+            # (outputs at the norm nodes), same risk profile
+            def pattern(residual, input, weight):
+                rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                    input, residual, weight, 1e-6
+                )
+                return rms, residual_out
+
+            def replacement(residual, input, weight):
+                return input, residual
+
+            pm_pass = PatternMatcherPass(pass_name="test_2way")
+
+            @enable_fake_mode
+            def _register():
+                # example inputs must be created INSIDE fake mode
+                inputs = [
+                    torch.empty((5, 16), dtype=torch.bfloat16, device="cpu"),
+                    torch.empty((5, 16), dtype=torch.bfloat16, device="cpu"),
+                    torch.empty((16,), dtype=torch.float32, device="cpu"),
+                ]
+                pm.register_replacement(
+                    pattern,
+                    replacement,
+                    inputs,
+                    pm.fwd_only,
+                    pm_pass,
+                    extra_check=extra_check or (lambda m: True),
+                )
+
+            _register()
+            return pm_pass
+
+        with cfg_ctx:
+            # without the guard: the 2-way consumes AR+norm (the v1 bug)
+            gm = self._chain_gm(f)
+            stolen = make_2way(None).apply(gm.graph)
+            assert stolen >= 1, "2-way should steal without the guard (sanity)"
+
+            # with the guard: it declines, and the 3-way then takes the chain
+            gm = self._chain_gm(f)
+            stolen = make_2way(guard).apply(gm.graph)
+            assert stolen == 0, "guard failed: 2-way consumed a 3-way site"
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+
+            @enable_fake_mode
+            def _register3():
+                pr3 = f.ArNormQuantInt8Pattern(1e-6)
+                pr3.extra_check = f._composite_check(pr3.quant_op)
+                pm_pass3 = PatternMatcherPass(pass_name="test_3way")
+                pm.register_replacement(
+                    pr3.pattern,
+                    pr3.replacement,
+                    pr3.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass3,
+                    extra_check=pr3.extra_check,
+                )
+                return pm_pass3
+
+            try:
+                pm_pass3 = _register3()
+                matched3 = pm_pass3.apply(gm.graph)
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched3 >= 1, "3-way did not take the site the guard reserved"
+
+
+class TestCollectiveDecision:
+    """The frozen fused-vs-fallback decision must be voted on collectively
+    (spec 3.7): a rank that decides alone can leave the peer spinning forever
+    in a captured graph."""
+
+    def _reset(self):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        kk._decision = None
+        kk._logged.clear()
+
+    def test_asymmetric_comm_init_falls_back_everywhere(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+        votes = []
+
+        class FakeGroup:
+            pass
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            votes.append(int(tensor.item()))
+            # vote 1 (readiness): everyone ready; vote 2 (comm init): the
+            # PEER failed -> MIN says no
+            tensor.fill_(1 if len(votes) == 1 else 0)
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (True, "ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", fake_all_reduce)
+        monkeypatch.setattr(
+            kk, "ArNormQuantComm", lambda *a, **k: type("C", (), {"hidden": a[2], "rows": a[1]})()
+        )
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            assert len(votes) == 2, f"expected 2 collective votes, got {votes}"
+            assert enabled is False, "asymmetric comm init must freeze fallback"
+            assert comm is None
+            assert "peer comm init failed" in reason
+        finally:
+            self._reset()
+
+    def test_collective_failure_freezes_fallback(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+
+        class FakeGroup:
+            pass
+
+        def boom(tensor, op=None, group=None):
+            raise RuntimeError("gloo timeout")
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (True, "ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", boom)
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            assert enabled is False, "collective failure must freeze fallback"
+            assert comm is None
+        finally:
+            self._reset()
+
+    def test_rows_over_comm_buffer_falls_back_per_call(self, monkeypatch):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+
+        class FakeComm:
+            hidden = 2048
+            rows = kk.MAX_ROWS
+
+        try:
+            kk._decision = {"enabled": True, "reason": "ready", "comm": FakeComm()}
+            enabled, reason, comm = kk.get_decision(kk.MAX_ROWS + 1, 2048)
+            assert enabled is False and comm is None
+            assert "rows" in reason
+            # in-regime calls still take the fused path
+            enabled, _, comm = kk.get_decision(8, 2048)
+            assert enabled is True and comm is not None
+            # a different hidden falls back instead of mis-indexing the slots
+            enabled, reason, comm = kk.get_decision(8, 4096)
+            assert enabled is False and comm is None and "hidden" in reason
+        finally:
+            self._reset()
+
+    def test_readiness_no_skips_nothing(self, monkeypatch):
+        """Even a local 'no' must run the collective vote (BLOCKER-2 class)."""
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+        votes = []
+
+        class FakeGroup:
+            pass
+
+        def fake_all_reduce(tensor, op=None, group=None):
+            votes.append(int(tensor.item()))
+            tensor.fill_(0)
+
+        monkeypatch.setattr(kk, "_local_readiness", lambda: (False, "not ready", FakeGroup()))
+        monkeypatch.setattr(kk.torch.distributed, "all_reduce", fake_all_reduce)
+        try:
+            enabled, reason, comm = kk.get_decision(8, 2048)
+            # exactly 2 votes even for a local 'no': vote COUNTS must match
+            # across ranks too, or the peer blocks in an unmatched collective
+            assert votes == [0, 0], f"a local 'no' must still vote twice, got {votes}"
+            assert enabled is False and comm is None
+        finally:
+            self._reset()

@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 
 
 class Int8MoeBackend(Enum):
+    AITER = "AITER"
     TRITON = "TRITON"
     HUMMING = "HUMMING"
     CPU = "CPU"
@@ -37,17 +38,37 @@ class Int8MoeBackend(Enum):
 def _get_priority_backends(
     moe_config: FusedMoEConfig,
 ) -> list[Int8MoeBackend]:
-    """Get available backends in priority order based on platform and config."""
-    return [
+    """Get available backends in priority order based on platform and config.
+
+    AITER (CK grouped MoE) is prepended ONLY when its env gates are on
+    (VLLM_ROCM_USE_AITER=1 + VLLM_ROCM_USE_AITER_MOE=1): the default order is
+    unchanged and prod keeps running TritonExperts unless the gate is set.
+    """
+    backends = [
         Int8MoeBackend.TRITON,
         Int8MoeBackend.HUMMING,
         Int8MoeBackend.CPU,
     ]
+    try:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        if rocm_aiter_ops.is_fused_moe_enabled():
+            backends.insert(0, Int8MoeBackend.AITER)
+    except ImportError:
+        pass
+    return backends
 
 
 def backend_to_kernel_cls(
     backend: Int8MoeBackend,
 ) -> list[type[mk.FusedMoEExperts]]:
+    if backend == Int8MoeBackend.AITER:
+        from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+            AiterExperts,
+        )
+
+        return [AiterExperts]
+
     if backend == Int8MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
             TritonExperts,
@@ -88,6 +109,7 @@ def backend_to_kernel_cls(
 def map_int8_backend(runner_backend: MoEBackend) -> Int8MoeBackend:
     """Map user's MoEBackend to Int8MoeBackend."""
     mapping = {
+        "aiter": Int8MoeBackend.AITER,
         "triton": Int8MoeBackend.TRITON,
         "humming": Int8MoeBackend.HUMMING,
     }
@@ -275,7 +297,11 @@ def convert_to_int8_moe_kernel_format(
             quant_config=_humming_int8_weight_schema(w13, layer.w13_weight_scale),
         )
         return layer.w13_weight, layer.w2_weight
-    elif int8_backend not in (Int8MoeBackend.TRITON, Int8MoeBackend.CPU):
+    elif int8_backend not in (
+        Int8MoeBackend.AITER,
+        Int8MoeBackend.TRITON,
+        Int8MoeBackend.CPU,
+    ):
         raise ValueError(f"Unsupported Int8 MoE backend: {int8_backend.value}")
 
     return w13, w2

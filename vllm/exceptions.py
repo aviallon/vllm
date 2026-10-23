@@ -145,12 +145,28 @@ class GracefulHTTPError(VLLMError):
     control rejections) and should be surfaced to the client with the
     explicit HTTP status code they carry, rather than being mapped to a
     generic 4xx/5xx by the client/server split.
+
+    Args:
+        message: The error message describing the failure.
+        http_status: The HTTP status code to surface to the client.
+        retry_after: Seconds the client should wait before retrying, or
+            None. When set, entrypoints emit it as the ``Retry-After``
+            header (RFC 9110) and in the error body (``error.retry_after``);
+            the body copy exists because streaming responses cannot carry
+            headers once the HTTP 200 has been sent.
+
     """
 
-    def __init__(self, message: str, http_status: HTTPStatus):
+    def __init__(
+        self,
+        message: str,
+        http_status: HTTPStatus,
+        retry_after: int | None = None,
+    ):
         super().__init__(message)
         self.message = message
         self.http_status = http_status
+        self.retry_after = retry_after
 
 
 class QueueOverflowError(GracefulHTTPError):
@@ -158,13 +174,26 @@ class QueueOverflowError(GracefulHTTPError):
 
     Returns HTTP 503 (Service Unavailable) so that load balancers and
     client SDKs retry the request on a different instance.
+
+    Passing ``retry_after`` switches the rejection to HTTP 429 (Too Many
+    Requests) carrying that many seconds of ``Retry-After`` (RFC 6585
+    section 4), the pairing for client-side backoff instead of load
+    balancer failover. Servers opt in with ``--retry-after-on-overload``.
+
+    Args:
+        retry_after: Seconds the client should wait before retrying, or
+            None to keep the plain HTTP 503 rejection.
+
     """
 
-    def __init__(self):
+    def __init__(self, *, retry_after: int | None = None):
         super().__init__(
             "The engine is currently busy and cannot accept new requests. "
             "Please try again later or on a different instance.",
-            HTTPStatus.SERVICE_UNAVAILABLE,
+            HTTPStatus.TOO_MANY_REQUESTS
+            if retry_after is not None
+            else HTTPStatus.SERVICE_UNAVAILABLE,
+            retry_after,
         )
 
 
@@ -173,13 +202,25 @@ class MaxQueuedTokensError(GracefulHTTPError):
 
     Returns HTTP 503 (Service Unavailable) so that load balancers and
     client SDKs retry the request on a different instance.
+
+    Passing ``retry_after`` switches the rejection to HTTP 429 (Too Many
+    Requests) carrying that many seconds of ``Retry-After``, like
+    :class:`QueueOverflowError`.
+
+    Args:
+        retry_after: Seconds the client should wait before retrying, or
+            None to keep the plain HTTP 503 rejection.
+
     """
 
-    def __init__(self):
+    def __init__(self, *, retry_after: int | None = None):
         super().__init__(
             "The engine has reached its prefill token backlog limit. "
             "Please try again later or on a different instance.",
-            HTTPStatus.SERVICE_UNAVAILABLE,
+            HTTPStatus.TOO_MANY_REQUESTS
+            if retry_after is not None
+            else HTTPStatus.SERVICE_UNAVAILABLE,
+            retry_after,
         )
 
 

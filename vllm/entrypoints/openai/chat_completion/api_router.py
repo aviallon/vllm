@@ -15,6 +15,9 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    error_response_to_json_response,
+)
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     validate_json_request,
@@ -62,9 +65,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(), status_code=generator.error.code
-        )
+        return error_response_to_json_response(generator)
 
     elif isinstance(generator, ChatCompletionResponse):
         return JSONResponse(
@@ -103,7 +104,7 @@ async def create_batch_chat_completion(
     result = await handler.create_batch_chat_completion(request, raw_request)
 
     if isinstance(result, ErrorResponse):
-        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+        return error_response_to_json_response(result)
 
     return JSONResponse(content=result.model_dump())
 

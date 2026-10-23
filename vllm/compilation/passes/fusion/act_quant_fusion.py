@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from typing import Any
 
 import torch
@@ -10,17 +11,21 @@ from torch._ops import OpOverload
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    silu_and_mul_per_token_quant_int8_op,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic64Sym,
     kFp8Dynamic128Sym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
 )
 from vllm.platforms import current_platform
 
 from ..vllm_inductor_pass import VllmFusionPatternMatcherPass, VllmPatternReplacement
-from .matcher_utils import MatcherQuantFP8, MatcherSiluAndMul
+from .matcher_utils import MatcherQuantFP8, MatcherQuantInt8, MatcherSiluAndMul
 from .rms_quant_fusion import QUANT_OPS, empty_bf16, empty_fp32, empty_i32
 
 logger = init_logger(__name__)
@@ -33,6 +38,11 @@ SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 FUSED_OPS: dict[QuantKey, OpOverload] = {
     kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
 }
+if silu_and_mul_per_token_quant_int8_op is not None:
+    # Fused SiluAndMul + dynamic per-token int8 quant (Triton). The C++
+    # silu_and_mul_quant only accepts FP8 output, so the int8 path gets its
+    # own fused kernel.
+    FUSED_OPS[kInt8DynamicTokenSym] = silu_and_mul_per_token_quant_int8_op
 silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )
@@ -118,6 +128,47 @@ class SiluMulFp8StaticQuantPattern(ActivationQuantPattern):
                 self.FUSED_OP, result=result, input=input, scale=scale
             )
             return at[1]
+
+        return _replacement
+
+
+class SiluMulInt8QuantPattern(ActivationQuantPattern):
+    """Fusion for SiluMul+Int8DynamicTokenQuant Pattern."""
+
+    def __init__(self) -> None:
+        super().__init__(kInt8DynamicTokenSym)
+        self.quant_matcher = MatcherQuantInt8(kInt8DynamicTokenSym)
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [
+            *self.silu_and_mul_matcher.inputs(),  # input
+        ]
+
+    @property
+    def pattern(self):
+        def _pattern(
+            input: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result_silu_mul = self.silu_and_mul_matcher(input)
+            return self.quant_matcher(result_silu_mul)  # type: ignore[no-any-return]
+
+        return _pattern
+
+    @property
+    def replacement(self):
+        def _replacement(
+            input: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            d = input.shape[-1] // 2
+            output_shape = input.shape[:-1] + (d,)
+            result = torch.empty(
+                output_shape, device=input.device, dtype=self.quant_dtype
+            )
+            scales = self.quant_matcher.make_scale(input)
+            at = auto_functionalized(
+                self.FUSED_OP, result=result, scales=scales, input=input
+            )
+            return at[1], at[2]
 
         return _replacement
 
@@ -287,6 +338,20 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
         super().__init__(config, "activation_quant_fusion_pass")
 
         self.register(SiluMulFp8StaticQuantPattern())
+
+        if silu_and_mul_per_token_quant_int8_op is not None and os.getenv(
+            "VLLM_FUSE_INT8_QUANT_ACT",
+            os.getenv("VLLM_FUSE_INT8_QUANT", "0"),
+        ) == "1":
+            # Gated OFF by default: the int8 arity crash at trace time is
+            # fixed (d7ad0b43a6), but the wall gain is not established, so
+            # this stays opt-in. Sub-gate VLLM_FUSE_INT8_QUANT_ACT controls
+            # this motif family alone (VLLM_FUSE_INT8_QUANT_NORM the norm->
+            # quant family); the master VLLM_FUSE_INT8_QUANT enables both.
+            # NOTE: on models whose MoE/MLP silu lives inside an opaque custom
+            # op (e.g. vllm.moe_forward_shared on qwen3.6), this pattern has
+            # no site at all -- see the fusion site census log.
+            self.register(SiluMulInt8QuantPattern())
 
         if silu_and_mul_nvfp4_quant_supported:
             self.register(SiluMulNvfp4QuantPattern())

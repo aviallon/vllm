@@ -7,12 +7,17 @@ from collections.abc import Sequence
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     QuantKey,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
 )
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     CUTLASS_BLOCK_FP8_SUPPORTED,
@@ -43,6 +48,16 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     @classmethod
     def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
         return True, None
+
+    def input_quant_key(self) -> QuantKey | None:
+        # Dynamic symmetric per-token int8: the kernel's own input
+        # quantization (ops.scaled_int8_quant) is exactly kInt8DynamicTokenSym,
+        # so a pre-quantized activation from a fused producer (fused
+        # rms_norm/silu + quant) can be consumed as-is. Static or asymmetric
+        # input schemes need the layer's own scales/zero-points and stay None.
+        if self.config.is_static_input_scheme or not self.config.input_symmetric:
+            return None
+        return kInt8DynamicTokenSym
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w_q_name, w_s_name, i_s_name, i_zp_name, azp_adj_name = self.layer_param_names
@@ -122,7 +137,7 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
@@ -131,9 +146,16 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
         # * dynamic, i_s is None and x_s computed from x.
         # * static, i_s is scalar and x_s is i_s.
         symmetric = azp_adj is None
-        x_q, x_s, x_zp = ops.scaled_int8_quant(
-            x.contiguous(), i_s, i_zp, symmetric=symmetric
-        )
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            x_q, x_s, x_zp = qa.data, qa.scale, None
+            orig_dtype = qa.orig_dtype
+        else:
+            assert isinstance(x, torch.Tensor)
+            x_q, x_s, x_zp = ops.scaled_int8_quant(
+                x.contiguous(), i_s, i_zp, symmetric=symmetric
+            )
+            orig_dtype = x.dtype
 
         if x_zp is not None:
             # Currently, static is always per-tensor and dynamic is per-token
@@ -144,13 +166,13 @@ class CutlassInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
                 w_q,
                 scale_a=x_s,
                 scale_b=w_s,
-                out_dtype=x.dtype,
+                out_dtype=orig_dtype,
                 azp_adj=azp_adj,
                 azp=azp,
                 bias=bias,
             )
         return ops.cutlass_scaled_mm(
-            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=x.dtype, bias=bias
+            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=orig_dtype, bias=bias
         )
 
 

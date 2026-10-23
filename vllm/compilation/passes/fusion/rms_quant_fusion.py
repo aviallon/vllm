@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any, NamedTuple
 
 import torch
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
     kStaticTensorScale,
 )
@@ -30,9 +32,18 @@ from vllm.utils.flashinfer import has_flashinfer
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..inductor_pass import enable_fake_mode
-from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
+from ..vllm_inductor_pass import (
+    VllmInductorPass,
+    VllmPatternMatcherPass,
+    counted_extra_check,
+    log_pattern_match_summary,
+)
 from .matcher_utils import (
+    FusionSiteCensus,
     MatcherQuantFP8,
+    MatcherQuantInt8,
+    called_op,
+    op_call_kwargs,
 )
 
 logger = init_logger(__name__)
@@ -114,7 +125,15 @@ if (
 # TODO: extend rmsnorm quant kernels to support mixed input/weight dtypes,
 # and remove this check.
 def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
-    """Prevent fusion when rms_norm input and weight dtypes differ."""
+    """Prevent fusion when the fused kernel cannot take the site's dtypes.
+
+    ``rms_norm_dynamic_per_token_quant`` accepts input and weight of the same
+    dtype, and -- since the mixed-dtype kernel extension -- also an fp32
+    weight with an fp16/bf16 input (the Gemma-style ``weight.float() + 1.0``
+    form every norm site of the w8a8 qwen3.6 models has). Anything else is
+    rejected here rather than crashing at run time in the kernel's
+    ``TORCH_CHECK(weight.scalar_type() == input.scalar_type())``.
+    """
     for node in match.nodes:
         if node.target == _RMS_NORM_OP:
             # rms_norm(x, weight, epsilon, variance_size)
@@ -125,7 +144,97 @@ def _rms_input_weight_dtype_match(match: pm.Match) -> bool:
         else:
             continue
         if isinstance(x, fx.Node) and isinstance(weight, fx.Node):
-            return x.meta["val"].dtype == weight.meta["val"].dtype
+            x_dtype = x.meta["val"].dtype
+            w_dtype = weight.meta["val"].dtype
+            ok = w_dtype == x_dtype or (
+                w_dtype == torch.float32
+                and x_dtype in (torch.float16, torch.bfloat16)
+            )
+            if not ok:
+                key = f"dtype_check_rejected:{x_dtype}/{w_dtype}"
+                if key not in _dtype_check_logged:
+                    _dtype_check_logged.add(key)
+                    logger.warning(
+                        "rms+quant fusion rejected by dtype check: input=%s "
+                        "weight=%s (one-shot)",
+                        x_dtype,
+                        w_dtype,
+                    )
+            return ok
+    return True
+
+
+_dtype_check_logged: set[str] = set()
+
+
+def _counted_dtype_check(pm_pass: PatternMatcherPass, motif_owner: Any) -> Any:
+    """Telemetry-wrapped :func:`_rms_input_weight_dtype_match` for a pattern."""
+    motif = getattr(motif_owner, "motif", type(motif_owner).__name__)
+    return counted_extra_check(pm_pass.pass_name, motif, _rms_input_weight_dtype_match)
+
+
+def _int8_alloc_conform(quant_op: Any, match: Any) -> bool:
+    """Guard for the buffer-as-input int8 patterns (see MatcherQuantInt8).
+
+    The allocs are pattern inputs -- wildcards -- so nothing constrains their
+    shape at match time; the fused kernel writes ``result`` as the quant input
+    shape and ``scale`` as one float32 per token, exactly like the quant call
+    it replaces. Reject (loudly, one-shot) the rare site whose buffers would
+    not satisfy that contract instead of writing out of bounds.
+    """
+    for node in match.nodes:
+        if called_op(node) is not quant_op:
+            continue
+        kwargs = op_call_kwargs(node, quant_op)
+        result, scale, inp = (
+            kwargs.get("result"),
+            kwargs.get("scale"),
+            kwargs.get("input"),
+        )
+        try:
+            r_val, s_val, i_val = (
+                result.meta["val"],
+                scale.meta["val"],
+                inp.meta["val"],
+            )
+        except (AttributeError, KeyError, TypeError):
+            logger.warning(
+                "rms+quant int8 fusion rejected: buffers without meta vals "
+                "(one-shot)"
+            )
+            return False
+        rows = i_val.numel() // i_val.shape[-1]
+        ok = (
+            r_val.dtype == torch.int8
+            and s_val.dtype == torch.float32
+            and r_val.numel() == i_val.numel()
+            and s_val.numel() == rows
+        )
+        try:
+            ok = bool(ok)  # SymBool on backed-dynamic graphs
+        except Exception:  # noqa: BLE001 - symbolic equality not decidable
+            # shape-polymorphic site: the dims are the same expressions on
+            # both sides (numel of the same arg) -- defer to the runtime
+            # contract checks instead of silently rejecting the site.
+            ok = True
+        if not ok:
+            key = (
+                f"alloc_conform:{r_val.dtype}/{tuple(r_val.shape)}/"
+                f"{s_val.dtype}/{tuple(s_val.shape)}/{tuple(i_val.shape)}"
+            )
+            if key not in _dtype_check_logged:
+                _dtype_check_logged.add(key)
+                logger.warning(
+                    "rms+quant int8 fusion rejected by alloc guard: result=%s%s "
+                    "scale=%s%s input=%s%s (one-shot)",
+                    r_val.dtype,
+                    tuple(r_val.shape),
+                    s_val.dtype,
+                    tuple(s_val.shape),
+                    i_val.dtype,
+                    tuple(i_val.shape),
+                )
+        return ok
     return True
 
 
@@ -163,6 +272,8 @@ QUANT_OPS: dict[QuantKey, OpOverload] = {
 if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+if hasattr(torch.ops._C, "dynamic_scaled_int8_quant"):
+    QUANT_OPS[kInt8DynamicTokenSym] = torch.ops._C.dynamic_scaled_int8_quant.default  # noqa: E501
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out
 
@@ -196,6 +307,15 @@ FUSED_OPS: dict[FusedRMSQuantKey, OpOverload] = {
     FusedRMSQuantKey(
         kFp8DynamicTokenSym, True
     ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    # The fused layernorm+quant kernel accepts int8 output (ScalarType::Char)
+    # with the same dynamic per-token scale convention as
+    # dynamic_scaled_int8_quant (absmax / 127, one float32 scale per token).
+    FusedRMSQuantKey(
+        kInt8DynamicTokenSym, False
+    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
+    FusedRMSQuantKey(
+        kInt8DynamicTokenSym, True
+    ): torch.ops._C.rms_norm_dynamic_per_token_quant.default,  # noqa: E501
 }
 # rms_norm_per_block_quant is CUDA-only; guard it like per_token_group_fp8_quant above.
 if hasattr(torch.ops._C, "rms_norm_per_block_quant"):
@@ -222,12 +342,18 @@ class RMSNormQuantPattern:
 
         assert key in FUSED_OPS, f"unsupported fused rmsnorm+quant op for {key}"
         self.FUSED_OP = FUSED_OPS[key]
+        self.key = key
+        self.motif = f"{type(self).__name__}[{key}]"
 
-        self.quant_matcher = MatcherQuantFP8(
-            key.quant,
-            has_col_major_scales=has_col_major_scales,
-            is_e8m0=is_e8m0,
-            is_tma_aligned=is_tma_aligned,
+        self.quant_matcher = (
+            MatcherQuantInt8(key.quant)
+            if key.quant.dtype == torch.int8
+            else MatcherQuantFP8(
+                key.quant,
+                has_col_major_scales=has_col_major_scales,
+                is_e8m0=is_e8m0,
+                is_tma_aligned=is_tma_aligned,
+            )
         )
 
 
@@ -282,7 +408,7 @@ class RMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -349,7 +475,7 @@ class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -456,7 +582,7 @@ class FusedAddRMSNormGroupQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -550,7 +676,7 @@ class RMSNormGroupQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -609,7 +735,7 @@ class RMSNormDynamicQuantPattern(RMSNormQuantPattern):
             ],
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -674,7 +800,7 @@ class FusedAddRMSNormDynamicQuantPattern(RMSNormQuantPattern):
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -765,7 +891,7 @@ class FusedAddRMSNormNvfp4QuantPattern:
             inputs,
             pm.fwd_only,
             pm_pass,
-            extra_check=_rms_input_weight_dtype_match,
+            extra_check=_counted_dtype_check(pm_pass, self),
         )
 
 
@@ -809,6 +935,25 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
             # Fuse rms_norm + dynamic per-token fp8 quant
             RMSNormDynamicQuantPattern(epsilon, FP8_DTYPE).register(self.patterns)
 
+            # Fuse fused_add_rms_norm + dynamic per-token int8 quant.
+            # Gated OFF by default. The old blocker (int8 matcher arity crash
+            # at trace time on torch 2.13) is fixed (d7ad0b43a6); what remains
+            # is that the wall gain of the int8 fusions is not established, so
+            # they stay opt-in. Separate sub-gates per motif family:
+            #   VLLM_FUSE_INT8_QUANT       master switch (both families)
+            #   VLLM_FUSE_INT8_QUANT_NORM  norm->quant int8 only
+            #   VLLM_FUSE_INT8_QUANT_ACT   silu_and_mul->quant int8 only
+            # A sub-gate defaults to the master switch's value.
+            if os.getenv(
+                "VLLM_FUSE_INT8_QUANT_NORM", os.getenv("VLLM_FUSE_INT8_QUANT", "0")
+            ) == "1":
+                FusedAddRMSNormDynamicQuantPattern(epsilon, torch.int8).register(
+                    self.patterns
+                )
+
+                # Fuse rms_norm + dynamic per-token int8 quant
+                RMSNormDynamicQuantPattern(epsilon, torch.int8).register(self.patterns)
+
             # Only register group quant patterns on CUDA/ROCm where the C++ op exists
             for group_shape in [GroupShape(1, 128), GroupShape(1, 64)]:
                 for has_col_major_scales in [True, False]:
@@ -838,8 +983,12 @@ class RMSNormQuantFusionPass(VllmPatternMatcherPass):
 
     @VllmInductorPass.time_and_log
     def __call__(self, graph: fx.Graph) -> None:
+        # One-shot census BEFORE rewriting: candidate sites and their shapes
+        # are the ground truth the per-motif match counts are read against.
+        FusionSiteCensus.log(graph)
         self.matched_count = self.patterns.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
+        log_pattern_match_summary(self.patterns.pass_name, self.matched_count)
 
     def uuid(self) -> str:
         return self.hash_source(

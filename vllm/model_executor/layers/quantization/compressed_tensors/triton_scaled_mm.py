@@ -217,7 +217,9 @@ def _triton_scaled_mm_impl(
         is_small_N = N < 8192
         next_power_of_2_M = max(32, triton.next_power_of_2(M))
         if next_power_of_2_M <= 32:
-            tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
+            # BM=16 for decode (M<=32): -19..-37% vs BM=64 on gfx90a INT8 GEMM,
+            # bit-exact, scoped here so prefill (M>64) keeps BM=64.
+            tile_shape = (16, 64, 256) if is_small_N else (16, 128, 256)
         elif next_power_of_2_M <= 64:
             tile_shape = (64, 64, 256)
         elif next_power_of_2_M <= 128:

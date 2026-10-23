@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import operator
 from abc import ABC, abstractmethod
-from typing import Any
+from collections import defaultdict
+from typing import Any, ClassVar
 
 import torch
+from torch import fx
 from torch._higher_order_ops import auto_functionalized
 from torch._ops import OpOverload
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
@@ -21,6 +25,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
     kNvfp4Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
@@ -28,6 +33,8 @@ from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
     DeepseekScalingRotaryEmbedding,
 )
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 ROTARY_OP = torch.ops._C.rotary_embedding.default
 FLASHINFER_ROTARY_OP = torch.ops.vllm.flashinfer_rotary_embedding.default
@@ -43,11 +50,53 @@ if hasattr(torch.ops._C, "per_token_group_fp8_quant"):
     QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
     QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
 
+if hasattr(torch.ops._C, "dynamic_scaled_int8_quant"):
+    QUANT_OPS[kInt8DynamicTokenSym] = torch.ops._C.dynamic_scaled_int8_quant.default  # noqa: E501
+
 if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
 
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
+
+
+def _mutable_arg_names(op: OpOverload) -> list[str]:
+    """Names of the op's mutable arguments, in schema order.
+
+    Optional mutable arguments (``Tensor!? azp``) count too: an argument is
+    mutable because the SCHEMA says so, regardless of whether the call passed a
+    value for it.
+    """
+    return [
+        arg.name
+        for arg in op._schema.arguments
+        if arg.alias_info is not None and arg.alias_info.is_write
+    ]
+
+
+def functionalized_mutable_args(op: OpOverload, out: Any) -> dict[str, Any]:
+    """Map ``auto_functionalized``'s return tuple onto the op's mutable args.
+
+    ``auto_functionalized`` returns ``(op_return, *mutated_in_schema_order)``:
+    the leading entry is the op's return value (``None`` for ``-> ()`` ops) and
+    the mutated entries include optional mutable arguments even when the call
+    passed ``None`` for them.  The tuple's arity is therefore a property of the
+    SCHEMA, not of the call: ``dynamic_scaled_int8_quant``
+    (``Tensor! result, Tensor input, Tensor! scale, Tensor!? azp) -> ()``
+    returns 4 entries ``(None, result, scale, azp)``, which a fixed
+    ``_, result, scale = ...`` unpack cannot read (measured under
+    torch 2.13.0+git733fca1, aragorn
+    research/w8a8-pdtest-2026-10-18/evidence/arity-probe-torch213.log).  Index
+    by schema instead of unpacking a fixed arity.
+    """
+    names = _mutable_arg_names(op)
+    values = out if isinstance(out, tuple) else (out,)
+    if len(values) < len(names):
+        raise RuntimeError(
+            f"auto_functionalized({op}) returned {len(values)} value(s), fewer "
+            f"than the {len(names)} mutable argument(s) {names} of its schema"
+        )
+    return dict(zip(names, values[len(values) - len(names) :]))
 
 
 class MatcherCustomOp(ABC):
@@ -464,7 +513,7 @@ class MatcherQuantFP8(MatcherCustomOp):
             fp8_min = finfo.min
             fp8_max = finfo.max
 
-            _, result, scale = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP,
                 input=input,
                 output_q=result,
@@ -477,21 +526,28 @@ class MatcherQuantFP8(MatcherCustomOp):
                 dummy_is_scale_transposed=self.has_col_major_scales,
                 dummy_is_tma_aligned=self.is_tma_aligned,
             )
-            return result, scale
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["output_q"], outs["output_s"]
 
         if self.quant_key.scale.static:
             assert scale is not None
-            _, result = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP, result=result, input=input, scale=scale
             )
-            return result, scale
+            # NOTE: the old `_, result = ...` unpack read a 2-tuple, but this
+            # op has TWO mutable args (result, scale), so auto_functionalized
+            # returns 3 entries and the unpack raised "too many values".  The
+            # scale the op wrote is the one to return, not the caller's input.
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["result"], outs["scale"]
         else:
             assert scale is None
             scale = self.make_scale(input)
-            _, result, scale = auto_functionalized(
+            ret = auto_functionalized(
                 self.QUANT_OP, result=result, input=input, scale=scale, scale_ub=None
             )
-            return result, scale
+            outs = functionalized_mutable_args(self.QUANT_OP, ret)
+            return outs["result"], outs["scale"]
 
     def forward_native(
         self,
@@ -524,6 +580,136 @@ class MatcherQuantFP8(MatcherCustomOp):
         return [input]
 
 
+class MatcherQuantInt8(MatcherCustomOp):
+    """Matcher for dynamic per-token symmetric int8 quantization.
+
+    Mirrors MatcherQuantFP8's dynamic per-token branch, but traces the int8
+    op's own call convention (``azp`` argument instead of ``scale_ub``). The
+    scale convention is the consumer's: one float32 scale per token,
+    absmax / 127 (see ops.scaled_int8_quant / per_token_quant_int8).
+    """
+
+    def __init__(
+        self,
+        quant_key: QuantKey,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is None:
+            enabled = (
+                not current_platform.is_xpu()
+                and hasattr(torch.ops._C, "dynamic_scaled_int8_quant")
+            )
+
+        super().__init__(enabled)
+        self.quant_key = quant_key
+
+        assert quant_key in QUANT_OPS, (
+            f"unsupported quantization scheme {quant_key}"
+        )
+        self.QUANT_OP = QUANT_OPS[quant_key]
+
+        assert quant_key.dtype == torch.int8, "Only int8 supported"
+        assert quant_key.scale2 is None
+        assert not quant_key.scale.static
+        assert quant_key.scale.group_shape.is_per_token()
+
+    def forward_custom(
+        self,
+        input: torch.Tensor,
+        scale: torch.Tensor | None = None,
+        result_buf: torch.Tensor | None = None,
+        scale_buf: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert scale is None
+        # Two allocation regimes, deliberately:
+        #
+        # * ``result_buf``/``scale_buf`` given (the norm->quant patterns pass
+        #   the allocs as PATTERN INPUTS): the buffers are plain pattern
+        #   placeholders, so nothing about their shape is baked into the
+        #   pattern. This is what makes ``register_replacement``'s exact
+        #   re-match pass on every site: with computed allocs the re-traced
+        #   pattern tied both alloc dims to ONE shared symbol placeholder,
+        #   while the engine graph carries the token dim as separate
+        #   (semantically equal) sym-int placeholder args per use site --
+        #   a shared pattern placeholder must bind one node, so every site
+        #   whose two allocs referenced different placeholders was silently
+        #   rejected by check_fn (measured 2026-10-19/20).
+        #
+        # * computed (no buffers): mirrors the shipping
+        #   ops.scaled_int8_quant call site's allocation in the form the
+        #   ENGINE's graph contains after standalone_compile's pre-grad
+        #   decompositions (empty_like -> empty(size, layout=strided,
+        #   pin_memory=False)). Kept for the fp8 path and for callers that
+        #   have no buffers to pass.
+        if result_buf is None:
+            result_buf = torch.empty(
+                (input.numel() // input.shape[-1], input.shape[-1]),
+                dtype=self.quant_key.dtype,
+                layout=torch.strided,
+                device=input.device,
+                pin_memory=False,
+            )
+        if scale_buf is None:
+            scale_buf = self.make_scale(input)
+        ret = auto_functionalized(
+            self.QUANT_OP,
+            result=result_buf,
+            input=input,
+            scale=scale_buf,
+            azp=None,
+        )
+        # Schema-indexed: dynamic_scaled_int8_quant has THREE mutable args
+        # (result, scale, azp - `Tensor!? azp` is optional AND mutable), so the
+        # return is a 4-tuple (None, result, scale, azp) and the old fixed
+        # `_, result, scale =` unpack raised "too many values to unpack".
+        outs = functionalized_mutable_args(self.QUANT_OP, ret)
+        return outs["result"], outs["scale"]
+
+    def forward_native(
+        self,
+        input: torch.Tensor,
+        scale: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from vllm.model_executor.layers.quantization.utils.int8_utils import (
+            per_token_quant_int8,
+        )
+
+        return per_token_quant_int8(input)  # type: ignore[no-any-return]
+
+    def make_scale(self, input: torch.Tensor, transposed: bool = False) -> torch.Tensor:
+        assert not transposed
+        # One float32 scale per token, flattened like the shipping
+        # ops.scaled_int8_quant call site.
+        num_tokens = input.numel() // input.shape[-1]
+        return torch.empty(
+            (num_tokens, 1), device=input.device, dtype=torch.float32
+        )
+
+    def inputs(self) -> list[torch.Tensor]:
+        return [self.empty(5, 16)]
+
+    def buffer_examples(self, rows: int, hidden: int) -> list[torch.Tensor]:
+        """Example alloc buffers, for patterns that take the quant call's
+        ``result``/``scale`` allocations as pattern inputs (see
+        :meth:`forward_custom`)."""
+        return [
+            torch.empty(
+                (rows, hidden),
+                dtype=self.quant_key.dtype,
+                layout=torch.strided,
+                device=self.device,
+                pin_memory=False,
+            ),
+            torch.empty(
+                (rows, 1),
+                dtype=torch.float32,
+                layout=torch.strided,
+                device=self.device,
+                pin_memory=False,
+            ),
+        ]
+
+
 class MatcherSiluAndMul(MatcherCustomOp):
     def __init__(self, enabled: bool | None = None) -> None:
         if enabled is None:
@@ -541,11 +727,183 @@ class MatcherSiluAndMul(MatcherCustomOp):
         d = x.shape[-1] // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        result = auto_functionalized(SILU_MUL_OP, result=out, input=x)
-        return result[1]
+        ret = auto_functionalized(SILU_MUL_OP, result=out, input=x)
+        return functionalized_mutable_args(SILU_MUL_OP, ret)["result"]
 
     def forward_native(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         return SiluAndMul.forward_native(x)
+
+
+# ---------------------------------------------------------------------------
+# Graph site census -- one-shot proof-of-branching diagnostic.
+#
+# Answers, on the real compiled graph and at match time: how many nodes of the
+# fusion-relevant ops exist, how many candidate producer->quant sites there
+# are, and through what chain the producer reaches the quant. "0 candidates"
+# and "N candidates" are both proof; silence is not.
+# ---------------------------------------------------------------------------
+
+_AUTO_FUNCTIONALIZED_NAMES = ("auto_functionalized", "auto_functionalized_v2")
+
+
+def called_op(node: fx.Node) -> OpOverload | None:
+    """The :class:`OpOverload` a node calls, unwrapping ``auto_functionalized``.
+
+    At post-grad match time mutating custom ops appear as
+    ``auto_functionalized(op, **kwargs)`` HOP calls (``auto_functionalized_v2``
+    on newer torch); both forms are recognised so the census sees the same
+    nodes the fusion patterns match.
+    """
+    if node.op != "call_function":
+        return None
+    target = node.target
+    if isinstance(target, OpOverload):
+        return target
+    if getattr(target, "__name__", "") in _AUTO_FUNCTIONALIZED_NAMES and (
+        node.args and isinstance(node.args[0], OpOverload)
+    ):
+        return node.args[0]
+    return None
+
+
+def op_call_kwargs(node: fx.Node, op: OpOverload) -> dict[str, Any]:
+    """Schema-name -> value for a (possibly functionalized) op call node."""
+    out: dict[str, Any] = {}
+    schema_args = list(op._schema.arguments)
+    if isinstance(node.target, OpOverload):
+        for name, value in zip((a.name for a in schema_args), node.args):
+            out[name] = value
+    out.update(node.kwargs)
+    return out
+
+
+def op_base_name(target: Any) -> str:
+    """'contiguous' for aten.contiguous.default, 'silu' for aten.silu, ..."""
+    if isinstance(target, OpOverload):
+        return target.name().split("::")[-1].split(".")[0]
+    return getattr(target, "__name__", "")
+
+
+def walk_views(node: Any) -> tuple[Any, int]:
+    """Follow no-op-ish view/cast nodes to the real producer.
+
+    Returns (producer, chain length). Mutating-op outputs (getitem of
+    auto_functionalized) count as producers.
+    """
+    chain = 0
+    while isinstance(node, fx.Node) and node.op == "call_function":
+        target = node.target
+        name = op_base_name(target)
+        if name in ("contiguous", "clone", "view", "reshape", "flatten", "to",
+                    "permute", "transpose", "unsqueeze", "squeeze", "_unsafe_view"):
+            node = node.args[0]
+            chain += 1
+            continue
+        if (
+            target is operator.getitem
+            and node.args
+            and isinstance(node.args[0], fx.Node)
+        ):
+            producer = called_op(node.args[0])
+            if producer is not None:
+                # the getitem reads a mutable output of an op call: the real
+                # producer is that op
+                return node.args[0], chain + 1
+            node = node.args[0]
+            chain += 1
+            continue
+        break
+    return node, chain
+
+
+class FusionSiteCensus:
+    """One-shot log of fusion-relevant op counts and candidate sites."""
+
+    _logged: ClassVar[bool] = False
+
+    @classmethod
+    def log(cls, graph: fx.Graph) -> None:
+        if cls._logged:
+            return
+        cls._logged = True
+
+        counts: dict[str, int] = defaultdict(int)
+        candidates: dict[str, int] = defaultdict(int)
+        quant_forms: dict[str, int] = defaultdict(int)
+        quant_inputs: dict[Any, Any] = {}
+
+        try:
+            rms_op = torch.ops.vllm_ir.rms_norm.default
+        except AttributeError:
+            rms_op = None
+        try:
+            fused_add_rms_op = torch.ops.vllm_ir.fused_add_rms_norm.default
+        except AttributeError:
+            fused_add_rms_op = None
+
+        tracked: dict[Any, str] = {SILU_MUL_OP: "silu_and_mul"}
+        quant_op = QUANT_OPS.get(kInt8DynamicTokenSym)
+        if quant_op is not None:
+            tracked[quant_op] = "quant_int8_dynamic_token"
+        if rms_op is not None:
+            tracked[rms_op] = "rms_norm"
+        if fused_add_rms_op is not None:
+            tracked[fused_add_rms_op] = "fused_add_rms_norm"
+
+        for node in graph.nodes:
+            op = called_op(node)
+            if op is None:
+                if node.op == "call_function" and op_base_name(node.target) == "silu":
+                    counts["aten_silu"] += 1
+                continue
+            if op in tracked:
+                counts[tracked[op]] += 1
+            elif op_base_name(op) == "silu":
+                counts["aten_silu"] += 1
+            elif op is torch.ops.aten.contiguous.default:
+                counts["aten_contiguous"] += 1
+            if quant_op is not None and op is quant_op:
+                kwargs = op_call_kwargs(node, op)
+                quant_inputs[node] = kwargs.get("input")
+                if isinstance(node.target, OpOverload):
+                    quant_forms["raw_call"] += 1
+                else:
+                    quant_forms[op_base_name(node.target)] += 1
+
+        first_site: list[str] = []
+        for qnode, qinput in quant_inputs.items():
+            producer, chain = walk_views(qinput)
+            pop = called_op(producer) if isinstance(producer, fx.Node) else None
+            label = tracked.get(pop, "other")
+            candidates[f"{label}->{'quant_int8'}(view_chain={chain})"] += 1
+            if not first_site and label in ("rms_norm", "fused_add_rms_norm"):
+                # one-shot site dump: the exact nodes between the producer and
+                # the quant (the form the matchers must reproduce)
+                cursor = qinput
+                first_site.append(qnode.format_node())
+                seen = 0
+                while isinstance(cursor, fx.Node) and seen < 6:
+                    first_site.append(cursor.format_node())
+                    if called_op(cursor) is not None or not cursor.args:
+                        break
+                    cursor = cursor.args[0]
+                    seen += 1
+                # and the allocs feeding the quant call (result/scale)
+                for key, val in op_call_kwargs(qnode, quant_op).items():
+                    if isinstance(val, fx.Node) and val is not qinput:
+                        first_site.append(f"{key}={val.format_node()}")
+
+        logger.info(
+            "fusion site census (real graph, one-shot): ops=%s "
+            "quant_call_forms=%s int8_quant_candidates=%s",
+            dict(counts),
+            dict(quant_forms),
+            dict(candidates),
+        )
+        if first_site:
+            logger.info(
+                "fusion site census: first norm->quant site nodes=%s", first_site
+            )

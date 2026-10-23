@@ -81,6 +81,7 @@ class ErrorInfo(OpenAIBaseModel):
     type: str
     param: str | None = None
     code: int
+    retry_after: int | None = None
 
 
 class ErrorResponse(OpenAIBaseModel):

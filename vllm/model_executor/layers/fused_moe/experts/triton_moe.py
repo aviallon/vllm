@@ -38,6 +38,9 @@ from vllm.model_executor.layers.fused_moe.utils import (
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
 )
+from vllm.model_executor.layers.quantization.utils.int8_utils import (
+    silu_and_mul_per_token_quant_int8,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
     QuantKey,
@@ -513,6 +516,27 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 intermediate_cache1.view(-1, N),
                 group_size=128,
                 quant_dtype=current_platform.fp8_dtype(),
+            )
+        elif (
+            activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and self.quant_config.use_int8_w8a8
+            and self.per_act_token_quant
+            and self.block_shape is None
+            and lora_context is None
+            and not self.quantization_emulation
+        ):
+            # Fuse SiLU+Mul + per-token int8 quantize into a single kernel,
+            # skipping the bf16 intermediate write. Same conditions as the
+            # fp8 arm above (gated SiLU, no LoRA needing the bf16
+            # intermediate, no clamp). Per-token quantization is row-local,
+            # so the EP untouched-row caveat for a global a2 scale does not
+            # apply. The quantized output matches
+            # silu_and_mul -> per_token_quant_int8 (the unfused path) up to
+            # the bf16 intermediate rounding; a2_scale is ignored exactly as
+            # _int8_quantize ignores it for per-token quantization.
+            qintermediate_cache2, a2q_scale = silu_and_mul_per_token_quant_int8(
+                intermediate_cache1.view(-1, N)
             )
         else:
             self.activation(

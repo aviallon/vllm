@@ -31,6 +31,16 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+
+# One-shot diagnostic (2026-10-17, extended the same day): log the effective
+# tile config AND the executed path ("2d" / "3d" / "int4_delegate") of every
+# attention launch.  The earlier version logged only the prefill tile branch,
+# after the tile selection, so a path that returns before that selection (the
+# INT4 delegation) — or a launch whose knobs come from somewhere else — could
+# not be told apart from a branch that silently never triggers.  Once per
+# distinct (path, config) combination, capped, to stay quiet in production.
+_TILE_CONFIG_LOGGED: set = set()
+_TILE_CONFIG_LOG_CAP = 8
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -285,6 +295,14 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    # Native int8 QK^T (the "missing branch" of the int8 reader): requantise
+    # the query rows ONCE per program in the prologue, then compute QK as
+    # int8 x int8 with an i32 accumulator.  Only for KV_QUANT_MODE == 2
+    # (INT8 per-token-head) — asserted below.  The per-(token, head) k scales
+    # stay exactly where they are (post-dot, per column); only the K upcast
+    # disappears.  PV keeps its bf16 form (V upcast, P scaled): the int8 PV
+    # variant measured SLOWER and puts P's precision at risk.
+    USE_INT8_QK: tl.constexpr = False,
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window
     # instead of letting them override it. Default False preserves the
     # original (causal AND SW) OR mm_prefix behavior for all other models.
@@ -295,6 +313,13 @@ def kernel_unified_attention(
         KV_QUANT_MODE <= 3
     )
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
+    if USE_INT8_QK:
+        # The i8 x i8 dot needs an int8 cache tile AND per-token-head scales
+        # folded post-dot; nothing else is implemented or safe.
+        tl.static_assert(
+            KV_QUANT_MODE == 2,
+            "USE_INT8_QK requires KV_QUANT_MODE == 2 (INT8 per-token-head)",
+        )
 
     if USE_TD:
         tl.static_assert(
@@ -371,6 +396,34 @@ def kernel_unified_attention(
             mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
             other=0.0,
         )
+
+    if USE_INT8_QK:
+        # Prologue requant of Q: one dynamic per-row absmax over the loaded
+        # tile (amortised over the whole tile loop — ~258 iterations at 9k),
+        # round-half-away-from-zero then int8 truncation, same rule as the
+        # per-token-head writer (_reshape_cache_per_token_head).  Masked rows
+        # / padded dims are 0 in Q, so their absmax is 0 and the 1e-6 floor
+        # keeps the division finite: they quantise to all-zero rows and their
+        # score rows are masked to -inf later anyway.
+        #
+        # The fp32 cast of the i32 dot below is lossless while
+        # HEAD_SIZE_PADDED * 128 * 128 <= 2^24, i.e. HEAD_SIZE_PADDED <= 1024
+        # (2^24 / 16384).  Every integer <= 2^24 is exactly representable in
+        # fp32, so the boundary value itself is safe.  head_size 256 (the only
+        # measured shape) is far inside; assert the bound so a hypothetical
+        # wider head cannot start rounding the accumulator in fp32 silently.
+        # The i32 accumulation itself stays exact to head_size ~131k — this
+        # bound is about the cast.
+        tl.static_assert(
+            HEAD_SIZE_PADDED <= 1024,
+            "USE_INT8_QK requires HEAD_SIZE_PADDED <= 1024 for the exact "
+            "i32->fp32 accumulator cast",
+        )
+        q_absmax = tl.max(tl.abs(Q.to(tl.float32)), axis=1)
+        q_row_scale = tl.maximum(q_absmax / 127.0, 1e-6)
+        q_scaled = Q.to(tl.float32) * (1.0 / q_row_scale[:, None])
+        q_scaled = tl.where(q_scaled >= 0, q_scaled + 0.5, q_scaled - 0.5)
+        Q_i8 = tl.clamp(q_scaled, -128.0, 127.0).to(tl.int8)
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -494,7 +547,12 @@ def kernel_unified_attention(
                 mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+        if USE_INT8_QK:
+            # K stays raw int8 for the i8 dot below — this is the upcast that
+            # the native branch removes.  V is still upcast (PV stays bf16).
+            K = K_load
+        else:
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
@@ -539,7 +597,19 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
+        if USE_INT8_QK:
+            # int8 x int8 -> i32 (exact products, exact i32 accumulation:
+            # worst case HEAD_SIZE_PADDED * 128 * 128 = 4 194 304 at
+            # head_size 256 — < 2^24, so the fp32 cast below is lossless;
+            # the <= 1024 head-size bound is asserted in the prologue).
+            # The dequant factors are per ROW (q_row_scale, prologue) and per
+            # COLUMN (k_token_head_scales, gathered as before), fused into the
+            # post-dot multiply — no gather added, none removed (the static
+            # per-head variant is the one that removes them).
+            S += tl.dot(Q_i8, K, out_dtype=tl.int32).to(tl.float32) * (
+                score_scale * q_row_scale[:, None] * k_token_head_scales[None, :]
+            )
+        elif USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: fuse softmax_scale with per-head k_scale
             # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
             S += tl.dot(Q, K) * (score_scale * k_token_head_scales[None, :])
@@ -786,6 +856,32 @@ def _is_gemma3_attention(head_size: int, sliding_window: int) -> bool:
     return sliding_window == 1024 and head_size in (128, 256)
 
 
+def _large_head_tuning_supported() -> bool:
+    """Whether the tuned large-head launch config applies to this GPU.
+
+    The config (TILE_SIZE_PREFILL=128, BLOCK_M=32, 8 warps) is measured
+    ~2x on B200 (sm100) for head_dim=256 prefill.
+
+    gfx90a (MI200) is deliberately NOT covered, even though it has the
+    same shape regime.  The B2 GPU bench (aragorn
+    ``research/gfx90a-triton-attn-reader-tile-config-bench-b2-2026-10-17.md``,
+    MI210, real prefill shapes B=8x9000 and B=4x9000, 16 q heads x 256,
+    GQA=8) measured the ported config:
+
+    - 8.6x-11x SLOWER than the shipping config in int8_per_token_head KV
+      mode (it spills: 1316B/2912B compile-time scratch, 2348B at
+      runtime, vs 0B for the shipping config);
+    - unable to even LAUNCH in bf16 (KVQuantMode.NONE): the binary needs
+      131072 B of LDS against gfx90a's 65536 B limit -> OutOfResources.
+
+    So enabling it on gfx90a would not merely fail to speed prefill up:
+    it would slow int8 prefill down ~10x and break bf16 prefill outright.
+    The config measured good on gfx90a (head_dim=256, int8 prefill only)
+    is the conditional BLOCK_M=32 variant in ``unified_attention`` below.
+    """
+    return current_platform.is_device_capability_family(100)
+
+
 def _get_tile_size(
     head_size: int,
     sliding_window: int,
@@ -802,6 +898,79 @@ def _get_tile_size(
         return 32
     # Note: tile size must be at least 32 for fp8 (element_size == 1).
     return 16 if element_size >= 2 else 32
+
+
+def _log_tile_config_once(
+    *,
+    path: str,
+    branch: str,
+    block_m: int,
+    block_q: int,
+    tile_size: int | None,
+    num_warps: int | None,
+    num_stages: int | None,
+    num_segments: int | None,
+    head_size: int,
+    num_queries_per_kv: int,
+    max_seqlen_q: int,
+    num_seqs: int,
+    kv_quant_mode: KVQuantMode,
+    int8_qk: bool = False,
+    ws_default: tuple[int, int] | None = (4, 2),
+) -> None:
+    """One-shot-per-config log of the effective attention launch knobs.
+
+    ``num_warps``/``num_stages`` of ``None`` mean "Triton launcher default";
+    for ``kernel_unified_attention`` that default was measured as 4/2 (the B2
+    bench proved the implicit and the explicit 4/2 launches compile to the
+    identical binary), so the log prints the effective values with a
+    ``(default)`` marker.  Pass ``ws_default=None`` for delegated kernels whose
+    launcher default is not measured — the value is then left out rather than
+    asserted.
+    """
+    global _TILE_CONFIG_LOGGED
+    key = (
+        path,
+        branch,
+        block_m,
+        block_q,
+        tile_size,
+        num_warps,
+        num_stages,
+        num_segments,
+        head_size,
+        num_queries_per_kv,
+        kv_quant_mode,
+        int8_qk,
+    )
+    if key in _TILE_CONFIG_LOGGED or len(_TILE_CONFIG_LOGGED) >= _TILE_CONFIG_LOG_CAP:
+        return
+    _TILE_CONFIG_LOGGED.add(key)
+
+    def _ws(v: int | None, default: int | None) -> str:
+        if v is not None:
+            return str(v)
+        return f"{default}(default)" if default is not None else "(default)"
+
+    logger.info(
+        "triton_attn attention launch: path=%s branch=%s BLOCK_M=%s BLOCK_Q=%s "
+        "TILE=%s warps=%s stages=%s segments=%s head_size=%s nq_per_kv=%s "
+        "max_seqlen_q=%s num_seqs=%s kv_quant=%s qk_i8=%s",
+        path,
+        branch,
+        block_m,
+        block_q,
+        tile_size if tile_size is not None else "delegate",
+        _ws(num_warps, ws_default[0] if ws_default else None),
+        _ws(num_stages, ws_default[1] if ws_default else None),
+        num_segments,
+        head_size,
+        num_queries_per_kv,
+        max_seqlen_q,
+        num_seqs,
+        kv_quant_mode.name,
+        int8_qk,
+    )
 
 
 def unified_attention(
@@ -870,6 +1039,54 @@ def unified_attention(
 
         if sinks is not None:
             assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
+        # This delegation RETURNS before the tile selection below, so its
+        # launches never see the prefill tile branches.  Log it explicitly:
+        # if this line is what production shows, every tile-config change in
+        # ``unified_attention`` is dead code for that workload.  The delegate
+        # picks its own knobs (see ``int4_per_token_head._launch_packed_attn``);
+        # BLOCK_M/BLOCK_Q and the tile size below mirror its formulas, and the
+        # path/segment count mirror ITS OWN use_3d predicate — the delegate
+        # launches 2D with one segment whenever that predicate is false, so
+        # reporting the raw ``num_par_softmax_segments`` here would misreport
+        # exactly what this log exists to disambiguate.
+        _int4_num_seqs = len(seqused_k)
+        _int4_nq_per_kv = q.shape[1] // k.shape[2]
+        _int4_block_m = (
+            16
+            if _int4_nq_per_kv <= 16
+            else triton.next_power_of_2(_int4_nq_per_kv)
+        )
+        _int4_use_3d = not (
+            seq_threshold_3D is None
+            or num_par_softmax_segments is None
+            or softmax_segm_output is None
+            or softmax_segm_max is None
+            or softmax_segm_expsum is None
+            or max_seqlen_q > 1
+            or _int4_num_seqs > seq_threshold_3D
+            or is_batch_invariant
+        )
+        _log_tile_config_once(
+            path="int4_3d" if _int4_use_3d else "int4_2d",
+            branch="int4_delegate",
+            block_m=_int4_block_m,
+            block_q=_int4_block_m // _int4_nq_per_kv,
+            tile_size=_get_tile_size(
+                q.shape[2],
+                1 + window_size[0] if window_size[0] >= 0 else 0,
+                q.element_size(),
+                is_prefill=not _int4_use_3d,
+            ),
+            num_warps=None,
+            num_stages=None,
+            num_segments=num_par_softmax_segments if _int4_use_3d else 1,
+            head_size=q.shape[2],
+            num_queries_per_kv=_int4_nq_per_kv,
+            max_seqlen_q=max_seqlen_q,
+            num_seqs=_int4_num_seqs,
+            kv_quant_mode=kv_quant_mode,
+            ws_default=None,
+        )
         unified_attention_int4(
             q=q,
             k_cache=k,
@@ -911,6 +1128,15 @@ def unified_attention(
             f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"
         )
 
+    # Native int8 QK^T (bg-19 candidate b): the query rows are requantised
+    # once per program and QK runs as int8 x int8 (i32 acc), instead of
+    # upcasting every K tile to bf16 at every loop iteration and dotting in
+    # bf16.  Conditioned on KVQuantMode.INT8_PER_TOKEN_HEAD ONLY — bf16 and
+    # the FP8 modes are byte-for-byte the old code path.  PV keeps its bf16
+    # form; the per-(token, head) K/V scales are unchanged (gathered per tile,
+    # applied post-dot), so the cache layout and the writer need no change.
+    use_int8_qk = kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+
     use_mm_prefix = False
     max_mm_ranges = 0
     if mm_prefix_range is not None:
@@ -942,22 +1168,66 @@ def unified_attention(
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.
     launch_num_warps: int | None = None
     launch_num_stages: int | None = None
+    # Self-description for the one-shot launch log below.
+    tile_config_branch = "shipping"
 
     # head_size 256 with many query rows per sequence (e.g. diffusion-gemma
     # bidirectional canvas passes) is prefill-shaped, but the decode-oriented
     # defaults (BLOCK_Q=8, TILE=32, 4 warps) under-tile it. A wider KV tile +
-    # more query rows per block + 8 warps is ~2x faster on B200.
+    # more query rows per block + 8 warps is ~2x faster on B200 (sm100).
+    # gfx90a is excluded (see ``_large_head_tuning_supported``: the config
+    # spills there and cannot launch in bf16). Decode (max_seqlen_q == 1) is
+    # excluded by the gate below and keeps its tile size untouched.
     tuned_large_head = (
         head_size == 256
         and max_seqlen_q > 1
         and num_queries_per_kv <= 16
-        and current_platform.is_device_capability_family(100)
+        and _large_head_tuning_supported()
     )
     if tuned_large_head:
         BLOCK_M = 32
         BLOCK_Q = BLOCK_M // num_queries_per_kv
         launch_num_warps = 8
         launch_num_stages = 2
+        tile_config_branch = "tuned_large_head"
+    elif (
+        head_size == 256
+        and max_seqlen_q > 1
+        and num_queries_per_kv <= 16
+        and kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+    ):
+        # C3 from the B2 gfx90a reader bench (aragorn
+        # ``research/gfx90a-triton-attn-reader-tile-config-bench-b2-2026-10-17.md``):
+        # TILE_SIZE_PREFILL stays 32, BLOCK_M 16->32, defaults 4 warps /
+        # 2 stages.  Measured -26% on the reader kernel for head_dim=256
+        # int8_per_token_head prefill (B=8x9000 and B=4x9000, two
+        # concordant blocks, spill-free, outputs ~1 ulp vs the shipping
+        # config).  This is a reader-kernel measurement only: it promises
+        # NO end-to-end prefill gain.
+        #
+        # Conditioned on KV mode 2 because in bf16 (KVQuantMode.NONE) the
+        # same config measured +5..10% SLOWER there, so bf16 keeps the
+        # shipping BLOCK_M=16.  ``num_queries_per_kv <= 16`` matches the
+        # measured regime (shipping BLOCK_M is 16 exactly then; for
+        # num_queries_per_kv > 16 the default BLOCK_M already exceeds 32
+        # and forcing 32 would even break BLOCK_Q).  BLOCK_Q (= BLOCK_M //
+        # num_queries_per_kv) and the grid's first dimension
+        # (total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs, computed
+        # below) both derive from BLOCK_M and follow automatically.
+        BLOCK_M = 32
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+        launch_num_warps = 4
+        launch_num_stages = 2
+        tile_config_branch = "c3_int8"
+        # Optional BLOCK_M override for the int8 KV prefill path (the
+        # "halve the reader's KV reads" lever: traffic is in 1/BLOCK_Q).
+        # Measured-null unless set; the branch name carries the effective
+        # value so the launch log is its own branching proof.
+        _bm_env = envs.VLLM_ROCM_TRITON_ATTN_BLOCK_M
+        if _bm_env in (16, 32, 64):
+            BLOCK_M = _bm_env
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+            tile_config_branch = f"c3_int8_bm{BLOCK_M}"
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -1092,6 +1362,26 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
+    # Logged here — not at the tile selection — so the entry names the path
+    # that is really launched ("2d"/"3d") with the knobs that really reach
+    # the JIT function.
+    _log_tile_config_once(
+        path="3d" if use_3d else "2d",
+        branch=tile_config_branch,
+        block_m=BLOCK_M,
+        block_q=BLOCK_Q,
+        tile_size=tile_size,
+        num_warps=launch_num_warps,
+        num_stages=launch_num_stages,
+        num_segments=num_segments,
+        head_size=head_size,
+        num_queries_per_kv=num_queries_per_kv,
+        max_seqlen_q=max_seqlen_q,
+        num_seqs=num_seqs,
+        kv_quant_mode=kv_quant_mode,
+        int8_qk=use_int8_qk,
+    )
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1167,6 +1457,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        USE_INT8_QK=use_int8_qk,
         MM_PREFIX_CLAMP_SW=mm_prefix_clamp_sliding_window,
         **launch_kwargs,
     )

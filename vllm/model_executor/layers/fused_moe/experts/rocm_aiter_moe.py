@@ -26,6 +26,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt8DynamicTokenSym,
+    kInt8StaticChannelSym,
     kMxfp4Dynamic,
     kMxfp4Static,
 )
@@ -506,6 +508,10 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             (kFp8StaticChannelSym, kFp8DynamicTokenSym),
             (kMxfp4Static, None),
             (kMxfp4Static, kMxfp4Dynamic),
+            # int8 w8a8 (Quark checkpoints): per-out-channel weights + dynamic
+            # per-token activations -> QuantMethod.PER_TOKEN in
+            # rocm_aiter_fused_experts (commit 99197bf031).
+            (kInt8StaticChannelSym, kInt8DynamicTokenSym),
         ]
         if (weight_key, activation_key) not in SUPPORTED_W_A:
             return False

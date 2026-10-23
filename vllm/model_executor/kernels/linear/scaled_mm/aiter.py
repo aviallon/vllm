@@ -9,6 +9,10 @@ from vllm._aiter_ops import (
     rocm_aiter_ops,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
 )
@@ -68,7 +72,7 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`AiterInt8ScaledMMLinearKernel` implements a fused version of
@@ -89,12 +93,18 @@ class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         assert symmetric, (
             "AiterInt8ScaledMMLinearKernel only supports symmetric quantization."
         )
-        x_q, x_s, x_zp = ops.scaled_int8_quant(x, i_s, i_zp, symmetric=symmetric)
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            x_q, x_s, x_zp = qa.data, qa.scale, None
+            out_dtype = qa.orig_dtype
+        else:
+            assert isinstance(x, torch.Tensor)
+            x_q, x_s, x_zp = ops.scaled_int8_quant(x, i_s, i_zp, symmetric=symmetric)
+            out_dtype = x.dtype
 
         assert x_zp is None, (
             "AiterInt8ScaledMMLinearKernel only supports symmetric quantization."
         )
-        out_dtype = x.dtype
 
         assert w_q.shape[0] % 16 == 0 and w_q.shape[1] % 16 == 0
         assert out_dtype is torch.bfloat16 or out_dtype is torch.float16

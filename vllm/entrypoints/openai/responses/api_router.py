@@ -15,6 +15,9 @@ from vllm.entrypoints.openai.responses.protocol import (
 )
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    error_response_to_json_response,
+)
 from vllm.entrypoints.serve.utils.api_utils import (
     load_aware_call,
     validate_json_request,
@@ -65,10 +68,7 @@ async def create_responses(request: ResponsesRequest, raw_request: Request):
     generator = await handler.create_responses(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(
-            content=generator.model_dump(mode="json", by_alias=True),
-            status_code=generator.error.code,
-        )
+        return error_response_to_json_response(generator)
     elif isinstance(generator, ResponsesResponse):
         return JSONResponse(content=generator.model_dump(mode="json", by_alias=True))
 

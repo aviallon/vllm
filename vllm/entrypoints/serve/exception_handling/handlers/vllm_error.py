@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from fastapi import Request
-from starlette.responses import JSONResponse
 
 from vllm.entrypoints.launchers.launcher import terminate_if_errored
 from vllm.exceptions import GenerationError, VLLMError
 from vllm.logger import init_logger
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
 
-from ..error_response import create_error_response
+from ..error_response import create_error_response, error_response_to_json_response
 from .exception import exception_handler
 
 logger = init_logger(__name__)
@@ -62,8 +61,7 @@ async def engine_error_handler(
         server=req.app.state.server,
         engine=req.app.state.engine_client,
     )
-    err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return error_response_to_json_response(create_error_response(exc))
 
 
 async def generation_error_handler(req: Request, exc: GenerationError):
@@ -73,5 +71,4 @@ async def generation_error_handler(req: Request, exc: GenerationError):
     that should be returned to the client without polluting server logs with
     stack traces.
     """
-    err = create_error_response(exc)
-    return JSONResponse(err.model_dump(), status_code=err.error.code)
+    return error_response_to_json_response(create_error_response(exc))

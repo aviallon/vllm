@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from http import HTTPStatus
 
+from starlette.responses import JSONResponse
+
 from vllm.exceptions import GenerationError, RetryableRequestError
 from vllm.logger import init_logger
 
@@ -18,6 +20,7 @@ def create_error_response(
     param: str | None = None,
 ) -> ErrorResponse:
     exc: Exception | None = None
+    retry_after: int | None = None
 
     if isinstance(message, Exception):
         exc = message
@@ -38,6 +41,7 @@ def create_error_response(
             err_type = HTTPStatus(exc.http_status).phrase
             status_code = exc.http_status
             param = None
+            retry_after = exc.retry_after
         elif isinstance(exc, VLLMValidationError):
             err_type = "BadRequestError"
             status_code = HTTPStatus.BAD_REQUEST
@@ -96,5 +100,27 @@ def create_error_response(
             type=err_type,
             code=status_code.value,
             param=param,
+            retry_after=retry_after,
         )
     )
+
+
+def error_response_to_json_response(err: ErrorResponse) -> JSONResponse:
+    """Render an ``ErrorResponse`` as a JSON HTTP response.
+
+    Adds the ``Retry-After`` header when the error carries one, so that
+    clients can back off without parsing the body.
+
+    Args:
+        err: The error payload to serialize.
+
+    Returns:
+        A JSON response with the error's HTTP status code.
+
+    """
+    headers = (
+        {"Retry-After": str(err.error.retry_after)}
+        if err.error.retry_after is not None
+        else None
+    )
+    return JSONResponse(err.model_dump(), status_code=err.error.code, headers=headers)

@@ -257,6 +257,8 @@ OPTIMIZATION_LEVEL_00 = {
         "pass_config": {
             "fuse_norm_quant": False,
             "fuse_act_quant": False,
+            "fuse_norm_quant_triton": False,
+            "fuse_ar_norm_quant": False,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
             "enable_sp": False,
@@ -280,6 +282,8 @@ OPTIMIZATION_LEVEL_01 = {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
+            "fuse_norm_quant_triton": False,
+            "fuse_ar_norm_quant": False,
             "fuse_allreduce_rms": False,
             "fuse_attn_quant": False,
             "enable_sp": False,
@@ -303,6 +307,8 @@ OPTIMIZATION_LEVEL_02 = {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
+            "fuse_norm_quant_triton": False,
+            "fuse_ar_norm_quant": False,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
@@ -326,6 +332,8 @@ OPTIMIZATION_LEVEL_03 = {
         "pass_config": {
             "fuse_norm_quant": enable_norm_fusion,
             "fuse_act_quant": enable_act_fusion,
+            "fuse_norm_quant_triton": False,
+            "fuse_ar_norm_quant": False,
             "fuse_allreduce_rms": enable_allreduce_rms_fusion,
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
