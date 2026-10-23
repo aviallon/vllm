@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
 
 import torch
 
@@ -503,6 +504,16 @@ def _triton_scaled_mm_impl(
 # tensor) prevents torch from introspecting the raw Triton kernel, fixing the
 # miscompilation while keeping eager behaviour identical.
 # ---------------------------------------------------------------------------
+def _scaled_int8_quant_chain(input: torch.Tensor, symmetric: bool = True):
+    """The shipped activation quantization, used by the regime fallback above
+    (identical to what `apply_weights` runs when the gate is off)."""
+    from vllm import _custom_ops as ops
+
+    x_q, x_s, x_zp = ops.scaled_int8_quant(input.contiguous(), None, None,
+                                           symmetric=symmetric)
+    return x_q, x_s, x_zp
+
+
 def _triton_scaled_mm_op(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -579,6 +590,29 @@ def triton_scaled_mm(
 # ---------------------------------------------------------------------------
 # Fused-quant variant (megakernel campaign 2026-10-23, pair (a)).
 #
+# Branch proof + shape probe: every (M, K, N) actually served by the FUSED
+# path is logged once.  The dedup key is the string form — under
+# torch.compile the dims are SymInts and comparing them creates guards
+# (pitfall M9: ConstraintViolationError, engine crash-loop); here we run at
+# runtime inside the custom op so the dims are concrete, but str() costs
+# nothing and keeps the helper safe from either caller.
+_FUSED_QUANT_LOGGED: set[str] = set()
+
+_logger = logging.getLogger(__name__)
+
+
+def _log_fused_quant_shape(M: int, K: int, N: int) -> None:
+    key = f"x({M}, {K})-w({K}, {N})"
+    if key in _FUSED_QUANT_LOGGED or len(_FUSED_QUANT_LOGGED) >= 128:
+        return
+    _FUSED_QUANT_LOGGED.add(key)
+    _logger.info(
+        "scaled_mm fused-quant ACTIVE (VLLM_SCALED_MM_FUSED_QUANT=1): "
+        "dynamic per-token int8 quant in the GEMM prologue, %s",
+        key,
+    )
+
+
 # input   - [M, K] float (bf16/fp16/fp32), quantized per row inside the kernel
 # weight  - [K, N] int8
 # returns (result [M, N] out_dtype, scale_a [M, 1] fp32) — scale_a is exactly
@@ -604,6 +638,7 @@ def _triton_scaled_mm_fused_quant_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, K = input.shape
     N = weight.shape[1]
+    _log_fused_quant_shape(M, K, N)
 
     assert N > 0 and K > 0 and M > 0
     assert weight.shape[0] == K
@@ -677,7 +712,28 @@ def _triton_scaled_mm_fused_quant_op(
     out_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # Regime gate, measured on the wall (2026-10-23): the fused path wins
+    # ~15-18% at decode shapes (M<=32: 151 dispatches/step gone from the
+    # CPU-side graph replay), is neutral at M=32..256, and REGRESSES ~13% at
+    # prefill sizes (the prologue's two A passes + quant VALU on the serial
+    # path of each CTA).  So: fused at M<=32, the shipped chain above.
+    # The decision is taken INSIDE the custom op, at runtime, where the dims
+    # are concrete ints — comparing them under torch.compile would create
+    # guards (pitfall M9).
+    if input.shape[0] > FUSED_QUANT_MAX_ROWS:
+        x_q, x_s, _ = _scaled_int8_quant_chain(input, bias is not None)
+        out = _triton_scaled_mm_impl(x_q, weight, x_s, scale_b, out_dtype, bias)
+        return out, x_s
     return _triton_scaled_mm_fused_quant_impl(input, weight, scale_b, out_dtype, bias)
+
+
+FUSED_QUANT_MAX_ROWS = 32
+
+
+def fused_quant_regime(M: int) -> bool:
+    """Regime policy (wall-measured 2026-10-23): the fused path at M<=32
+    (decode), the shipped chain above (prefill regressed ~13% fused)."""
+    return M <= FUSED_QUANT_MAX_ROWS
 
 
 def _triton_scaled_mm_fused_quant_op_fake(

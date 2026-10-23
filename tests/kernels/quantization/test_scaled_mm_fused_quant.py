@@ -29,6 +29,8 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     _choose_tile_shape,
+    _triton_scaled_mm_fused_quant_impl as fused_quant_kernel,
+    fused_quant_regime,
     triton_scaled_mm,
     triton_scaled_mm_fused_quant,
 )
@@ -86,7 +88,7 @@ def test_fused_quant_bitexact_vs_chain(M=None, K=None, N=None):
     for m, k, n in ([(M, K, N)] if M is not None else SHAPES):
         x, w_q, scale_b = _make_inputs(m, k, n)
         ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
-        out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+        out, s = fused_quant_kernel(x, w_q, scale_b, torch.bfloat16)
         assert torch.equal(s, ref_s), f"scales differ ({m},{k},{n})"
         assert torch.equal(out, ref_out), f"output differs ({m},{k},{n})"
 
@@ -99,9 +101,7 @@ def test_fused_quant_bitexact_with_bias(M=None, K=None, N=None):
         # conversion (`c += bias`), like the chain.
         bias = torch.randn(n, dtype=torch.bfloat16, device=x.device)
         ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16, bias=bias)
-        out, s = triton_scaled_mm_fused_quant(
-            x, w_q, scale_b, torch.bfloat16, bias=bias
-        )
+        out, s = fused_quant_kernel(x, w_q, scale_b, torch.bfloat16, bias=bias)
         assert torch.equal(s, ref_s)
         assert torch.equal(out, ref_out)
 
@@ -126,7 +126,7 @@ def test_fused_quant_half_even_rounding():
     scale_b = torch.ones(N, 1, dtype=torch.float32, device="cuda")
 
     ref_out, ref_s = _chain(x, w_q, scale_b, torch.float32)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+    out, s = fused_quant_kernel(x, w_q, scale_b, torch.float32)
     assert torch.equal(s, ref_s)
     assert torch.equal(out, ref_out)
 
@@ -141,7 +141,7 @@ def test_fused_quant_zero_rows():
     x, w_q, scale_b = _make_inputs(M, K, N)
     x[1] = 0.0  # all-zero row: absmax=0 -> inv_s=0 -> quant 0, scale 0
     ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+    out, s = fused_quant_kernel(x, w_q, scale_b, torch.bfloat16)
     assert torch.equal(s, ref_s)
     assert torch.equal(out, ref_out)
     assert s[1].item() == 0.0
@@ -153,7 +153,7 @@ def test_fused_quant_partial_k_vs_cpu():
     the tail zero-filled — the fused kernel masks its tail loads with 0."""
     M, K, N = 5, 2016, 96
     x, w_q, scale_b = _make_inputs(M, K, N)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+    out, s = fused_quant_kernel(x, w_q, scale_b, torch.float32)
 
     q, scales = _cpu_quant_exact(x)
     # fp64 matmul: exact for our magnitudes (|acc| < 2^27), and CUDA has no
@@ -225,7 +225,7 @@ def test_fused_quant_scale_convention_matches_vllm_reference():
         return
     M, K, N = 17, 1024, 256
     x, w_q, scale_b = _make_inputs(M, K, N)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+    out, s = fused_quant_kernel(x, w_q, scale_b, torch.float32)
     _xq, scales = ref_dynamic_per_token_quant(x, torch.int8)
     assert torch.equal(scales.float(), s)
 
@@ -246,9 +246,19 @@ def test_fused_quant_transposed_weight():
     assert not w_q.is_contiguous()
     scale_b = torch.rand(N, 1, dtype=torch.float32, device="cuda") * 0.01 + 0.001
     ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+    out, s = fused_quant_kernel(x, w_q, scale_b, torch.bfloat16)
     assert torch.equal(s, ref_s)
     assert torch.equal(out, ref_out)
+
+
+def test_regime_policy():
+    """The wall-measured regime: fused at M<=32 (decode win), chain above
+    (prefill regressed ~13% fused).  Must stay in lockstep with the
+    wall evidence in research/megakernel-campaign-2026-10-23/REPORT.md."""
+    for m in (1, 4, 32):
+        assert fused_quant_regime(m), f"M={m} must use the fused path"
+    for m in (33, 256, 4096):
+        assert not fused_quant_regime(m), f"M={m} must keep the shipped chain"
 
 
 def test_gate_decision_table(monkeypatch):
@@ -315,6 +325,7 @@ def _main() -> int:
     run("transposed weight (prod layout)", test_fused_quant_transposed_weight)
     run("partial K vs cpu", test_fused_quant_partial_k_vs_cpu)
     run("oracle is the chain?", test_partial_k_oracle_is_the_chain)
+    run("regime policy (M<=32)", test_regime_policy)
     run("vllm quant reference", test_fused_quant_scale_convention_matches_vllm_reference)
     mp = _MonkeyPatch()
     run("gate decision table", test_gate_decision_table, mp)
