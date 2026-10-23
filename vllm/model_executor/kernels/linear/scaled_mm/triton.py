@@ -38,19 +38,24 @@ logger = logging.getLogger(__name__)
 # every (M, K, N) actually served by the fused kernel is logged once, so "the
 # optimisation is not deployed" can never be mistaken for "it does not work",
 # and the intermediate-traffic accounting gets its real shapes.
-_FUSED_QUANT_LOGGED_SHAPES: set[tuple[int, ...]] = set()
+#
+# ⚠ The dedup key MUST be the STRING form of the shapes: under torch.compile
+# (backed dynamic shapes) the dims are SymInts, and putting them in a tuple/set
+# compares them -> guard creation -> ConstraintViolationError -> the engine
+# crash-loops at init (measured: arm A of the wall, 2026-10-23).  str() is
+# guard-free; comparisons are not.
+_FUSED_QUANT_LOGGED_SHAPES: set[str] = set()
 
 
 def _log_fused_quant_shape(x_shape: torch.Size, w_shape: torch.Size) -> None:
-    key = (x_shape[0], x_shape[1], w_shape[1])
+    key = f"x{tuple(x_shape)}-w{tuple(w_shape)}"
     if key in _FUSED_QUANT_LOGGED_SHAPES or len(_FUSED_QUANT_LOGGED_SHAPES) >= 64:
         return
     _FUSED_QUANT_LOGGED_SHAPES.add(key)
     logger.info(
         "scaled_mm fused-quant ACTIVE (VLLM_SCALED_MM_FUSED_QUANT=1): "
-        "dynamic per-token int8 quant in the GEMM prologue, "
-        "shape M=%d K=%d N=%d",
-        *key,
+        "dynamic per-token int8 quant in the GEMM prologue, %s",
+        key,
     )
 
 
