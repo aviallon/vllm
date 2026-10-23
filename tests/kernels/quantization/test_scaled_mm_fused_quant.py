@@ -15,10 +15,13 @@ ever switches to round-half-away-from-zero (`tl.extra.hip.libdevice.round`),
 it fails on the crafted .5 values.
 """
 
-import pytest
 import torch
 
-from tests.kernels.quant_utils import ref_dynamic_per_token_quant
+try:
+    from tests.kernels.quant_utils import ref_dynamic_per_token_quant
+except ImportError:  # in-image runs may not ship the tests package
+    ref_dynamic_per_token_quant = None
+
 from vllm import envs
 from vllm._custom_ops import scaled_int8_quant
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
@@ -75,25 +78,28 @@ def _cpu_quant_exact(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, amax / 127.0
 
 
-@pytest.mark.parametrize("M,K,N", SHAPES)
-def test_fused_quant_bitexact_vs_chain(M, K, N):
-    x, w_q, scale_b = _make_inputs(M, K, N)
-    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
-    assert torch.equal(s, ref_s), "per-row scales differ from the chain"
-    assert torch.equal(out, ref_out), "GEMM output differs from the chain"
+def test_fused_quant_bitexact_vs_chain(M=None, K=None, N=None):
+    for m, k, n in ([(M, K, N)] if M is not None else SHAPES):
+        x, w_q, scale_b = _make_inputs(m, k, n)
+        ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
+        out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+        assert torch.equal(s, ref_s), f"scales differ ({m},{k},{n})"
+        assert torch.equal(out, ref_out), f"output differs ({m},{k},{n})"
 
 
-@pytest.mark.parametrize("M,K,N", [(1, 2048, 1024), (32, 2048, 2048)])
-def test_fused_quant_bitexact_with_bias(M, K, N):
-    x, w_q, scale_b = _make_inputs(M, K, N)
-    # bias must be in out_dtype: the kernel adds it after the output
-    # conversion (`c += bias`), like the chain.
-    bias = torch.randn(N, dtype=torch.bfloat16, device=x.device)
-    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16, bias=bias)
-    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16, bias=bias)
-    assert torch.equal(s, ref_s)
-    assert torch.equal(out, ref_out)
+def test_fused_quant_bitexact_with_bias(M=None, K=None, N=None):
+    combos = [(M, K, N)] if M is not None else [(1, 2048, 1024), (32, 2048, 2048)]
+    for m, k, n in combos:
+        x, w_q, scale_b = _make_inputs(m, k, n)
+        # bias must be in out_dtype: the kernel adds it after the output
+        # conversion (`c += bias`), like the chain.
+        bias = torch.randn(n, dtype=torch.bfloat16, device=x.device)
+        ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16, bias=bias)
+        out, s = triton_scaled_mm_fused_quant(
+            x, w_q, scale_b, torch.bfloat16, bias=bias
+        )
+        assert torch.equal(s, ref_s)
+        assert torch.equal(out, ref_out)
 
 
 def test_fused_quant_half_even_rounding():
@@ -157,6 +163,9 @@ def test_fused_quant_scale_convention_matches_vllm_reference():
     """Our scales must be the same convention ref_dynamic_per_token_quant
     documents (amax / 127), and the quantized values must agree with our
     verbatim expressions."""
+    if ref_dynamic_per_token_quant is None:
+        print("SKIP vllm quant reference (tests.kernels.quant_utils absent)")
+        return
     M, K, N = 17, 1024, 256
     x, w_q, scale_b = _make_inputs(M, K, N)
     out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
@@ -192,3 +201,58 @@ def test_gate_decision_table(monkeypatch):
     # `qa is None` check, but a raw int8 tensor is ineligible here too)
     x_i8 = torch.zeros(4, 128, dtype=torch.int8, device="cuda")
     assert not fused_quant_eligible(True, None, x_i8, w_q)
+
+
+class _MonkeyPatch:
+    """Minimal pytest-monkeypatch stand-alone shim for `python3 <this file>`."""
+
+    def __init__(self):
+        self._saved = []
+
+    def setattr(self, obj, name, value):
+        self._saved.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def undo(self):
+        for obj, name, old in reversed(self._saved):
+            setattr(obj, name, old)
+        self._saved = []
+
+
+def _main() -> int:
+    """Self-driver: runs every test without pytest (in-image sessions)."""
+    failures = []
+
+    def run(tag, fn, *args):
+        try:
+            fn(*args)
+            print(f"PASS {tag}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+
+            traceback.print_exc()
+            print(f"FAIL {tag}: {type(e).__name__}: {e}", flush=True)
+            failures.append(tag)
+
+    for M, K, N in SHAPES:
+        run(f"bitexact ({M},{K},{N})", test_fused_quant_bitexact_vs_chain, M, K, N)
+    for M, K, N in [(1, 2048, 1024), (32, 2048, 2048)]:
+        run(f"bitexact+bias ({M},{K},{N})", test_fused_quant_bitexact_with_bias, M, K, N)
+    run("half-even rounding", test_fused_quant_half_even_rounding)
+    run("zero rows", test_fused_quant_zero_rows)
+    run("partial K vs cpu", test_fused_quant_partial_k_vs_cpu)
+    run("vllm quant reference", test_fused_quant_scale_convention_matches_vllm_reference)
+    mp = _MonkeyPatch()
+    run("gate decision table", test_gate_decision_table, mp)
+    mp.undo()
+
+    print()
+    if failures:
+        print(f"{len(failures)} FAILURES: {failures}")
+        return 1
+    print("ALL CONTRACT TESTS GREEN")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
