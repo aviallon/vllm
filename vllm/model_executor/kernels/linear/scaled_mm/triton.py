@@ -2,15 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import logging
+
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+    has_triton_scaled_mm_fused_quant_op,
     triton_scaled_mm,
+    triton_scaled_mm_fused_quant,
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
@@ -26,6 +31,33 @@ from .cutlass import CutlassInt8ScaledMMLinearKernel
 from .ScaledMMLinearKernel import (
     Int8ScaledMMLinearLayerConfig,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def fused_quant_eligible(
+    symmetric: bool,
+    i_s: torch.Tensor | None,
+    x: object,
+    w_q: torch.Tensor,
+    i_zp: torch.Tensor | None = None,
+) -> bool:
+    """Decision table for the fused-quant path (megakernel campaign, pair (a)).
+
+    Everything the fused kernel does not cover keeps the shipped two-kernel
+    chain verbatim: pre-quantized input (`as_quantized_activation`), static
+    input scale, asymmetric quantization (azp), non-float or non-int8 dtypes.
+    """
+    return (
+        envs.VLLM_SCALED_MM_FUSED_QUANT
+        and has_triton_scaled_mm_fused_quant_op()
+        and symmetric
+        and i_s is None
+        and i_zp is None
+        and isinstance(x, torch.Tensor)
+        and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and w_q.dtype == torch.int8
+    )
 
 
 class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -132,19 +164,35 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
 
         symmetric = azp_adj is None
         qa = as_quantized_activation(x, self.input_quant_key())
-        if qa is not None:
-            x_q, x_s, x_zp = qa.data, qa.scale, None
-            orig_dtype = qa.orig_dtype
-        else:
-            assert isinstance(x, torch.Tensor)
-            x_q, x_s, x_zp = ops.scaled_int8_quant(
-                x.contiguous(), i_s, i_zp, symmetric=symmetric
-            )
-            orig_dtype = x.dtype
-
-        out = triton_scaled_mm(
-            x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=orig_dtype, bias=bias
+        # Pair (a) of the megakernel campaign: fold the dynamic per-token int8
+        # quantization of the activation into the GEMM prologue (bit-exact, see
+        # scaled_mm_fused_quant_kernel).  Gated OFF by default; every case the
+        # fused path does not cover (pre-quantized input, static scale,
+        # asymmetric quant) keeps the shipped two-kernel chain verbatim.
+        use_fused_quant = (
+            qa is None and fused_quant_eligible(symmetric, i_s, x, w_q)
         )
+        if use_fused_quant:
+            assert isinstance(x, torch.Tensor)
+            orig_dtype = x.dtype
+            out, x_s = triton_scaled_mm_fused_quant(
+                x.contiguous(), w_q, scale_b=w_s, out_dtype=orig_dtype, bias=bias
+            )
+            x_zp = None
+        else:
+            if qa is not None:
+                x_q, x_s, x_zp = qa.data, qa.scale, None
+                orig_dtype = qa.orig_dtype
+            else:
+                assert isinstance(x, torch.Tensor)
+                x_q, x_s, x_zp = ops.scaled_int8_quant(
+                    x.contiguous(), i_s, i_zp, symmetric=symmetric
+                )
+                orig_dtype = x.dtype
+
+            out = triton_scaled_mm(
+                x_q, w_q, scale_a=x_s, scale_b=w_s, out_dtype=orig_dtype, bias=bias
+            )
 
         if azp_adj is not None:
             # Asymmetric quantization: subtract the zero-point correction.
