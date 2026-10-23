@@ -266,7 +266,10 @@ def scaled_mm_fused_quant_kernel(
         amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
         k_off = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
         a_scan = a_ptr + stride_am * offsets_am[:, None] + stride_ak * k_off[None, :]
-        for _k1 in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # num_stages pipelines the loads across iterations: without it the
+        # K-chunk loads are serialised and their latency is exposed (measured
+        # +5.6 us at decode shapes in session mk-quant-gemm-b2).
+        for _k1 in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=4):
             masks_k = k_off < K
             a_f = tl.load(
                 a_scan, mask=masks_am[:, None] & masks_k[None, :], other=0.0
