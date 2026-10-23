@@ -268,8 +268,12 @@ def scaled_mm_fused_quant_kernel(
         a_scan = a_ptr + stride_am * offsets_am[:, None] + stride_ak * k_off[None, :]
         # num_stages pipelines the loads across iterations: without it the
         # K-chunk loads are serialised and their latency is exposed (measured
-        # +5.6 us at decode shapes in session mk-quant-gemm-b2).
-        for _k1 in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=4):
+        # +5.6 us at decode shapes in session mk-quant-gemm-b2).  Budget:
+        # each staged buffer is (A tile + B tile) = 24 KiB at the decode tile,
+        # and the LDS window is 64 KiB minus the dot's own staging (16 KiB) —
+        # num_stages=2 fits (48 KiB), 4 overflows (73728 B > 65536, measured
+        # in mk-quant-gemm-b4).
+        for _k1 in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=2):
             masks_k = k_off < K
             a_f = tl.load(
                 a_scan, mask=masks_am[:, None] & masks_k[None, :], other=0.0
@@ -291,9 +295,10 @@ def scaled_mm_fused_quant_kernel(
     # the memory latency of EVERY chunk (measured +4.5 us at M<=32 and +39 us
     # at M=256 vs the shipped chain in mk-quant-gemm-b2/b3).  With it, the
     # VALU work of chunk k+1 sits in the MFMA/load bubbles of chunk k — the
-    # VALU/MFMA overlap the campaign asked for.
+    # VALU/MFMA overlap the campaign asked for.  num_stages=2 only (LDS
+    # budget: see the scan loop's note; 4 measured to overflow at 73728 B).
     # ------------------------------------------------------------------
-    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=4):
+    for k in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=2):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
         a_f = tl.load(a_ptrs, mask=masks_a, other=0.0)

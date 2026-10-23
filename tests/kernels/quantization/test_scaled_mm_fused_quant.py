@@ -157,8 +157,21 @@ def test_fused_quant_partial_k_vs_cpu():
     acc = (q.to(torch.float64) @ w_q.to(torch.float64)).to(torch.float32)
     # same op order as the kernel epilogue: (scale_a * acc) then (scale_b.T *)
     ref = (scales * acc) * scale_b.t()
-    assert torch.equal(s, scales)
-    assert torch.equal(out, ref)
+    assert torch.equal(s, scales), f"scales differ at K={K}"
+    if not torch.equal(out, ref):
+        diff = (out.float() - ref.float()).abs()
+        idx = (diff > 0).nonzero()
+        print(
+            f"    diag partial-K: {len(idx)} differing elems, "
+            f"max|d|={diff.max().item():.6g}"
+        )
+        for i in idx[:4].tolist():
+            r, c = i[0], i[1]
+            print(
+                f"      [{r},{c}] out={out[r, c].item():.9g} "
+                f"ref={ref[r, c].item():.9g} q_sum={(q[r].to(torch.float64) * w_q[:, c].to(torch.float64)).sum().item():.9g}"
+            )
+        raise AssertionError(f"partial-K mismatch at K={K}")
 
 
 def test_fused_quant_scale_convention_matches_vllm_reference():
