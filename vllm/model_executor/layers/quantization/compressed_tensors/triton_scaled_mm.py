@@ -260,7 +260,9 @@ def scaled_mm_fused_quant_kernel(
     # Masked K tail loads contribute |0| = 0, like the quant kernel which
     # only walks the valid elements from a 0.0 initial max.
     # AMAX_SCAN=False (probe/ablation only) skips the scan and reads the
-    # per-row scales from `scale_a_out_ptr` instead (single pass).
+    # per-row scales from `scale_a_out_ptr` instead (single pass).  NOTE it is
+    # NOT bit-exact by construction: `1.0 / scale_a` is not bitwise
+    # `127.0 / amax`; it is a timing probe, never a shipping path.
     # ------------------------------------------------------------------
     if AMAX_SCAN:
         amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
@@ -268,11 +270,14 @@ def scaled_mm_fused_quant_kernel(
         a_scan = a_ptr + stride_am * offsets_am[:, None] + stride_ak * k_off[None, :]
         # num_stages pipelines the loads across iterations: without it the
         # K-chunk loads are serialised and their latency is exposed (measured
-        # +5.6 us at decode shapes in session mk-quant-gemm-b2).  Budget:
-        # each staged buffer is (A tile + B tile) = 24 KiB at the decode tile,
-        # and the LDS window is 64 KiB minus the dot's own staging (16 KiB) —
-        # num_stages=2 fits (48 KiB), 4 overflows (73728 B > 65536, measured
-        # in mk-quant-gemm-b4).
+        # +5.6 us at decode shapes in session mk-quant-gemm-b2).
+        # LDS budget: the measured staging at the decode tile (16,64,256) is
+        # 73728 B at num_stages=4 (over the 65536 B window -> OutOfResources at
+        # RUNTIME, mk-quant-gemm-b4: the compile smoke does NOT catch it) and
+        # fits at 2.  Only ONE operand appears multi-buffered in that count
+        # (4x16 KiB B-tile + 8 KiB A-tile), so do NOT re-derive the budget from
+        # tile sizes: check metadata.shared per tile in the smoke before
+        # raising num_stages again.
         for _k1 in tl.range(0, tl.cdiv(K, BLOCK_SIZE_K), num_stages=2):
             masks_k = k_off < K
             a_f = tl.load(
@@ -726,6 +731,14 @@ def triton_scaled_mm_fused_quant(
         return torch.ops.vllm.triton_scaled_mm_fused_quant(
             input, weight, scale_b, out_dtype, bias
         )
-    return _triton_scaled_mm_fused_quant_impl(
-        input, weight, scale_b, out_dtype, bias
+    # Registration failed: NEVER fall back to the raw kernel here.  Under
+    # torch.compile the raw Triton kernel would be introspected and
+    # miscompiled (all-zero outputs, see the note above) — the catastrophic
+    # failure mode.  Callers keep the two-kernel chain via
+    # `has_triton_scaled_mm_fused_quant_op()`; reaching this point means the
+    # contract of that check was broken, so fail loud instead.
+    raise RuntimeError(
+        "triton_scaled_mm_fused_quant: custom op not registered; "
+        "callers must gate on has_triton_scaled_mm_fused_quant_op() "
+        "and keep the two-kernel chain"
     )

@@ -28,6 +28,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     fused_quant_eligible,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+    _choose_tile_shape,
     triton_scaled_mm,
     triton_scaled_mm_fused_quant,
 )
@@ -67,10 +68,13 @@ def _chain(x, w_q, scale_b, out_dtype, bias=None):
 
 
 def _cpu_quant_exact(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """The kernel's quantization expressions, verbatim, on CPU/GPU torch:
-    amax = max(|x|); scale = amax/127; inv_s = (amax == 0) ? 0 : 127/amax;
-    q = clamp(nearbyint(x * inv_s), -128, 127).  torch.round == nearbyint
-    (both round-half-to-even)."""
+    """The kernel's quantization expressions, verbatim, in torch ops (computed
+    on the SAME device as x — torch's fp32 division is a different code path
+    from LLVM's `fdiv`, so this is an ORACLE CANDIDATE, not the contract; see
+    `test_partial_k_oracle_is_the_chain` which decides whether it or the
+    kernel is the odd one out).  amax = max(|x|); scale = amax/127;
+    inv_s = (amax == 0) ? 0 : 127/amax; q = clamp(nearbyint(x*inv_s), -128,
+    127).  torch.round == nearbyint (both round-half-to-even)."""
     xf = x.float()
     amax = xf.abs().amax(dim=1, keepdim=True)
     inv_s = torch.where(amax == 0, torch.zeros_like(amax), 127.0 / amax)
@@ -159,14 +163,16 @@ def test_fused_quant_partial_k_vs_cpu():
     ref = (scales * acc) * scale_b.t()
     assert torch.equal(s, scales), f"scales differ at K={K}"
     if not torch.equal(out, ref):
+        # the effective tile of this shape (M<=32 -> BK=256)
+        _, _, bk = _choose_tile_shape(M, N, True, (32, 32, 32))
+        k_body = (K // bk) * bk
         diff = (out.float() - ref.float()).abs()
         flat = diff.view(-1)
         bad = int(flat.argmax().item())
         r, c = divmod(bad, diff.shape[1])
         s_rc = (scales[r, 0] * scale_b[c, 0]).item()
         acc_full = float((q[r].to(torch.float64) * w_q[:, c].to(torch.float64)).sum())
-        k_tail = K - (K // 256) * 256
-        k_body = K - k_tail
+        k_tail = K - k_body
         acc_body = float(
             (q[r, :k_body].to(torch.float64) * w_q[:k_body, c].to(torch.float64)).sum()
         )
@@ -177,9 +183,37 @@ def test_fused_quant_partial_k_vs_cpu():
         print(
             f"      scale={s_rc:.9g} acc_impl={out[r, c].item() / s_rc:.4f} "
             f"acc_full={acc_full:.1f} acc_without_tail(k>={k_body})={acc_body:.1f} "
-            f"tail_elems={k_tail}"
+            f"tail_elems={k_tail} bk={bk}"
         )
         raise AssertionError(f"partial-K mismatch at K={K}")
+
+
+def test_partial_k_oracle_is_the_chain():
+    """Decisive test for the partial-K disagreement (review 2026-10-23):
+    is the torch-based reference or the kernel the odd one out?
+
+    Compare the CHAIN's quantization (the contractual CUDA kernel) against
+    the torch oracle on the very dataset where they disagree.  If the chain
+    also differs from the oracle at the same elements, the oracle's fp32
+    division/rounding is the divergent one and the fused kernel is innocent.
+    """
+    M, K, N = 5, 2016, 96
+    x, _w_q, _scale_b = _make_inputs(M, K, N)
+    q_chain, s_chain = scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
+    q_ref, s_ref = _cpu_quant_exact(x)
+    assert torch.equal(s_chain, s_ref), "scales: chain vs oracle differ"
+    n_diff = int((q_chain != q_ref).sum().item())
+    print(f"    oracle-vs-chain quantization diffs: {n_diff} of {q_chain.numel()}")
+    if n_diff == 0:
+        print("    oracle == chain => the fused kernel is the divergent one")
+    else:
+        idx = (q_chain != q_ref).nonzero()[:4].tolist()
+        for r, c in idx:
+            print(f"      [{r},{c}] chain={q_chain[r, c].item()} "
+                  f"oracle={q_ref[r, c].item()}")
+        print("    chain != oracle => the torch oracle is NOT the contract "
+              "(its fp32 ops diverge from the LLVM device path); the partial-K "
+              "disagreement does not implicate the fused kernel")
 
 
 def test_fused_quant_scale_convention_matches_vllm_reference():
@@ -200,6 +234,21 @@ def test_fused_quant_scale_convention_matches_vllm_reference():
     acc = (q.to(torch.float64) @ w_q.to(torch.float64)).to(torch.float32)
     ref = (s2 * acc) * scale_b.t()
     assert torch.equal(out, ref)
+
+
+def test_fused_quant_transposed_weight():
+    """Production weight layout: `process_weights_after_loading` stores
+    ``w_q.t().data`` — a TRANSPOSED view ([K, N] with strides (1, K)).  Both
+    paths address B through strides, so the chain is the oracle here too."""
+    M, K, N = 32, 2048, 1024
+    x = torch.randn(M, K, dtype=torch.float32, device="cuda").to(torch.bfloat16)
+    w_q = torch.randint(-127, 127, (N, K), dtype=torch.int8, device="cuda").t()
+    assert not w_q.is_contiguous()
+    scale_b = torch.rand(N, 1, dtype=torch.float32, device="cuda") * 0.01 + 0.001
+    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+    assert torch.equal(s, ref_s)
+    assert torch.equal(out, ref_out)
 
 
 def test_gate_decision_table(monkeypatch):
@@ -263,7 +312,9 @@ def _main() -> int:
         run(f"bitexact+bias ({M},{K},{N})", test_fused_quant_bitexact_with_bias, M, K, N)
     run("half-even rounding", test_fused_quant_half_even_rounding)
     run("zero rows", test_fused_quant_zero_rows)
+    run("transposed weight (prod layout)", test_fused_quant_transposed_weight)
     run("partial K vs cpu", test_fused_quant_partial_k_vs_cpu)
+    run("oracle is the chain?", test_partial_k_oracle_is_the_chain)
     run("vllm quant reference", test_fused_quant_scale_convention_matches_vllm_reference)
     mp = _MonkeyPatch()
     run("gate decision table", test_gate_decision_table, mp)

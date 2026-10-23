@@ -64,6 +64,7 @@ def fused_quant_eligible(
     i_s: torch.Tensor | None,
     x: object,
     w_q: torch.Tensor,
+    i_zp: torch.Tensor | None = None,
 ) -> bool:
     """Decision table for the fused-quant path (megakernel campaign, pair (a)).
 
@@ -76,6 +77,7 @@ def fused_quant_eligible(
         and has_triton_scaled_mm_fused_quant_op()
         and symmetric
         and i_s is None
+        and i_zp is None
         and isinstance(x, torch.Tensor)
         and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
         and w_q.dtype == torch.int8
