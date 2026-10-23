@@ -194,6 +194,7 @@ def scaled_mm_fused_quant_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
+    AMAX_SCAN: tl.constexpr = True,
 ):
     """W8A8 GEMM with the dynamic per-token int8 quantization of A fused into
     the prologue (megakernel campaign 2026-10-23, pair (a)).
@@ -258,21 +259,27 @@ def scaled_mm_fused_quant_kernel(
     # needs the full row before any quantized value can be formed).
     # Masked K tail loads contribute |0| = 0, like the quant kernel which
     # only walks the valid elements from a 0.0 initial max.
+    # AMAX_SCAN=False (probe/ablation only) skips the scan and reads the
+    # per-row scales from `scale_a_out_ptr` instead (single pass).
     # ------------------------------------------------------------------
-    amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
-    k_off = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
-    a_scan = a_ptr + stride_am * offsets_am[:, None] + stride_ak * k_off[None, :]
-    for _k1 in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        masks_k = k_off < K
-        a_f = tl.load(
-            a_scan, mask=masks_am[:, None] & masks_k[None, :], other=0.0
-        )
-        amax = tl.maximum(amax, tl.max(tl.abs(a_f.to(tl.float32)), axis=1))
-        k_off = k_off + BLOCK_SIZE_K
-        a_scan = a_scan + BLOCK_SIZE_K * stride_ak
+    if AMAX_SCAN:
+        amax = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+        k_off = tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+        a_scan = a_ptr + stride_am * offsets_am[:, None] + stride_ak * k_off[None, :]
+        for _k1 in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            masks_k = k_off < K
+            a_f = tl.load(
+                a_scan, mask=masks_am[:, None] & masks_k[None, :], other=0.0
+            )
+            amax = tl.maximum(amax, tl.max(tl.abs(a_f.to(tl.float32)), axis=1))
+            k_off = k_off + BLOCK_SIZE_K
+            a_scan = a_scan + BLOCK_SIZE_K * stride_ak
 
-    inv_s = tl.where(amax == 0.0, 0.0, 127.0 / amax)
-    scale_a = amax / 127.0
+        inv_s = tl.where(amax == 0.0, 0.0, 127.0 / amax)
+        scale_a = amax / 127.0
+    else:
+        scale_a = tl.load(scale_a_out_ptr + offsets_am, mask=masks_am, other=0.0)
+        inv_s = tl.where(scale_a == 0.0, 0.0, 1.0 / scale_a)
 
     # ------------------------------------------------------------------
     # Pass 2 — quantize each A chunk in registers (VALU) and accumulate with
@@ -329,12 +336,13 @@ def scaled_mm_fused_quant_kernel(
 
     # Publish the per-row scales — same values the two-kernel chain would
     # have written via dynamic_scaled_int8_quant's scale_out ([M, 1] fp32).
-    offs_scale_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    tl.store(
-        scale_a_out_ptr + offs_scale_m,
-        scale_a,
-        mask=offs_scale_m < M,
-    )
+    if AMAX_SCAN:
+        offs_scale_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        tl.store(
+            scale_a_out_ptr + offs_scale_m,
+            scale_a,
+            mask=offs_scale_m < M,
+        )
 # weight - [K, N]
 def _choose_tile_shape(
     M: int,
@@ -574,6 +582,8 @@ def _triton_scaled_mm_fused_quant_impl(
     block_size_n: int = 32,
     block_size_k: int = 32,
     use_heuristic=True,
+    amax_scan: bool = True,
+    scale_a_in: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, K = input.shape
     N = weight.shape[1]
@@ -599,6 +609,10 @@ def _triton_scaled_mm_fused_quant_impl(
 
     result = torch.empty((M, N), dtype=out_dtype, device=input.device)
     scale_a_out = torch.empty((M, 1), dtype=torch.float32, device=input.device)
+    if not amax_scan:
+        # probe/ablation path: the per-row scales come from outside
+        assert scale_a_in is not None
+        scale_a_out = scale_a_in.contiguous().view(M, 1).to(torch.float32)
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -633,6 +647,7 @@ def _triton_scaled_mm_fused_quant_impl(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_SCALE_B=block_size_sb,
+        AMAX_SCAN=amax_scan,
     )
 
     return result.to(out_dtype), scale_a_out

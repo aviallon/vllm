@@ -152,9 +152,11 @@ def test_fused_quant_partial_k_vs_cpu():
     out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
 
     q, scales = _cpu_quant_exact(x)
-    acc = q.to(torch.int32) @ w_q.to(torch.int32)
+    # fp64 matmul: exact for our magnitudes (|acc| < 2^27), and CUDA has no
+    # int32 addmm.  The .to(fp32) then matches the kernel's int32->fp32.
+    acc = (q.to(torch.float64) @ w_q.to(torch.float64)).to(torch.float32)
     # same op order as the kernel epilogue: (scale_a * acc) then (scale_b.T *)
-    ref = (scales * acc.float()) * scale_b.t()
+    ref = (scales * acc) * scale_b.t()
     assert torch.equal(s, scales)
     assert torch.equal(out, ref)
 
@@ -174,8 +176,8 @@ def test_fused_quant_scale_convention_matches_vllm_reference():
 
     q, s2 = _cpu_quant_exact(x)
     assert torch.equal(s2, s)
-    acc = q.to(torch.int32) @ w_q.to(torch.int32)
-    ref = (s2 * acc.float()) * scale_b.t()
+    acc = (q.to(torch.float64) @ w_q.to(torch.float64)).to(torch.float32)
+    ref = (s2 * acc) * scale_b.t()
     assert torch.equal(out, ref)
 
 
