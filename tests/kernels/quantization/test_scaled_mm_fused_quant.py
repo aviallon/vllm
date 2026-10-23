@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Contract tests for the fused-quant W8A8 GEMM (megakernel campaign 2026-10-23,
+pair (a): dynamic per-token int8 activation quantization folded into the
+`scaled_mm_kernel` prologue).
+
+The contract is BIT-EXACTNESS against the shipped two-kernel chain
+(`_C::dynamic_scaled_int8_quant` -> `triton_scaled_mm`): same absmax, same
+scale expressions, same nearbyint rounding + saturation, same epilogue order.
+No dtype rule is consumed (the quantized path keeps int8/int32 exactly as the
+chain does).
+
+`test_fused_quant_half_even_rounding` is the mutation guard: if the prologue
+ever switches to round-half-away-from-zero (`tl.extra.hip.libdevice.round`),
+it fails on the crafted .5 values.
+"""
+
+import pytest
+import torch
+
+from tests.kernels.quant_utils import ref_dynamic_per_token_quant
+from vllm import envs
+from vllm._custom_ops import scaled_int8_quant
+from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+    fused_quant_eligible,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+    triton_scaled_mm,
+    triton_scaled_mm_fused_quant,
+)
+
+# (M, K, N) — decode shapes first (the campaign's target regime), then prefill
+# and off-tile shapes.  K must be a multiple of 256 (= BLOCK_SIZE_K of the
+# deployed tiles) for the chain comparison: at partial K the *chain's* dot tail
+# is undefined by construction (masked tl.load without `other`), so the chain
+# is not a valid oracle there — `test_fused_quant_partial_k_vs_cpu` covers it.
+SHAPES = [
+    (1, 2048, 1024),
+    (1, 2048, 2048),
+    (4, 2048, 2560),
+    (32, 2048, 512),
+    (33, 1024, 1024),
+    (256, 2048, 2048),
+    (300, 512, 256),
+    (4096, 2048, 1024),
+]
+
+
+def _make_inputs(M, K, N, dtype=torch.bfloat16, device="cuda", seed=0):
+    torch.manual_seed(seed)
+    x = torch.randn(M, K, dtype=torch.float32, device=device).to(dtype)
+    w_q = torch.randint(-127, 127, (K, N), dtype=torch.int8, device=device)
+    scale_b = torch.rand(N, 1, dtype=torch.float32, device=device) * 0.01 + 0.001
+    return x, w_q, scale_b
+
+
+def _chain(x, w_q, scale_b, out_dtype, bias=None):
+    """The shipped two-kernel path (what the fused kernel replaces)."""
+    x_q, x_s, x_zp = scaled_int8_quant(x.contiguous(), None, None, symmetric=True)
+    out = triton_scaled_mm(
+        x_q, w_q, scale_a=x_s, scale_b=scale_b, out_dtype=out_dtype, bias=bias
+    )
+    return out, x_s
+
+
+def _cpu_quant_exact(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The kernel's quantization expressions, verbatim, on CPU/GPU torch:
+    amax = max(|x|); scale = amax/127; inv_s = (amax == 0) ? 0 : 127/amax;
+    q = clamp(nearbyint(x * inv_s), -128, 127).  torch.round == nearbyint
+    (both round-half-to-even)."""
+    xf = x.float()
+    amax = xf.abs().amax(dim=1, keepdim=True)
+    inv_s = torch.where(amax == 0, torch.zeros_like(amax), 127.0 / amax)
+    q = torch.round(xf * inv_s).clamp(-128, 127).to(torch.int8)
+    return q, amax / 127.0
+
+
+@pytest.mark.parametrize("M,K,N", SHAPES)
+def test_fused_quant_bitexact_vs_chain(M, K, N):
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+    assert torch.equal(s, ref_s), "per-row scales differ from the chain"
+    assert torch.equal(out, ref_out), "GEMM output differs from the chain"
+
+
+@pytest.mark.parametrize("M,K,N", [(1, 2048, 1024), (32, 2048, 2048)])
+def test_fused_quant_bitexact_with_bias(M, K, N):
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    # bias must be in out_dtype: the kernel adds it after the output
+    # conversion (`c += bias`), like the chain.
+    bias = torch.randn(N, dtype=torch.bfloat16, device=x.device)
+    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16, bias=bias)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16, bias=bias)
+    assert torch.equal(s, ref_s)
+    assert torch.equal(out, ref_out)
+
+
+def test_fused_quant_half_even_rounding():
+    """x * inv_s lands on exact .5 values: round-half-to-EVEN is what
+    float_to_int8_rn (nearbyint) does — half-away would differ on every .5.
+
+    amax = 127 -> inv_s = 1.0 -> the quantized values are nearbyint(x).
+    """
+    M, K, N = 2, 256, 64
+    x = torch.zeros(M, K, dtype=torch.float32, device="cuda")
+    halves = torch.tensor(
+        [0.5, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5], dtype=torch.float32
+    )
+    x[0, : 8] = halves
+    x[0, 8] = 127.0
+    x[0, 9] = -127.0
+    x[1, : 8] = halves  # second row: same, non-zero amax
+    x = x.to(torch.bfloat16)
+    w_q = torch.ones(K, N, dtype=torch.int8, device="cuda")
+    scale_b = torch.ones(N, 1, dtype=torch.float32, device="cuda")
+
+    ref_out, ref_s = _chain(x, w_q, scale_b, torch.float32)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+    assert torch.equal(s, ref_s)
+    assert torch.equal(out, ref_out)
+
+    expected = torch.tensor([0, 2, 2, 4, 0, -2, -2, -4], dtype=torch.int8)
+    q, scales = _cpu_quant_exact(x)
+    assert torch.equal(q[0, :8].cpu(), expected), "rounding mode drifted"
+    assert torch.equal(scales, ref_s)
+
+
+def test_fused_quant_zero_rows():
+    M, K, N = 3, 512, 128
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    x[1] = 0.0  # all-zero row: absmax=0 -> inv_s=0 -> quant 0, scale 0
+    ref_out, ref_s = _chain(x, w_q, scale_b, torch.bfloat16)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.bfloat16)
+    assert torch.equal(s, ref_s)
+    assert torch.equal(out, ref_out)
+    assert s[1].item() == 0.0
+
+
+def test_fused_quant_partial_k_vs_cpu():
+    """K not a multiple of BLOCK_SIZE_K: the chain is no oracle (its dot tail
+    is undefined), so compare against a CPU computation of the same math with
+    the tail zero-filled — the fused kernel masks its tail loads with 0."""
+    M, K, N = 5, 2016, 96
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+
+    q, scales = _cpu_quant_exact(x)
+    acc = q.to(torch.int32) @ w_q.to(torch.int32)
+    # same op order as the kernel epilogue: (scale_a * acc) then (scale_b.T *)
+    ref = (scales * acc.float()) * scale_b.t()
+    assert torch.equal(s, scales)
+    assert torch.equal(out, ref)
+
+
+def test_fused_quant_scale_convention_matches_vllm_reference():
+    """Our scales must be the same convention ref_dynamic_per_token_quant
+    documents (amax / 127), and the quantized values must agree with our
+    verbatim expressions."""
+    M, K, N = 17, 1024, 256
+    x, w_q, scale_b = _make_inputs(M, K, N)
+    out, s = triton_scaled_mm_fused_quant(x, w_q, scale_b, torch.float32)
+    _xq, scales = ref_dynamic_per_token_quant(x, torch.int8)
+    assert torch.equal(scales.float(), s)
+
+    q, s2 = _cpu_quant_exact(x)
+    assert torch.equal(s2, s)
+    acc = q.to(torch.int32) @ w_q.to(torch.int32)
+    ref = (s2 * acc.float()) * scale_b.t()
+    assert torch.equal(out, ref)
+
+
+def test_gate_decision_table(monkeypatch):
+    x = torch.randn(4, 128, dtype=torch.bfloat16, device="cuda")
+    w_q = torch.randint(-127, 127, (128, 64), dtype=torch.int8, device="cuda")
+
+    monkeypatch.setattr(envs, "VLLM_SCALED_MM_FUSED_QUANT", False)
+    assert not fused_quant_eligible(True, None, x, w_q), "gate must default OFF"
+
+    monkeypatch.setattr(envs, "VLLM_SCALED_MM_FUSED_QUANT", True)
+    assert fused_quant_eligible(True, None, x, w_q)
+
+    # static input scale -> chain
+    i_s = torch.tensor([0.1], device="cuda")
+    assert not fused_quant_eligible(True, i_s, x, w_q)
+    # asymmetric quantization -> chain
+    assert not fused_quant_eligible(False, None, x, w_q)
+    # non-int8 weight -> chain
+    w_bf16 = torch.randn(128, 64, dtype=torch.bfloat16, device="cuda")
+    assert not fused_quant_eligible(True, None, x, w_bf16)
+    # non-float activation (pre-quantized int8 reaches the caller's
+    # `qa is None` check, but a raw int8 tensor is ineligible here too)
+    x_i8 = torch.zeros(4, 128, dtype=torch.int8, device="cuda")
+    assert not fused_quant_eligible(True, None, x_i8, w_q)

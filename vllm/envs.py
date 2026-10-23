@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
+    VLLM_SCALED_MM_FUSED_QUANT: bool = False
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -643,6 +644,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``0`` forces TD off.  Useful for A/B benchmarking the TD path.
     "VLLM_TRITON_USE_TD": lambda: {"1": True, "0": False}.get(
         os.getenv("VLLM_TRITON_USE_TD", "").strip()
+    ),
+    # Fuse the dynamic per-token int8 activation quantization into the prologue
+    # of the Triton W8A8 scaled_mm kernel (megakernel campaign 2026-10-23).
+    # Default OFF = the shipped two-kernel chain
+    # (`_C::dynamic_scaled_int8_quant` -> `triton_scaled_mm`), byte-identical
+    # fallback.  Bit-exact when on: same absmax (fp32 max), same scale
+    # expressions, same nearbyint rounding+saturation as
+    # csrc/quantization/w8a8/int8/scaled_quant.cu, same epilogue order.
+    "VLLM_SCALED_MM_FUSED_QUANT": lambda: bool(
+        int(os.getenv("VLLM_SCALED_MM_FUSED_QUANT", "0") or 0)
     ),
     # If set, enable GPU<->CPU synchronization checking around the worker's
     # `execute_model` and `sample_tokens` calls, via PyTorch's sync debug mode
