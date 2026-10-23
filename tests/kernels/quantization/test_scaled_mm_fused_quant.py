@@ -160,17 +160,25 @@ def test_fused_quant_partial_k_vs_cpu():
     assert torch.equal(s, scales), f"scales differ at K={K}"
     if not torch.equal(out, ref):
         diff = (out.float() - ref.float()).abs()
-        idx = (diff > 0).nonzero()
-        print(
-            f"    diag partial-K: {len(idx)} differing elems, "
-            f"max|d|={diff.max().item():.6g}"
+        flat = diff.view(-1)
+        bad = int(flat.argmax().item())
+        r, c = divmod(bad, diff.shape[1])
+        s_rc = (scales[r, 0] * scale_b[c, 0]).item()
+        acc_full = float((q[r].to(torch.float64) * w_q[:, c].to(torch.float64)).sum())
+        k_tail = K - (K // 256) * 256
+        k_body = K - k_tail
+        acc_body = float(
+            (q[r, :k_body].to(torch.float64) * w_q[:k_body, c].to(torch.float64)).sum()
         )
-        for i in idx[:4].tolist():
-            r, c = i[0], i[1]
-            print(
-                f"      [{r},{c}] out={out[r, c].item():.9g} "
-                f"ref={ref[r, c].item():.9g} q_sum={(q[r].to(torch.float64) * w_q[:, c].to(torch.float64)).sum().item():.9g}"
-            )
+        print(
+            f"    diag partial-K worst [{r},{c}]: out={out[r, c].item():.9g} "
+            f"ref={ref[r, c].item():.9g} max|d|={diff.max().item():.6g}"
+        )
+        print(
+            f"      scale={s_rc:.9g} acc_impl={out[r, c].item() / s_rc:.4f} "
+            f"acc_full={acc_full:.1f} acc_without_tail(k>={k_body})={acc_body:.1f} "
+            f"tail_elems={k_tail}"
+        )
         raise AssertionError(f"partial-K mismatch at K={K}")
 
 
