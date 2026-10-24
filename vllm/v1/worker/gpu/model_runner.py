@@ -2037,6 +2037,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         self.kv_connector.finish_forward()
 
+        # Gate-0 duty accounting (research/gate0-async-ar-*): close the timed
+        # step at the end of the REAL forward. _dummy_run closes its own bracket
+        # and must keep doing so -- dummy runs are also the capture runs, and a
+        # gate-0 flush (device sync) inside a graph capture would deadlock it.
+        if not dummy_run:
+            self.step_timing.gate0_close_step()
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)

@@ -118,11 +118,24 @@ class StepTimingCollector:
     def forward_end(self) -> None:
         if self._step is not None:
             self._step.forward_end.record()
-            if self._gate0:
-                self._g0_timed.append(self._step)
-                self._step = None
-                if len(self._g0_timed) >= self._gate0_every:
-                    self._gate0_flush()
+
+    def gate0_close_step(self) -> None:
+        """Gate-0 duty hook (research/gate0-async-ar-*): close the timed step on
+        the REAL path and queue it for the periodic log.
+
+        The real path never calls ``forward_end`` (only ``_dummy_run`` does),
+        so this is where the real step's bracket is closed. Deliberately a
+        no-op for dummy runs and for ``collect()``: dummy runs are also the
+        graph-capture runs, and a gate-0 flush (device sync) inside a capture
+        would deadlock it.
+        """
+        if not self._gate0 or self._step is None or self._collecting:
+            return
+        self._step.forward_end.record()
+        self._g0_timed.append(self._step)
+        self._step = None
+        if len(self._g0_timed) >= self._gate0_every:
+            self._gate0_flush()
 
     def _gate0_flush(self) -> None:
         timed = self._g0_timed
