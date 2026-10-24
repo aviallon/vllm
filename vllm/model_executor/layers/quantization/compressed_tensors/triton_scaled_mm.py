@@ -5,6 +5,7 @@ import logging
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton, use_tensor_descriptor
 from vllm.triton_utils.allocation import set_triton_allocator
 
@@ -379,13 +380,31 @@ def _choose_tile_shape(
         is_small_N = N < 8192
         next_power_of_2_M = max(32, triton.next_power_of_2(M))
         if next_power_of_2_M <= 32:
-            return (16, 64, 256) if is_small_N else (16, 128, 256)
+            tile = (16, 64, 256) if is_small_N else (16, 128, 256)
         elif next_power_of_2_M <= 64:
-            return (64, 64, 256)
+            tile = (64, 64, 256)
         elif next_power_of_2_M <= 128:
-            return (64, 128, 128)
+            tile = (64, 128, 128)
         else:
-            return (128, 128, 128)
+            tile = (128, 128, 128)
+        # Skinny-N override (decode GDN in_proj_ba, N=32 per GPU shard): a BN
+        # larger than N pads the tile and collapses the grid to 1-2 programs
+        # on 104 CUs. Measured on MI210/gfx90a (CUDA-graph replay,
+        # aragorn research/gdn-bf16-optim-2026-10-24/scripts/gdn_decode_sweep.py):
+        #   [128,2048]x[2048,32] int8: (64,128,128) 2 programs = 39.6 us
+        #                              (16, 16, 64) 16 programs = 14.1 us
+        # BIT-EXACT: the kernel accumulates K in ascending order whatever the
+        # tile (verified torch.equal at M=32 and M=128 against the previous
+        # tiles, including different BK). Only decode-shaped M is overridden:
+        # M<=32 keeps its (16,64,256) tile (measured 13.5 us = the best), and
+        # prefill M>128 keeps (128,128,128) (not re-measured).
+        if (
+            envs.VLLM_ROCM_INT8_SKINNY_N_TILES
+            and N <= 32
+            and 32 < next_power_of_2_M <= 128
+        ):
+            tile = (16, 16, 64)
+        return tile
     return fallback
 
 

@@ -94,6 +94,8 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_SCALED_MM_FUSED_QUANT: bool = False
+    VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
+    VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -666,6 +668,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # csrc/quantization/w8a8/int8/scaled_quant.cu, same epilogue order.
     "VLLM_SCALED_MM_FUSED_QUANT": lambda: bool(
         int(os.getenv("VLLM_SCALED_MM_FUSED_QUANT", "0") or 0)
+    ),
+    # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
+    # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the
+    # M-only heuristic (BN>N pads the tile and collapses the grid to 1-2
+    # programs). BIT-EXACT when on: same BK, same ascending-K accumulation.
+    # Measured [128,2048]x[2048,32]: 39.6us -> 14.1us (MI210, graph replay).
+    # See research/gdn-bf16-optim-2026-10-24.
+    "VLLM_ROCM_INT8_SKINNY_N_TILES": lambda: bool(
+        int(os.getenv("VLLM_ROCM_INT8_SKINNY_N_TILES", "0") or 0)
+    ),
+    # Compute unquantized GEMMs with a single output feature (weight [1, K],
+    # e.g. qwen3.5's shared_expert_gate) as an fp32 dot reduction instead of a
+    # hipBLASLt GEMM (which runs 2 workgroups there). Default OFF = the
+    # shipped tgemm/hipBLASLt path. NOT bit-exact: only the K summation order
+    # differs (bf16 operands, fp32 products and accumulator kept).
+    "VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION": lambda: bool(
+        int(os.getenv("VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION", "0") or 0)
     ),
     # If set, enable GPU<->CPU synchronization checking around the worker's
     # `execute_model` and `sample_tokens` calls, via PyTorch's sync debug mode

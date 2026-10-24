@@ -324,6 +324,31 @@ def rocm_unquantized_gemm_impl(
         x_view = x.reshape(-1, x.size(-1)).contiguous()
         return ops.wvSplitKrc(x_view, weight, cu_count, bias)
 
+    # A GEMM with a single output feature (weight [1, K]) is pathological
+    # through hipBLASLt/tgemm: the solution pads the N tile to 64 and runs
+    # with 2 workgroups on 104 CUs. Measured on MI210/gfx90a (CUDA-graph
+    # replay, aragorn research/gdn-bf16-optim-2026-10-24):
+    #   [32,2048]x[2048,1] bf16: F.linear 49.2 us vs fp32 reduction  9.4 us
+    #   [128,2048]x[2048,1] bf16: F.linear 45.5 us vs fp32 reduction  9.7 us
+    # qwen3.5's shared_expert_gate is exactly this shape (ReplicatedLinear
+    # hidden->1, fed to a sigmoid gate) and pays it once per MoE block
+    # (40/step). The reduction keeps the GEMM semantics -- bf16 operands, fp32
+    # products and accumulator, bias applied last -- and only the K summation
+    # order differs from hipBLASLt, so the result is NOT bit-identical (gate
+    # governed by the task-coherence doctrine).
+    if (
+        envs.VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION
+        and m == 1
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and x.numel() == n * k
+    ):
+        x_view = x.reshape(n, k)
+        w_col = weight.reshape(-1).to(torch.float32)
+        out = (x_view.to(torch.float32) * w_col).sum(-1, keepdim=True)
+        if bias is not None:
+            out = out + bias.to(torch.float32)
+        return out.to(x.dtype).reshape(*x.shape[:-1], 1)
+
     # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
     # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
     # partial last tile). Some whitelisted shapes have K=2880 (e.g. gpt-oss-120b
@@ -342,7 +367,6 @@ def rocm_unquantized_gemm_impl(
         and k % 8 == 0
         and skinny_operands_compatible
     )
-
     if use_skinny:
         # The skinny kernels assume contiguous K elements. A shape-preserving
         # reshape can retain a transposed activation's non-contiguous strides.
