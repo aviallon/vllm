@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     VLLM_SCALED_MM_FUSED_QUANT: bool = False
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
+    VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS: int = 1
     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
     MAX_JOBS: str | None = None
     NVCC_THREADS: str | None = None
@@ -685,6 +686,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # differs (bf16 operands, fp32 products and accumulator kept).
     "VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION": lambda: bool(
         int(os.getenv("VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION", "0") or 0)
+    ),
+    # num_warps of the FLA packed-decode GDN kernel (fused_recurrent.py:443).
+    # Default 1 = shipped value; 2 doubles the in-flight loads (register
+    # footprint halves: waves/SIMD 3 -> 7 on gfx90a) and measures -9% at
+    # B=32/64, -1.7% at B=128 (HBM ceiling). Kept an int so A/B arms can carry
+    # a dose; the coherence battery arbitrates.
+    "VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS": lambda: int(
+        os.getenv("VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS", "1") or 1
     ),
     # If set, enable GPU<->CPU synchronization checking around the worker's
     # `execute_model` and `sample_tokens` calls, via PyTorch's sync debug mode

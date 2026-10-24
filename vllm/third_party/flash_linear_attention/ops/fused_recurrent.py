@@ -10,6 +10,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 from .op import exp, log
@@ -448,7 +449,15 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         )
     BV = min(triton.next_power_of_2(V), 32)
     num_stages = 3
-    num_warps = 1
+    # num_warps: occupancy calc for gfx90a (CDNA2, 512 VGPR/SIMD, granule 4,
+    # wave slots/SIMD = 10): the [BV=32, BK=128] fp32 state is 64 regs/lane at
+    # nw=1 (total VGPR=134 -> floor(512/136)=3 waves/SIMD, register-limited) vs
+    # 32 regs/lane at nw=2 (VGPR~70 -> floor(512/72)=7 waves/SIMD): twice the
+    # in-flight memory loads. Measured (CUDA-graph, aragorn
+    # research/gdn-bf16-optim-2026-10-24): nw=2 wins everywhere (-9% B=32/64,
+    # -1.7% B=128 where the kernel sits on the HBM ceiling), nw=4 loses (the
+    # cross-wave reductions need more sync). Env-overridable for A/B arms.
+    num_warps = envs.VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)

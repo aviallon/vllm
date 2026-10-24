@@ -333,21 +333,9 @@ def rocm_unquantized_gemm_impl(
     # qwen3.5's shared_expert_gate is exactly this shape (ReplicatedLinear
     # hidden->1, fed to a sigmoid gate) and pays it once per MoE block
     # (40/step). The reduction keeps the GEMM semantics -- bf16 operands, fp32
-    # products and accumulator, bias applied last -- and only the K summation
-    # order differs from hipBLASLt, so the result is NOT bit-identical (gate
-    # governed by the task-coherence doctrine).
-    if (
-        envs.VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION
-        and m == 1
-        and x.dtype in [torch.float16, torch.bfloat16]
-        and x.numel() == n * k
-    ):
-        x_view = x.reshape(n, k)
-        w_col = weight.reshape(-1).to(torch.float32)
-        out = (x_view.to(torch.float32) * w_col).sum(-1, keepdim=True)
-        if bias is not None:
-            out = out + bias.to(torch.float32)
-        return out.to(x.dtype).reshape(*x.shape[:-1], 1)
+    # products and accumulator, bias applied last -- only the K summation
+    # order differs from hipBLASLt (final coherence is judged by the task
+    # gates, per the doctrine: performance + end-to-end coherence).
 
     # gfx1250's aiter gemm_a16w16 uses the gluon backend, which requires
     # K % 256 == 0 (it walks K with fixed-size descriptors and won't pad a
@@ -395,6 +383,23 @@ def rocm_unquantized_gemm_impl(
             x_view = x.reshape(-1, x.size(-1)).contiguous()
             out = ops.LLMM1(weight, x_view, 4)
             return out.reshape(*x.shape[:-1], weight.shape[0])
+
+    # Placed AFTER the use_skinny block on purpose: for n<=4 rows the shipped
+    # wvSplitK path is already fast and the reduction REGRESSED c1 by +10.8%
+    # when it replaced it (measured, justai63 pilot). This path only replaces
+    # the tgemm/hipBLASLt fallback (n>=5 tokens).
+    if (
+        envs.VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION
+        and m == 1
+        and x.dtype in [torch.float16, torch.bfloat16]
+        and x.numel() == n * k
+    ):
+        x_view = x.reshape(n, k)
+        w_col = weight.reshape(-1).to(torch.float32)
+        out = (x_view.to(torch.float32) * w_col).sum(-1, keepdim=True)
+        if bias is not None:
+            out = out + bias.to(torch.float32)
+        return out.to(x.dtype).reshape(*x.shape[:-1], 1)
 
     if rocm_aiter_ops.is_tgemm_enabled():
         from aiter.tuned_gemm import tgemm
