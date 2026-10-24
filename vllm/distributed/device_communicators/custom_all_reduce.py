@@ -750,7 +750,8 @@ class CustomAllreduce:
 
         buf = torch.empty(ring_len, dtype=torch.int64)
         prev = None  # (host_t, call_max, exit_max, inj_cum)
-        while not self._gate0_stop.wait(10.0):
+        interval = float(envs.VLLM_AR_SPIN_TEST_DUMP_S or 10)
+        while not self._gate0_stop.wait(interval):
             if self._gate0_capturing:
                 # Never sync the device while a graph capture is in flight.
                 continue
@@ -785,14 +786,20 @@ class CustomAllreduce:
             end_wait = t_exit - t_pre
             spin = t_spin - t_sync
             injected = inj > 0
+            # MEANS, not just percentiles: the per-step spin is a SUM over the
+            # ~81 calls, and percentiles do not sum (lesson from gate-0).
+            sw_mean = float(start_wait.mean())
+            ew_mean = float(end_wait.mean())
+            spin_mean = float(spin[injected].mean()) if injected.any() else 0.0
+            dur_mean = float(dur.mean())
             period = np.diff(call[injected]) if injected.sum() > 1 else np.array([0])
             step_ticks = np.percentile(period, 50) if len(period) else 0
             logger.info(
                 "[gate0-ar] entries=%d call_max=%d injected=%d "
-                "start_wait_ticks(p50/p90/max)=%d/%d/%d "
-                "end_wait_ticks(p50/p90/max)=%d/%d/%d "
-                "dur_ticks(p50/p90/max)=%d/%d/%d "
-                "spin_ticks(p50/max)=%d/%d step_period_ticks(p50)=%d "
+                "start_wait_ticks(p50/p90/max/mean)=%d/%d/%d/%d "
+                "end_wait_ticks(p50/p90/max/mean)=%d/%d/%d/%d "
+                "dur_ticks(p50/p90/max/mean)=%d/%d/%d/%d "
+                "spin_ticks(p50/mean/max)=%d/%d/%d step_period_ticks(p50)=%d "
                 "calib_ticks_per_ms=%.1f call_rate_per_ms=%.3f "
                 "inj_rate_per_ms=%.5f",
                 len(a),
@@ -801,13 +808,17 @@ class CustomAllreduce:
                 int(np.percentile(start_wait, 50)),
                 int(np.percentile(start_wait, 90)),
                 int(start_wait.max()),
+                int(sw_mean),
                 int(np.percentile(end_wait, 50)),
                 int(np.percentile(end_wait, 90)),
                 int(end_wait.max()),
+                int(ew_mean),
                 int(np.percentile(dur, 50)),
                 int(np.percentile(dur, 90)),
                 int(dur.max()),
+                int(dur_mean),
                 int(np.percentile(spin[injected], 50)) if injected.any() else 0,
+                int(spin_mean),
                 int(spin.max()),
                 int(step_ticks),
                 calib,

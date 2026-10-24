@@ -314,6 +314,9 @@ if TYPE_CHECKING:
     VLLM_AR_SPIN_TEST_TICKS: int = 0
     VLLM_AR_SPIN_TEST_EVERY: int = 81
     VLLM_AR_SPIN_TEST_RING: int = 4096
+    # Dump interval (s) of the gate-0 timing ring (longer on prod: each dump
+    # synchronizes the device once).
+    VLLM_AR_SPIN_TEST_DUMP_S: int = 10
     # Log per-step GPU forward time (StepTimingCollector) for duty accounting.
     VLLM_GATE0_STEP_TIMING: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -2165,6 +2168,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_AR_SPIN_TEST_RING": lambda: int(
         os.getenv("VLLM_AR_SPIN_TEST_RING", "4096") or 4096
+    ),
+    "VLLM_AR_SPIN_TEST_DUMP_S": lambda: int(
+        os.getenv("VLLM_AR_SPIN_TEST_DUMP_S", "10") or 10
     ),
     "VLLM_GATE0_STEP_TIMING": lambda: maybe_convert_bool(
         os.getenv("VLLM_GATE0_STEP_TIMING", None)
