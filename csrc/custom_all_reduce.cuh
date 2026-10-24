@@ -224,8 +224,10 @@ class CustomAllreduce {
     CUDACHECK(cudaMemset(g0_.ring, 0,
                          (size_t)g0_.ring_n * kGate0RingStride *
                              sizeof(unsigned long long)));
-    printf("[gate0-ar] ring=%u every=%d spin_ticks=%llu\n", g0_.ring_n,
-           g0_.every, g0_.spin_ticks);
+    // stderr: unbuffered -- the branch proof greps the engine log for this.
+    fprintf(stderr, "[gate0-ar] ring=%u every=%d spin_ticks=%llu\n", g0_.ring_n,
+            g0_.every, g0_.spin_ticks);
+    fflush(stderr);
   }
 
   size_t gate0_ring_bytes() const {

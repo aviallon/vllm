@@ -4,6 +4,7 @@
 from contextlib import contextmanager
 from typing import Literal, cast
 import threading
+import time
 
 import torch
 import torch.distributed as dist
@@ -748,6 +749,7 @@ class CustomAllreduce:
         import numpy as np
 
         buf = torch.empty(ring_len, dtype=torch.int64)
+        prev = None  # (host_t, call_max, exit_max, inj_cum)
         while not self._gate0_stop.wait(10.0):
             if self._gate0_capturing:
                 # Never sync the device while a graph capture is in flight.
@@ -763,6 +765,21 @@ class CustomAllreduce:
                 continue
             a = a[np.argsort(a[:, 0])]
             call, t_arr, t_sync, t_spin, t_pre, t_exit, inj, ticks = a.T
+            every = max(1, int(envs.VLLM_AR_SPIN_TEST_EVERY))
+            call_max = int(call[-1])
+            exit_max = int(t_exit[-1])
+            inj_cum = call_max // every + 1  # calls with call_no %% every == 0
+            now = time.perf_counter()
+            calib = 0.0
+            call_rate = 0.0
+            inj_rate = 0.0
+            if prev is not None:
+                host_ms = (now - prev[0]) * 1e3
+                if host_ms > 0:
+                    calib = (exit_max - prev[2]) / host_ms
+                    call_rate = (call_max - prev[1]) / host_ms
+                    inj_rate = (inj_cum - prev[3]) / host_ms
+            prev = (now, call_max, exit_max, inj_cum)
             dur = t_exit - t_arr
             start_wait = t_sync - t_arr
             end_wait = t_exit - t_pre
@@ -771,12 +788,15 @@ class CustomAllreduce:
             period = np.diff(call[injected]) if injected.sum() > 1 else np.array([0])
             step_ticks = np.percentile(period, 50) if len(period) else 0
             logger.info(
-                "[gate0-ar] calls=%d injected=%d "
+                "[gate0-ar] entries=%d call_max=%d injected=%d "
                 "start_wait_ticks(p50/p90/max)=%d/%d/%d "
                 "end_wait_ticks(p50/p90/max)=%d/%d/%d "
                 "dur_ticks(p50/p90/max)=%d/%d/%d "
-                "spin_ticks(p50/max)=%d/%d step_period_ticks(p50)=%d",
+                "spin_ticks(p50/max)=%d/%d step_period_ticks(p50)=%d "
+                "calib_ticks_per_ms=%.1f call_rate_per_ms=%.3f "
+                "inj_rate_per_ms=%.5f",
                 len(a),
+                call_max,
                 int(injected.sum()),
                 int(np.percentile(start_wait, 50)),
                 int(np.percentile(start_wait, 90)),
@@ -790,6 +810,9 @@ class CustomAllreduce:
                 int(np.percentile(spin[injected], 50)) if injected.any() else 0,
                 int(spin.max()),
                 int(step_ticks),
+                calib,
+                call_rate,
+                inj_rate,
             )
 
     def close(self):
