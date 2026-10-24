@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 from typing import Literal, cast
+import threading
 
 import torch
 import torch.distributed as dist
@@ -338,6 +339,31 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        # ---- gate-0 async-AR research harness (research/gate0-async-ar-*) ----
+        # Low-rate dump thread: reads the in-kernel timing ring and logs one
+        # summary line per interval to the engine log (archived by the battery
+        # harness). Skipped entirely during graph capture (the D2H read
+        # synchronizes the device, which would break an in-flight capture).
+        self._gate0_stop = threading.Event()
+        self._gate0_capturing = False
+        self._gate0_thread = None
+        try:
+            _ring_len = ops.gate0_ring_len(self._ptr)
+        except Exception:
+            _ring_len = 0
+        if _ring_len and _ring_len > 0:
+            logger.info_once(
+                "[gate0-ar] timing ring active (%d u64 slots) -- "
+                "async-AR gate-0 harness",
+                _ring_len,
+            )
+            self._gate0_thread = threading.Thread(
+                target=self._gate0_dump_loop,
+                args=(_ring_len,),
+                daemon=True,
+                name="gate0-ar-dump",
+            )
+            self._gate0_thread.start()
         self._init_mnnvl_buffer(
             max(
                 max_mnnvl_all_gather_size * world_size,
@@ -469,11 +495,13 @@ class CustomAllreduce:
         `register_graph_buffers` call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
+        self._gate0_capturing = True
         try:
             self._IS_CAPTURING = True
             yield
         finally:
             self._IS_CAPTURING = False
+            self._gate0_capturing = False
             if not self.disabled:
                 self.register_graph_buffers()
 
@@ -714,7 +742,60 @@ class CustomAllreduce:
             )
         return out
 
+    # ---- gate-0 async-AR research harness (research/gate0-async-ar-*) ----
+    def _gate0_dump_loop(self, ring_len: int) -> None:
+        """Periodically read the in-kernel AR timing ring and log a summary."""
+        import numpy as np
+
+        buf = torch.empty(ring_len, dtype=torch.int64)
+        while not self._gate0_stop.wait(10.0):
+            if self._gate0_capturing:
+                # Never sync the device while a graph capture is in flight.
+                continue
+            try:
+                ops.gate0_ar_stats(self._ptr, buf)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[gate0-ar] stats read failed: %s", exc)
+                continue
+            a = buf.numpy().reshape(-1, 8)
+            a = a[a[:, 0] > 0]  # slot 0 is ambiguous with call_no 0
+            if len(a) == 0:
+                continue
+            a = a[np.argsort(a[:, 0])]
+            call, t_arr, t_sync, t_spin, t_pre, t_exit, inj, ticks = a.T
+            dur = t_exit - t_arr
+            start_wait = t_sync - t_arr
+            end_wait = t_exit - t_pre
+            spin = t_spin - t_sync
+            injected = inj > 0
+            period = np.diff(call[injected]) if injected.sum() > 1 else np.array([0])
+            step_ticks = np.percentile(period, 50) if len(period) else 0
+            logger.info(
+                "[gate0-ar] calls=%d injected=%d "
+                "start_wait_ticks(p50/p90/max)=%d/%d/%d "
+                "end_wait_ticks(p50/p90/max)=%d/%d/%d "
+                "dur_ticks(p50/p90/max)=%d/%d/%d "
+                "spin_ticks(p50/max)=%d/%d step_period_ticks(p50)=%d",
+                len(a),
+                int(injected.sum()),
+                int(np.percentile(start_wait, 50)),
+                int(np.percentile(start_wait, 90)),
+                int(start_wait.max()),
+                int(np.percentile(end_wait, 50)),
+                int(np.percentile(end_wait, 90)),
+                int(end_wait.max()),
+                int(np.percentile(dur, 50)),
+                int(np.percentile(dur, 90)),
+                int(dur.max()),
+                int(np.percentile(spin[injected], 50)) if injected.any() else 0,
+                int(spin.max()),
+                int(step_ticks),
+            )
+
     def close(self):
+        _stop = getattr(self, "_gate0_stop", None)
+        if _stop is not None:
+            _stop.set()
         if not self.disabled and self._ptr:
             if ops is not None:
                 ops.dispose(self._ptr)

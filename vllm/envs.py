@@ -307,6 +307,15 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    # Gate-0 async-AR research harness (research/gate0-async-ar-*): per-call
+    # timing ring + optional per-step artificial spin in the custom one-shot
+    # all-reduce (csrc/custom_all_reduce.cuh). Read by the C++ side directly.
+    VLLM_AR_SPIN_TEST: bool = False
+    VLLM_AR_SPIN_TEST_TICKS: int = 0
+    VLLM_AR_SPIN_TEST_EVERY: int = 81
+    VLLM_AR_SPIN_TEST_RING: int = 4096
+    # Log per-step GPU forward time (StepTimingCollector) for duty accounting.
+    VLLM_GATE0_STEP_TIMING: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -2144,6 +2153,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to control the v2 model runner. If unset, use config defaults.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
+    ),
+    "VLLM_AR_SPIN_TEST": lambda: maybe_convert_bool(
+        os.getenv("VLLM_AR_SPIN_TEST", None)
+    ),
+    "VLLM_AR_SPIN_TEST_TICKS": lambda: int(
+        os.getenv("VLLM_AR_SPIN_TEST_TICKS", "0") or 0
+    ),
+    "VLLM_AR_SPIN_TEST_EVERY": lambda: int(
+        os.getenv("VLLM_AR_SPIN_TEST_EVERY", "81") or 81
+    ),
+    "VLLM_AR_SPIN_TEST_RING": lambda: int(
+        os.getenv("VLLM_AR_SPIN_TEST_RING", "4096") or 4096
+    ),
+    "VLLM_GATE0_STEP_TIMING": lambda: maybe_convert_bool(
+        os.getenv("VLLM_GATE0_STEP_TIMING", None)
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

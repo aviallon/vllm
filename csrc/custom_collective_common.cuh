@@ -49,6 +49,27 @@ inline hipPointer_attribute rangeStartAddrAttr =
 // well-defined behavior.
 using FlagType = uint32_t;
 
+// ---- Gate 0 async-AR research (research/gate0-async-ar-2026-10-24.md) ----
+// Falsifiable mutation harness: a per-step artificial spin injected into the
+// one-shot all-reduce, AFTER the arrival-flag exchange, plus a per-call timing
+// ring. Gate is OFF (spin_ticks == 0 / every == 0) -> no injection; the ring
+// write (1 thread, 8 stores per call) stays active so every arm -- including
+// the 0-dose baseline -- carries the same instrumentation.
+//
+// Timestamps are s_memrealtime ticks (unit NOT assumed; the analysis derives
+// ticks/ms from the step period measured in the ring vs the harness wall).
+struct Gate0Cfg {
+  unsigned long long* ring;  // [ring_n][8], device memory
+  unsigned int ring_n;
+  unsigned long long spin_ticks;  // 0 = no spin
+  int every;                      // inject when (call_no % every) == 0; 0 = never
+};
+
+// Per-call ring layout (one slot per all-reduce call, block 0 / thread 0):
+// [0] call_no [1] t_arrival [2] t_after_start_barrier [3] t_after_spin
+// [4] t_before_end_barrier [5] t_exit [6] injected flag [7] spin_ticks
+constexpr int kGate0RingStride = 8;
+
 // Two sets of peer counters are needed for two syncs: starting and ending an
 // operation. The reason is that it's possible for peer GPU block to arrive at
 // the second sync point while the current GPU block haven't passed the first

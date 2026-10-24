@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -10,6 +11,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.logger import init_logger
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     LogprobsTensors,
@@ -18,6 +20,8 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.utils import raise_if_nan_logits
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
@@ -57,6 +61,16 @@ class StepTimingCollector:
         self._step: StepTimingEvents | None = None
         self._batch = (False, 0, 0)
         self._timed: list[tuple[StepTimingEvents, tuple[bool, int, int]]] = []
+        # ---- gate-0 async-AR research (research/gate0-async-ar-*) ----
+        # Always-on per-step GPU forward timing for duty accounting. Separate
+        # buffer from ``_timed`` so it cannot disturb ``collect()``. NOTE: with
+        # a drafter, the gate-0 flush closes the step at ``forward_end`` and
+        # skips drafter timing (gate-0 runs target spec-decode-off configs).
+        self._gate0 = bool(envs.VLLM_GATE0_STEP_TIMING)
+        self._g0_timed: list[StepTimingEvents] = []
+        self._g0_walls: list[float] = []
+        self._g0_host_prev: float | None = None
+        self._gate0_every = 32
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -92,13 +106,49 @@ class StepTimingCollector:
         self._batch = (full_cudagraph, input_batch.num_tokens, input_batch.num_reqs)
 
     def forward_start(self) -> None:
-        if self._collecting:
+        if self._gate0:
+            now = time.perf_counter()
+            if self._g0_host_prev is not None:
+                self._g0_walls.append(now - self._g0_host_prev)
+            self._g0_host_prev = now
+        if self._collecting or self._gate0:
             self._step = StepTimingEvents()
             self._step.forward_start.record()
 
     def forward_end(self) -> None:
         if self._step is not None:
             self._step.forward_end.record()
+            if self._gate0:
+                self._g0_timed.append(self._step)
+                self._step = None
+                if len(self._g0_timed) >= self._gate0_every:
+                    self._gate0_flush()
+
+    def _gate0_flush(self) -> None:
+        timed = self._g0_timed
+        self._g0_timed = []
+        walls = self._g0_walls[-len(timed) :]
+        self._g0_walls = []
+        if not timed:
+            return
+        # Same stream, issue order: once the last is done, so are the rest.
+        timed[-1].forward_end.synchronize()
+        fwd = [e.forward_start.elapsed_time(e.forward_end) for e in timed]
+        fwd.sort()
+        walls_sorted = sorted(walls) if walls else [0.0]
+        p50 = fwd[len(fwd) // 2]
+        p90 = fwd[min(len(fwd) - 1, int(len(fwd) * 0.9))]
+        wall_p50 = walls_sorted[len(walls_sorted) // 2] * 1e3
+        logger.info(
+            "[gate0-step] n=%d forward_ms(p50/p90/max)=%.3f/%.3f/%.3f "
+            "wall_ms(p50)=%.3f duty(p50)=%.3f",
+            len(fwd),
+            p50,
+            p90,
+            fwd[-1],
+            wall_p50,
+            (p50 / wall_p50) if wall_p50 > 0 else 0.0,
+        )
 
     def drafter_start(self) -> None:
         if self._step is not None:

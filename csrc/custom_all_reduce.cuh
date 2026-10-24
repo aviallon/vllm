@@ -4,22 +4,86 @@
 
 namespace vllm {
 
+// Gate-0 research: monotone in-kernel clock (ticks). Unit is NOT assumed by
+// the code: the analysis calibrates ticks/ms from the measured step period.
+#if defined(USE_ROCM)
+DINLINE unsigned long long gate0_now() {
+  return __builtin_amdgcn_s_memrealtime();
+}
+#else
+DINLINE unsigned long long gate0_now() {
+  return (unsigned long long)clock64();
+}
+#endif
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
+                               T* __restrict__ result, int rank, int size,
+                               Gate0Cfg g0) {
   using P = typename packed_t<T>::P;
   using A = typename packed_t<T>::A;
   // note: we don't reorder the address so the accumulation order is the same
   // for all ranks, ensuring bitwise identical results
   auto dp = *_dp;
+
+  // ---- gate-0 instrumentation (research/gate0-async-ar-*) ----
+  // call_no comes from block 0's persistent barrier counter (advanced by 2
+  // per call: one bump per barrier). Every block reads the SAME location, so
+  // the injection decision is uniform across blocks -- required, else blocks
+  // would disagree on who spins. Nothing here is baked at capture time.
+  unsigned long long g0_call = 0;
+  int g0_inject = 0;
+  unsigned long long g0_t_arr = 0, g0_t_synced = 0, g0_t_spin = 0,
+                     g0_t_pre_end = 0, g0_t_exit = 0;
+  if (g0.ring) {
+    g0_call = (unsigned long long)(self_sg->_flag[0] >> 1);
+    g0_inject = (g0.every > 0 && g0.spin_ticks > 0 &&
+                 (g0_call % (unsigned long long)g0.every) == 0);
+    if (threadIdx.x == 0 && blockIdx.x == 0) g0_t_arr = gate0_now();
+  }
+
   barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) g0_t_synced = gate0_now();
+
+  // Artificial spin AFTER the flag exchange: both ranks have announced their
+  // arrival, so the dose cannot be absorbed by sliding one rank against the
+  // other -- it can only be absorbed by the step's slack.
+  if (g0_inject) {
+    unsigned long long t0 = gate0_now();
+    while (gate0_now() - t0 < g0.spin_ticks) {
+      // Barrier against LICM/CSE: the loop must not be hoisted or unrolled
+      // away (same discipline as the 3-way Triton spin loop).
+      asm volatile("" ::: "memory");
+    }
+    if (threadIdx.x == 0 && blockIdx.x == 0) g0_t_spin = gate0_now();
+  } else if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) {
+    g0_t_spin = g0_t_synced;
+  }
+
   // do the actual reduction
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
+  if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) g0_t_pre_end = gate0_now();
+
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
+
+  if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) {
+    g0_t_exit = gate0_now();
+    unsigned long long* slot =
+        g0.ring + (g0_call % (unsigned long long)g0.ring_n) * kGate0RingStride;
+    slot[0] = g0_call;
+    slot[1] = g0_t_arr;
+    slot[2] = g0_t_synced;
+    slot[3] = g0_t_spin;
+    slot[4] = g0_t_pre_end;
+    slot[5] = g0_t_exit;
+    slot[6] = (unsigned long long)g0_inject;
+    slot[7] = g0_inject ? g0.spin_ticks : 0;
+  }
 }
 
 template <typename P>
@@ -30,7 +94,8 @@ DINLINE P* get_tmp_buf(Signal* sg) {
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_2stage(RankData* _dp, RankSignals sg, Signal* self_sg,
-                               T* __restrict__ result, int rank, int size) {
+                               T* __restrict__ result, int rank, int size,
+                               Gate0Cfg /*g0*/) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int stride = gridDim.x * blockDim.x;
   using P = typename packed_t<T>::P;
@@ -111,6 +176,12 @@ class CustomAllreduce {
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
 
+  // Gate-0 async-AR research harness (research/gate0-async-ar-*): per-call
+  // timing ring + optional per-step artificial spin. ring == nullptr means
+  // "no instrumentation at all"; otherwise the ring write is always on so
+  // every arm of an A/B carries the same instrumentation.
+  Gate0Cfg g0_{};
+
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
    * For each of the buffer, the layout is as follows:
@@ -132,6 +203,53 @@ class CustomAllreduce {
         d_rank_data_end_(d_rank_data_base_ + rank_data_sz / sizeof(RankData)) {
     for (int i = 0; i < world_size_; i++) {
       sg_.signals[i] = signals[i];
+    }
+    gate0_init_from_env();
+  }
+
+  // ---- gate-0 async-AR research harness (see Gate0Cfg) ----
+  void gate0_init_from_env() {
+    const char* on = std::getenv("VLLM_AR_SPIN_TEST");
+    if (on == nullptr || std::atoi(on) == 0) return;
+    const char* ticks = std::getenv("VLLM_AR_SPIN_TEST_TICKS");
+    const char* every = std::getenv("VLLM_AR_SPIN_TEST_EVERY");
+    const char* ringn = std::getenv("VLLM_AR_SPIN_TEST_RING");
+    g0_.spin_ticks = ticks ? std::strtoull(ticks, nullptr, 10) : 0ULL;
+    g0_.every = every ? std::atoi(every) : 81;
+    g0_.ring_n = ringn ? (unsigned int)std::atoi(ringn) : 4096u;
+    if (g0_.ring_n == 0) g0_.ring_n = 4096u;
+    CUDACHECK(cudaMalloc(&g0_.ring,
+                         (size_t)g0_.ring_n * kGate0RingStride *
+                             sizeof(unsigned long long)));
+    CUDACHECK(cudaMemset(g0_.ring, 0,
+                         (size_t)g0_.ring_n * kGate0RingStride *
+                             sizeof(unsigned long long)));
+    printf("[gate0-ar] ring=%u every=%d spin_ticks=%llu\n", g0_.ring_n,
+           g0_.every, g0_.spin_ticks);
+  }
+
+  size_t gate0_ring_bytes() const {
+    return (size_t)g0_.ring_n * kGate0RingStride * sizeof(unsigned long long);
+  }
+
+  // Number of u64 slots in the ring (0 = instrumentation off).
+  int64_t gate0_ring_len_u64() const {
+    return g0_.ring == nullptr ? 0
+                               : (int64_t)g0_.ring_n * kGate0RingStride;
+  }
+
+  // Synchronous D2H copy of the ring (called from a low-rate dump thread).
+  // Soft-fail on purpose: the harness must never take the engine down.
+  void gate0_stats_copy(void* dst) {
+    if (g0_.ring == nullptr) return;
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e != cudaSuccess) {
+      printf("[gate0-ar] sync failed: %s\n", cudaGetErrorString(e));
+      return;
+    }
+    e = cudaMemcpy(dst, g0_.ring, gate0_ring_bytes(), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+      printf("[gate0-ar] memcpy failed: %s\n", cudaGetErrorString(e));
     }
   }
 
@@ -285,9 +403,9 @@ class CustomAllreduce {
       }
     }
 
-#define KL(ngpus, name)                                                       \
+#define KL(ngpus, name)                                               \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
-                                                 rank_, size);
+                                                 rank_, size, g0_);
 #define REDUCE_CASE(ngpus)                              \
   case ngpus: {                                         \
     if (force_1stage) {                                 \
@@ -349,6 +467,10 @@ class CustomAllreduce {
   ~CustomAllreduce() {
     for (auto [_, ptr] : ipc_handles_) {
       CUDACHECK(cudaIpcCloseMemHandle(ptr));
+    }
+    if (g0_.ring != nullptr) {
+      CUDACHECK(cudaFree(g0_.ring));
+      g0_.ring = nullptr;
     }
   }
 };

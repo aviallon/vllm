@@ -200,3 +200,19 @@ fptr_t open_mem_handle(torch::stable::Tensor& mem_handle) {
 void free_shared_buffer(fptr_t buffer) {
   STD_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(buffer)));
 }
+
+// ---- gate-0 async-AR research harness (research/gate0-async-ar-*) ----
+// Number of u64 slots the timing ring holds (0 = instrumentation off).
+int64_t gate0_ring_len(fptr_t _fa) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  return fa->gate0_ring_len_u64();
+}
+
+// Synchronous D2H copy of the timing ring into a host int64 tensor.
+void gate0_ar_stats(fptr_t _fa, torch::stable::Tensor& out) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  int64_t n = fa->gate0_ring_len_u64();
+  STD_TORCH_CHECK(out.numel() >= n);
+  if (n == 0) return;
+  fa->gate0_stats_copy(out.mutable_data_ptr());
+}

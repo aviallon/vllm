@@ -3198,6 +3198,16 @@ def meta_size() -> int:
     return torch.ops._C_custom_ar.meta_size()
 
 
+def gate0_ring_len(fa: int) -> int:
+    # Gate-0 async-AR research harness: u64 slots of the AR timing ring (0 = off).
+    return torch.ops._C_custom_ar.gate0_ring_len(fa)
+
+
+def gate0_ar_stats(fa: int, out: torch.Tensor) -> None:
+    # Gate-0 async-AR research harness: D2H copy of the AR timing ring.
+    torch.ops._C_custom_ar.gate0_ar_stats(fa, out)
+
+
 def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
 

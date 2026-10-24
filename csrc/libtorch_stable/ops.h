@@ -535,6 +535,8 @@ void mnnvl_multimem_reduce_scatter(fptr_t _fa, torch::stable::Tensor& inp,
                                    int64_t stage_sz_bytes, int64_t block_limit);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t gate0_ring_len(fptr_t _fa);
+void gate0_ar_stats(fptr_t _fa, torch::stable::Tensor& out);
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);
