@@ -72,6 +72,32 @@ _FUSED_ADD_RMS_NORM_OP = torch.ops.vllm_ir.fused_add_rms_norm.default
 NORM_QUANT_OP = torch.ops.vllm.triton_norm_quant_int8.default
 AR_NORM_QUANT_OP = torch.ops.vllm.triton_ar_norm_quant_int8.default
 
+# The megakernel's fused quant+GEMM (campaign megakernel-2026-10-23, pair (a)).
+# Resolved lazily at call time: the ops register with the quantization layer,
+# which may load after this module. Both schemas are 5/6-arg positional
+# (input, weight, [scale_a,] scale_b, out_dtype, bias).
+def _scaled_mm_fused_quant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: Any,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = torch.ops.vllm.triton_scaled_mm_fused_quant.default
+    return op(input, weight, scale_b, out_dtype, bias)
+
+
+def _scaled_mm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: Any,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    op = torch.ops.vllm.triton_scaled_mm.default
+    return op(input, weight, scale_a, scale_b, out_dtype, bias)
+
 
 def _decode_regime(match: pm.Match) -> bool:
     """Decode-only regime gate, resolved at match time (section 3.4).
@@ -170,6 +196,129 @@ class _TritonNormQuantPatternBase(VllmPatternReplacement):
         values = at if isinstance(at, tuple) else (at,)
         normed = values[0]
         return outs["result"], outs["residual"], outs["scale"], normed
+
+
+class ArNormQuantFusedGemmPattern(_TritonNormQuantPatternBase):
+    """``all_reduce -> fused_add_rms_norm -> fused quant+GEMM`` -> 3-way int8 +
+    plain scaled_mm.
+
+    Why this motif exists (research/ar-vol-count-2026-10-25, ETAPE-B1): the
+    megakernel's fused-quant GEMM absorbs the per-token quant *node* that the
+    ``ArNormQuantInt8Pattern`` motif needs, so the 3-way matches ZERO site
+    whenever the fused-quant path is on (``matched_this_run=0`` in prod logs).
+    This motif reaches exactly those sites: the fused quant+GEMM node is the
+    consumer of the normed value, and the rewrite emits
+    ``[3-way: AR+norm+quant int8] -> [scaled_mm with the 3-way's per-token
+    scale]``. The GEMM's amax prologue then disappears (its input is already
+    quantified -- ``fused_quant_eligible`` declines pre-quantized activations),
+    so the two fusions coexist instead of fighting over one node.
+
+    Numeric contract: the 3-way reproduces the executed chain expression by
+    expression (spec ar-rms-quant-v2 §3.2); the GEMM computes the same
+    ``scale_a * scale_b * (A_q @ B_q)`` with the quant produced one stage
+    earlier. ``x_s`` (the fused op's scale output) is answered by the 3-way's
+    own per-token scale -- the same quantity the fused kernel computed.
+    """
+
+    def __init__(self, epsilon: float) -> None:
+        super().__init__(epsilon, AR_NORM_QUANT_OP, "ArNormQuantFusedGemmPattern")
+
+    @property
+    def pattern(self) -> Any:
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            allreduce_output = tensor_model_parallel_all_reduce(input)
+            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                allreduce_output, residual, weight, self.epsilon
+            )
+            gemm_out, x_s = _scaled_mm_fused_quant(
+                rms, w_q, w_s, torch.bfloat16, None
+            )
+            # x_s/rms kept alive: x_s answers the fused op's scale output, rms
+            # the sites whose normed value has OTHER consumers.
+            return gemm_out, x_s, residual_out, rms
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            # The matched node allocates its outputs internally (no alloc
+            # buffers in the motif), so the 3-way's mutable buffers are created
+            # here -- the canonical MatcherQuantInt8 alloc shapes.
+            rows, hidden = input.shape[0], input.shape[1]
+            result_buf = torch.empty(
+                (rows, hidden), dtype=torch.int8, device=input.device
+            )
+            scale_buf = torch.empty(
+                (rows, 1), dtype=torch.float32, device=input.device
+            )
+            result, residual_out, scale, rms = self._replacement_call(
+                result_buf, input, weight, scale_buf, residual
+            )
+            gemm_out = _scaled_mm(
+                result, w_q, scale, w_s, torch.bfloat16, None
+            )
+            return gemm_out, scale, residual_out, rms
+
+        return _replacement
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        # residual, input, weight (fp32 Gemma gamma), w_q (int8), w_s
+        return [
+            self.empty_bf16(5, 16),
+            self.empty_bf16(5, 16),
+            self.empty_fp32(16),
+            self.empty(16, 8, dtype=torch.int8),
+            self.empty_fp32(8, 1),
+        ]
+
+
+class ArNormQuantFusedGemmOutputOnlyPattern(ArNormQuantFusedGemmPattern):
+    """fused-GEMM variant for sites whose residual output is dead."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, x_s, _, rms = inner(residual, input, weight, w_q, w_s)
+            return gemm_out, x_s, rms
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, x_s, _, rms = inner(residual, input, weight, w_q, w_s)
+            return gemm_out, x_s, rms
+
+        return _replacement
 
 
 class ArNormQuantInt8Pattern(_TritonNormQuantPatternBase):
@@ -395,6 +544,12 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
             classes: list[type] = []
             if want_ar and tp2:
                 classes += [
+                    # fused-GEMM motif FIRST: today's graphs carry the quant
+                    # inside the GEMM node (ETAPE-B1), and within one
+                    # PatternMatcherPass patterns keyed at the same output
+                    # nodes are tried in registration order.
+                    ArNormQuantFusedGemmPattern,
+                    ArNormQuantFusedGemmOutputOnlyPattern,
                     ArNormQuantInt8Pattern,
                     ArNormQuantInt8OutputOnlyPattern,
                 ]

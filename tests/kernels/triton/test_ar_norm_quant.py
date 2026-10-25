@@ -572,6 +572,131 @@ class TestPatternWiring:
             for o in fused_ops
         ), f"fused 3-way op absent after rewrite: {fused_ops}"
 
+    def test_ar_fused_gemm_pattern_registers_and_fuses(self):
+        """Increment 1 (research/ar-vol-count-2026-10-25): the motif
+        ``AR -> norm -> fused quant+GEMM`` must rewrite to
+        ``[3-way int8] -> [scaled_mm]`` -- the fused-GEMM node is what today's
+        graphs carry (the megakernel hides the quant node, ETAPE-B1)."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        # force the quantization layer's op registration (fused quant+GEMM)
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmPattern(1e-6)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = PatternMatcherPass(pass_name="test_ar_fused_gemm")
+                    pm.register_replacement(
+                        pr.pattern,
+                        pr.replacement,
+                        pr.get_inputs(),
+                        pm.fwd_only,
+                        pm_pass,
+                        extra_check=pr.extra_check,
+                    )
+                    gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                    pre_ops = {
+                        f.called_op(n)
+                        for n in gm.graph.nodes
+                        if n.op == "call_function"
+                    }
+                    matched = pm_pass.apply(gm.graph)
+                    return gm, matched, pre_ops
+
+                gm, matched, pre_ops = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert f._AR_OP in pre_ops, f"AR node missing: {pre_ops}"
+        assert f._FUSED_ADD_RMS_NORM_OP in pre_ops
+        assert any(
+            o is not None and "triton_scaled_mm_fused_quant" in str(o)
+            for o in pre_ops
+        ), f"fused quant+GEMM node missing from the motif: {pre_ops}"
+        assert matched >= 1, (
+            "fused-GEMM motif did not match its own traced chain "
+            "(extra_check declining, or the quantized-GEMM node form changed?)"
+        )
+        post_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in post_ops
+        ), f"3-way op absent after rewrite: {post_ops}"
+        assert any(
+            o is torch.ops.vllm.triton_scaled_mm.default for o in post_ops
+        ), f"plain scaled_mm absent after rewrite: {post_ops}"
+        assert not any(
+            o is torch.ops.vllm.triton_scaled_mm_fused_quant.default
+            for o in post_ops
+        ), f"fused quant+GEMM survived the rewrite: {post_ops}"
+
+    def test_ar_fused_gemm_output_only_variant(self):
+        """The residual-dead variant of the fused-GEMM motif must match too."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmOutputOnlyPattern(1e-6)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = PatternMatcherPass(
+                        pass_name="test_ar_fused_gemm_outonly"
+                    )
+                    pm.register_replacement(
+                        pr.pattern,
+                        pr.replacement,
+                        pr.get_inputs(),
+                        pm.fwd_only,
+                        pm_pass,
+                        extra_check=pr.extra_check,
+                    )
+                    gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                    matched = pm_pass.apply(gm.graph)
+                    return gm, matched
+
+                gm, matched = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched >= 1, "output-only fused-GEMM variant did not match"
+        post_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in post_ops
+        ), f"3-way op absent after rewrite: {post_ops}"
+
     def test_pass_config_flags_exist(self):
         from vllm.config.compilation import PassConfig
 
