@@ -108,6 +108,12 @@ def _decode_regime(match: pm.Match) -> bool:
     Shapes are static per captured graph, so this is equivalent to a runtime
     gate for the graph replay -- and it is rank-symmetric (TP ranks compile
     the same graphs), which the fused-vs-fallback decision requires.
+
+    Within that bound the *measured* regime is narrower: the AR op takes its
+    fused one-stage kernel at rows <= ``FUSE_MAX_ROWS`` only (ETAPE-B3 row
+    gate, 2026-10-25) and answers with the two-stage chain above, so the
+    rewrite is safe at every shape and no site inherits the c128 kernel
+    regression.
     """
     for node in match.nodes:
         if called_op(node) is _AR_OP:
@@ -134,8 +140,9 @@ def _decode_regime(match: pm.Match) -> bool:
         # compiles backed-dynamic -- one graph serves rows 1..4096 -- and
         # refusing symbolic dims silently cut the reach to 10/68 sites). The
         # per-call bound in get_decision/_norm_gate enforces the regime at
-        # runtime (fused at rows <= comm.rows, the exact-chain fallback above),
-        # so the node is safe at every shape and every decode size fuses.
+        # runtime (fused at rows <= comm.rows and <= FUSE_MAX_ROWS, the
+        # two-stage chain above), so the node is safe at every shape and every
+        # decode size is served.
         if val.dtype != torch.bfloat16:
             return False
         return True
