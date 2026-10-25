@@ -10,6 +10,8 @@ from vllm.triton_utils import tl, triton, use_tensor_descriptor
 from vllm.triton_utils.allocation import set_triton_allocator
 
 _TD_ALLOCATOR_DEVICES: set[torch.device] = set()
+# One-shot activation log (prod branch proof, deployment verification 2026-10-25).
+_SKINNY_N_TILES_LOGGED = [False]
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -403,6 +405,11 @@ def _choose_tile_shape(
             and N <= 32
             and 32 < next_power_of_2_M <= 128
         ):
+            if not _SKINNY_N_TILES_LOGGED[0]:
+                _SKINNY_N_TILES_LOGGED[0] = True
+                logger.info(
+                    "int8 skinny-N tiles ACTIVE (VLLM_ROCM_INT8_SKINNY_N_TILES=1): "
+                    "N=%d M=%d -> tile (16,16,64)", N, M)
             tile = (16, 16, 64)
         return tile
     return fallback

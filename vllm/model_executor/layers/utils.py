@@ -21,6 +21,8 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+# One-shot activation log (prod branch proof, deployment verification 2026-10-25).
+_UNIT_OUTPUT_LOGGED = [False]
 
 
 def get_token_bin_counts_and_mask(
@@ -402,6 +404,12 @@ def rocm_unquantized_gemm_impl(
         and n <= 512
         and x.dtype in [torch.float16, torch.bfloat16]
     ):
+        if not _UNIT_OUTPUT_LOGGED[0]:
+            _UNIT_OUTPUT_LOGGED[0] = True
+            logger.info(
+                "unit-output reduction ACTIVE "
+                "(VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION=1): "
+                "weight [1,%d], n=%d -> fp32 dot reduction", k, n)
         x_view = x.reshape(n, k)
         w_col = weight.reshape(-1).to(torch.float32)
         out = (x_view.to(torch.float32) * w_col).sum(-1, keepdim=True)

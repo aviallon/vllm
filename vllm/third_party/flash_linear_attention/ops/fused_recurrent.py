@@ -11,9 +11,14 @@
 import torch
 
 from vllm import envs
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
 from .op import exp, log
+
+logger = init_logger(__name__)
+# One-shot activation log (prod branch proof, deployment verification 2026-10-25).
+_PACKED_NUM_WARPS_LOGGED = [False]
 
 
 @triton.heuristics(
@@ -458,6 +463,11 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     # -1.7% B=128 where the kernel sits on the HBM ceiling), nw=4 loses (the
     # cross-wave reductions need more sync). Env-overridable for A/B arms.
     num_warps = envs.VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS
+    if not _PACKED_NUM_WARPS_LOGGED[0]:
+        _PACKED_NUM_WARPS_LOGGED[0] = True
+        logger.info(
+            "FLA packed-decode num_warps=%d "
+            "(VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS)", num_warps)
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
