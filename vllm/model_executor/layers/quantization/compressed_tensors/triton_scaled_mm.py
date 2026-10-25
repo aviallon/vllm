@@ -407,7 +407,7 @@ def _choose_tile_shape(
         ):
             if not _SKINNY_N_TILES_LOGGED[0]:
                 _SKINNY_N_TILES_LOGGED[0] = True
-                logger.info(
+                _logger.info(
                     "int8 skinny-N tiles ACTIVE (VLLM_ROCM_INT8_SKINNY_N_TILES=1): "
                     "N=%d M=%d -> tile (16,16,64)", N, M)
             tile = (16, 16, 64)
