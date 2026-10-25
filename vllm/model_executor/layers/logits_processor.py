@@ -8,6 +8,7 @@ from functools import cache
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
@@ -94,6 +95,14 @@ class LogitsProcessor(PluggableLayer):
         # required for RL training-inference consistency.
         model_config = get_current_vllm_config().model_config
         self.head_dtype = model_config.head_dtype if model_config is not None else None
+        # AR count/volume probe (research/ar-vol-count-2026-10-25). Empty =
+        # shipped path (gather per step). "probe_skip_gather" = WALL PROBE
+        # ONLY: the logits all-gather is skipped and the sampler runs on the
+        # local vocab shard, so the sampled tokens are WRONG by construction
+        # (same contract as VLLM_AR_NOSYNC). Measures the ceiling of removing
+        # the NCCL gather + the full-vocab sampler work.
+        self.vol_mode = envs.VLLM_AR_VOL_MODE
+        self._vol_calls = 0
 
     def forward(
         self,
@@ -186,6 +195,20 @@ class LogitsProcessor(PluggableLayer):
     ) -> torch.Tensor | None:
         # Get the logits for the next tokens.
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        self._vol_calls += 1
+        if self.vol_mode == "probe_skip_gather":
+            if self._vol_calls == 1:
+                logger.warning(
+                    "[ar-vol] mode=probe_skip_gather: logits all-gather SKIPPED "
+                    "(wall probe only -- outputs are WRONG by construction)")
+            if self._vol_calls % 32 == 0:
+                logger.info(
+                    "[ar-vol] mode=probe_skip_gather gather_calls=0 skipped=%d",
+                    self._vol_calls)
+            return logits
+        if self._vol_calls == 1:
+            logger.info("[ar-vol] mode=%s: gather per step (shipped path)",
+                        self.vol_mode or "off")
         if skip_gather:
             return logits
 

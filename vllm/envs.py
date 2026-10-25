@@ -325,6 +325,13 @@ if TYPE_CHECKING:
     # barriers (ceiling probe of any async scheme -- outputs wrong, wall only).
     VLLM_AR_WAITB_SPIN: bool = True
     VLLM_AR_NOSYNC: bool = False
+    # AR count/volume reduction probe (research/ar-vol-count-2026-10-25).
+    # Empty = shipped behaviour. "probe_skip_gather" = WALL PROBE ONLY: the
+    # logits all-gather is skipped and the sampler runs on the local vocab
+    # shard, so the sampled tokens are WRONG by construction (like
+    # VLLM_AR_NOSYNC, a ceiling probe -- never a deliverable). It measures
+    # what eliminating the NCCL gather + the full-vocab sampler work is worth.
+    VLLM_AR_VOL_MODE: str = ""
     # Dump interval (s) of the gate-0 timing ring (longer on prod: each dump
     # synchronizes the device once).
     VLLM_AR_SPIN_TEST_DUMP_S: int = 10
@@ -2211,6 +2218,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_AR_NOSYNC": lambda: maybe_convert_bool(
         os.getenv("VLLM_AR_NOSYNC", "0")
     ),
+    "VLLM_AR_VOL_MODE": lambda: os.getenv("VLLM_AR_VOL_MODE", "") or "",
     "VLLM_AR_SPIN_TEST_DUMP_S": lambda: int(
         os.getenv("VLLM_AR_SPIN_TEST_DUMP_S", "10") or 10
     ),
