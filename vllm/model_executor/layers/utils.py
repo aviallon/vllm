@@ -388,11 +388,19 @@ def rocm_unquantized_gemm_impl(
     # wvSplitK path is already fast and the reduction REGRESSED c1 by +10.8%
     # when it replaced it (measured, justai63 pilot). This path only replaces
     # the tgemm/hipBLASLt fallback (n>=5 tokens).
+    #
+    # Bounded to decode-sized batches (n<=512): the fp32 intermediate is
+    # [n, K] and at prefill sizes (thousands of rows) it materialises tens of
+    # MB per call x 40 MoE blocks, while hipBLASLt streams the same GEMM
+    # without it. Only M=32/128 were microbench-measured, and the coherence
+    # runs showed a 2-7x TTFT regression on the package arm (unexplained, this
+    # is the unmeasured window) -- adversarial review bg-105, M6. Prefill stays
+    # on the shipped tgemm/hipBLASLt path until measured.
     if (
         envs.VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION
         and m == 1
+        and n <= 512
         and x.dtype in [torch.float16, torch.bfloat16]
-        and x.numel() == n * k
     ):
         x_view = x.reshape(n, k)
         w_col = weight.reshape(-1).to(torch.float32)
