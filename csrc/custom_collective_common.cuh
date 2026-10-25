@@ -63,6 +63,18 @@ struct Gate0Cfg {
   unsigned int ring_n;
   unsigned long long spin_ticks;  // 0 = no spin
   int every;                      // inject when (call_no % every) == 0; 0 = never
+  // ---- AR retraction gates (research/async-ar-retrait-2026-10-25) ----
+  // Falsifiable RETRAIT probe (B1: an addition law is not invertible -- only a
+  // retraction test decides). Defaults are the SHIPPED behaviour; the arms of
+  // the A/B differ only by these two envs.
+  //   VLLM_AR_WAITB_SPIN=0 : keep the END-flag WRITE of barrier_at_end but
+  //     drop its spin loop (removing the write would deadlock the peer). This
+  //     is the buffer-reuse guard retraction.
+  //   VLLM_AR_NOSYNC=1 : skip BOTH barriers entirely, keep the real reduction
+  //     = ceiling probe of ANY async scheme at the AR site. Outputs are WRONG
+  //     by construction (peer buffers read without a rendez-vous); wall-only.
+  int waitb_spin = 1;  // 1 = spin in barrier_at_end (shipped), 0 = neutralized
+  int nosync = 0;      // 0 = shipped, 1 = no barriers at all (wall probe only)
 };
 
 // Per-call ring layout (one slot per all-reduce call, block 0 / thread 0):
@@ -257,20 +269,24 @@ DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
 // synchronization barrier, we don't need to make any visibility guarantees
 // for prior memory accesses.
 template <int ngpus, bool final_sync = false>
-DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
+DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank,
+                            bool do_spin = true) {
   __syncthreads();
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
     auto peer_counter_ptr = &sg.signals[threadIdx.x]->end[blockIdx.x][rank];
     auto self_counter_ptr = &self_sg->end[blockIdx.x][threadIdx.x];
     // Write the expected counter value to peer and wait for correct value from
-    // peer.
+    // peer. do_spin == false (AR retraction arm) keeps the WRITE -- the peer
+    // still spins on it, dropping it would deadlock the pair -- and only skips
+    // the local wait: the buffer-reuse guard becomes the measured race window
+    // (research/async-ar-retrait-2026-10-25/ETAPE1-analyse.md section 6).
     if constexpr (!final_sync) {
       st_flag_release(peer_counter_ptr, flag);
-      while (ld_flag_acquire(self_counter_ptr) != flag);
+      if (do_spin) while (ld_flag_acquire(self_counter_ptr) != flag);
     } else {
       st_flag_volatile(peer_counter_ptr, flag);
-      while (ld_flag_volatile(self_counter_ptr) != flag);
+      if (do_spin) while (ld_flag_volatile(self_counter_ptr) != flag);
     }
   }
   if constexpr (!final_sync) __syncthreads();
@@ -331,30 +347,35 @@ DINLINE void barrier_at_start_release(const RankSignals& sg, Signal* self_sg,
 }
 
 template <int ngpus, bool final_sync = false>
-DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank) {
+DINLINE void barrier_at_end(const RankSignals& sg, Signal* self_sg, int rank,
+                            bool do_spin = true) {
   __syncthreads();
   uint32_t flag = self_sg->_flag[blockIdx.x] + 1;
   if (threadIdx.x < ngpus) {
     // simultaneously write to the corresponding flag of all ranks.
     // Latency = 1 p2p write
+    // do_spin == false (AR retraction arm): the WRITE always stays (the peer
+    // spins on it), only the local wait is dropped -- see the non-ROCm variant.
 #if defined(__gfx90a__)
     // CDNA2: always use release/acquire + system scope (see barrier_at_start).
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                             flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
-    while (
-        __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                               __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_SYSTEM) < flag);
+    if (do_spin)
+      while (
+          __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                 __ATOMIC_ACQUIRE,
+                                 __MEMORY_SCOPE_SYSTEM) < flag);
 #else
     __scoped_atomic_store_n(&sg.signals[threadIdx.x]->end[blockIdx.x][rank],
                             flag,
                             final_sync ? __ATOMIC_RELAXED : __ATOMIC_RELEASE,
                             __MEMORY_SCOPE_SYSTEM);
     // wait until we got true from all ranks
-    while (
-        __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
-                               final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
-                               __MEMORY_SCOPE_DEVICE) < flag);
+    if (do_spin)
+      while (
+          __scoped_atomic_load_n(&self_sg->end[blockIdx.x][threadIdx.x],
+                                 final_sync ? __ATOMIC_RELAXED : __ATOMIC_ACQUIRE,
+                                 __MEMORY_SCOPE_DEVICE) < flag);
 #endif
   }
   if constexpr (!final_sync) __syncthreads();

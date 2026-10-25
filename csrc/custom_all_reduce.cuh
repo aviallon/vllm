@@ -16,6 +16,22 @@ DINLINE unsigned long long gate0_now() {
 }
 #endif
 
+// Env flag for the research gates: unset -> def; "0"/"false"/"off"/"no"/"" ->
+// 0; anything else -> 1. Mirrors vllm.envs.maybe_convert_bool so a value set
+// from the pod env is never silently misread (std::atoi("true") == 0 would
+// flip a gate by accident).
+static inline int env_flag(const char* name, int def) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) return def;
+  if (v[0] == '\0') return 0;
+  if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
+      std::strcmp(v, "False") == 0 || std::strcmp(v, "off") == 0 ||
+      std::strcmp(v, "no") == 0) {
+    return 0;
+  }
+  return 1;
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1)
     cross_device_reduce_1stage(RankData* _dp, RankSignals sg, Signal* self_sg,
@@ -43,7 +59,14 @@ __global__ void __launch_bounds__(512, 1)
     if (threadIdx.x == 0 && blockIdx.x == 0) g0_t_arr = gate0_now();
   }
 
-  barrier_at_start<ngpus>(sg, self_sg, rank);
+  // ---- AR retraction arms (research/async-ar-retrait-2026-10-25) ----
+  // R1 (waitb_spin=0): barrier_at_end keeps its END-flag WRITE and only drops
+  // the spin (that write is what unblocks the peer).
+  // R2 (nosync=1): BOTH barriers skipped, reduction unchanged = ceiling probe
+  // of any async scheme at this site (outputs WRONG by construction).
+  if (!g0.nosync) {
+    barrier_at_start<ngpus>(sg, self_sg, rank);
+  }
 
   if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) g0_t_synced = gate0_now();
 
@@ -69,7 +92,14 @@ __global__ void __launch_bounds__(512, 1)
   }
   if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) g0_t_pre_end = gate0_now();
 
-  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+  if (!g0.nosync) {
+    barrier_at_end<ngpus, true>(sg, self_sg, rank, g0.waitb_spin != 0);
+  } else if (threadIdx.x == 0) {
+    // R2: the two barriers normally advance the per-block sequence counter by
+    // 2 per call (the gate-0 ring derives call_no from it). Keep that advance
+    // block-locally so the ring keeps counting; no inter-rank traffic.
+    self_sg->_flag[blockIdx.x] += 2;
+  }
 
   if (g0.ring && threadIdx.x == 0 && blockIdx.x == 0) {
     g0_t_exit = gate0_now();
@@ -209,6 +239,15 @@ class CustomAllreduce {
 
   // ---- gate-0 async-AR research harness (see Gate0Cfg) ----
   void gate0_init_from_env() {
+    // ---- AR retraction gates (research/async-ar-retrait-2026-10-25) ----
+    // Read BEFORE the ring early-return: they are armed in every arm (ring on
+    // or off). Defaults = shipped behaviour (WAIT B spins, barriers on).
+    g0_.waitb_spin = env_flag("VLLM_AR_WAITB_SPIN", 1);
+    g0_.nosync = env_flag("VLLM_AR_NOSYNC", 0);
+    // stderr: unbuffered -- the branch proof greps the engine log for this.
+    fprintf(stderr, "[ar-retrait] waitb_spin=%d nosync=%d\n", g0_.waitb_spin,
+            g0_.nosync);
+    fflush(stderr);
     const char* on = std::getenv("VLLM_AR_SPIN_TEST");
     if (on == nullptr || std::atoi(on) == 0) return;
     const char* ticks = std::getenv("VLLM_AR_SPIN_TEST_TICKS");

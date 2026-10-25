@@ -317,6 +317,14 @@ if TYPE_CHECKING:
     VLLM_AR_SPIN_TEST_TICKS: int = 0
     VLLM_AR_SPIN_TEST_EVERY: int = 81
     VLLM_AR_SPIN_TEST_RING: int = 4096
+    # AR retraction gates (research/async-ar-retrait-2026-10-25) -- falsifiable
+    # RETRAIT probe of the custom one-shot all-reduce (csrc/custom_all_reduce.
+    # cuh). Read by the C++ side directly. Defaults = shipped behaviour.
+    # VLLM_AR_WAITB_SPIN=0 keeps the END-flag write of barrier_at_end but drops
+    # its spin (buffer-reuse guard retraction); VLLM_AR_NOSYNC=1 drops BOTH
+    # barriers (ceiling probe of any async scheme -- outputs wrong, wall only).
+    VLLM_AR_WAITB_SPIN: bool = True
+    VLLM_AR_NOSYNC: bool = False
     # Dump interval (s) of the gate-0 timing ring (longer on prod: each dump
     # synchronizes the device once).
     VLLM_AR_SPIN_TEST_DUMP_S: int = 10
@@ -2196,6 +2204,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_AR_SPIN_TEST_RING": lambda: int(
         os.getenv("VLLM_AR_SPIN_TEST_RING", "4096") or 4096
+    ),
+    "VLLM_AR_WAITB_SPIN": lambda: maybe_convert_bool(
+        os.getenv("VLLM_AR_WAITB_SPIN", "1")
+    ),
+    "VLLM_AR_NOSYNC": lambda: maybe_convert_bool(
+        os.getenv("VLLM_AR_NOSYNC", "0")
     ),
     "VLLM_AR_SPIN_TEST_DUMP_S": lambda: int(
         os.getenv("VLLM_AR_SPIN_TEST_DUMP_S", "10") or 10
