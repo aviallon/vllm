@@ -104,6 +104,87 @@ _NUM_WARPS = 8
 
 
 @triton.jit
+def _ar_combined_s(
+    x_ptr,
+    x_scale_ptr,
+    slot_ptr,
+    peer_ptr,
+    slot_scale_ptr,
+    peer_scale_ptr,
+    res_ptr,
+    row,
+    offs,
+    m,
+    stride_x,
+    stride_slot,
+    stride_x_scale,
+    stride_res,
+    SCALE_TILE: tl.constexpr,
+    SCALE_TILES: tl.constexpr,
+    PEER: tl.constexpr,
+    IN8: tl.constexpr,
+):
+    """The AR combination + residual add, shared by the THREE reduction
+    phases of ``_norm_quant_int8_kernel`` -- ONE definition so the phases
+    cannot drift apart (the numeric contract is this expression).
+
+    Returns ``s = fp32(x_f) + fp32(residual)`` per element of ``offs``:
+
+    * no peer: x_f = x (bf16 loaded);
+    * peer, bf16 transport: x_f = bf16(fp32(x_self) + fp32(x_peer)) -- the
+      AR output is rounded HERE (the chain this kernel replaces);
+    * peer, IN8 transport (increment 2b): the int8 contributions are
+      requantized to the composed scale s_out = max(s_self, s_peer) with the
+      two per-token factors, accumulated in INT32 (exact), and dequantized in
+      REGISTERS only (zero HBM dequant) -- see the kernel docstring.
+    """
+    rs = tl.load(res_ptr + row * stride_res + offs, mask=m, other=0.0)
+    if PEER:
+        if IN8:
+            a8 = tl.load(
+                x_ptr + row * stride_x + offs, mask=m, other=0
+            ).to(tl.int32)
+            b8 = tl.load(
+                tl.cast(peer_ptr.to(tl.int64), tl.pointer_type(tl.int8))
+                + row * stride_slot
+                + offs,
+                mask=m,
+                other=0,
+            ).to(tl.int32)
+            s_off = offs // SCALE_TILE
+            s_self = tl.load(
+                x_scale_ptr + row * stride_x_scale + s_off, mask=m, other=0.0
+            )
+            s_peer = tl.load(
+                tl.cast(peer_scale_ptr.to(tl.int64), tl.pointer_type(tl.float32))
+                + row * SCALE_TILES
+                + s_off,
+                mask=m,
+                other=0.0,
+            )
+            s_out = tl.maximum(s_self, s_peer)
+            f_self = tl.where(s_out == 0.0, 0.0, s_self / s_out)
+            f_peer = tl.where(s_out == 0.0, 0.0, s_peer / s_out)
+            acc = _nearbyint(a8.to(tl.float32) * f_self) + _nearbyint(
+                b8.to(tl.float32) * f_peer
+            )
+            xf = acc.to(tl.float32) * s_out
+            return xf + rs.to(tl.float32)
+        a = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
+        b = tl.load(
+            tl.cast(peer_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
+            + row * stride_slot
+            + offs,
+            mask=m,
+            other=0.0,
+        )
+        xf = (a.to(tl.float32) + b.to(tl.float32)).to(tl.bfloat16)
+        return xf.to(tl.float32) + rs.to(tl.float32)
+    xf = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
+    return xf.to(tl.float32) + rs.to(tl.float32)
+
+
+@triton.jit
 def _norm_quant_int8_kernel(
     x_ptr,
     res_ptr,
@@ -125,11 +206,39 @@ def _norm_quant_int8_kernel(
     BLOCK_H: tl.constexpr,
     PEER: tl.constexpr,
     FLAG_STRIDE: tl.constexpr,
+    x_scale_ptr,
+    slot_scale_ptr,
+    peer_scale_ptr,
+    stride_x_scale,
+    SCALE_TILE: tl.constexpr = 0,
+    SCALE_TILES: tl.constexpr = 0,
+    SCALE_BLOCK: tl.constexpr = 0,
+    IN8: tl.constexpr = False,
 ):
     """One program per row; the full row is reduced inside the program.
 
     PEER=1 adds the publish + barrier + peer-sum phases (3-way); PEER=0 takes
     ``x`` itself as ``x_f`` (norm+quant only). Both share one numeric chain.
+
+    IN8=1 (increment 2b, AR int8 natif) is the PEER=1 int8 transport variant:
+    ``x_ptr`` carries the INT8 contribution (the requant-epilogue output) and
+    ``x_scale_ptr`` its per-(row, SCALE_TILE) fp32 scales; the symmetric slot
+    carries the same pair (int8 row at offset 0, scales row in the scale
+    area).  Contract (ETAPE-A 4.3 algebraic validity, named):
+
+        s_out  = max(s_self, s_peer)        # composed scale, per scale element
+        f_i    = s_i / s_out (0 if s_out == 0)   # the two factors per token
+        q_i'   = nearbyint(q_i * f_i)       # requant to the common scale
+        acc    = q_self' + q_peer'          # INT32 accumulation (exact)
+        x_f    = acc * s_out                # dequantized IN REGISTERS only
+        s      = fp32(x_f) + fp32(residual) # residual add in fp32 (unchanged)
+
+    "Zero dequant": the dequantized value never touches HBM (the bf16 path
+    publishes/reads bf16; here the transport is 1 byte/element and the scales
+    travel with it).  The result is exact up to the final requant: each
+    contribution carries at most s_out/2 of requant error (measured by the
+    tests against an fp32 reference).  The norm+quant tail is the SAME
+    expressions as the bf16 mode (lockstep within this kernel).
     """
     row = tl.program_id(0)
 
@@ -144,16 +253,42 @@ def _norm_quant_int8_kernel(
     peer_p = tl.cast(peer_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
     flag_p = tl.cast(flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
     pflag_p = tl.cast(peer_flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
+    # IN8 views of the same symmetric data buffer (int8 rows at offset 0) and
+    # of the scale area (raw addresses, zero when IN8=0).
+    slot_p8 = tl.cast(slot_ptr.to(tl.int64), tl.pointer_type(tl.int8))
+    peer_p8 = tl.cast(peer_ptr.to(tl.int64), tl.pointer_type(tl.int8))
+    slot_s_p = tl.cast(slot_scale_ptr.to(tl.int64), tl.pointer_type(tl.float32))
+    peer_s_p = tl.cast(peer_scale_ptr.to(tl.int64), tl.pointer_type(tl.float32))
 
     # ---- phase 0 (PEER): publish my row, then release my flag, then wait
     # for the peer's flag. Order is load-bearing: data stores strictly before
     # the release xchg (release/acquire pair gives the peer the data).
     if PEER:
-        for base in range(0, H, BLOCK_H):
-            offs = base + tl.arange(0, BLOCK_H)
-            m = offs < H
-            xv = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-            tl.store(slot_p + row * stride_slot + offs, xv, mask=m)
+        if IN8:
+            # int8 contribution + its per-(row, tile) scales, both published
+            # (the scale row lives in the scale area of the symmetric buffer).
+            for base in range(0, H, BLOCK_H):
+                offs = base + tl.arange(0, BLOCK_H)
+                m = offs < H
+                xv = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0)
+                tl.store(slot_p8 + row * stride_slot + offs, xv, mask=m)
+            s_blk = tl.arange(0, SCALE_BLOCK)
+            sv = tl.load(
+                x_scale_ptr + row * stride_x_scale + s_blk,
+                mask=s_blk < SCALE_TILES,
+                other=0.0,
+            )
+            tl.store(
+                slot_s_p + row * SCALE_TILES + s_blk,
+                sv,
+                mask=s_blk < SCALE_TILES,
+            )
+        else:
+            for base in range(0, H, BLOCK_H):
+                offs = base + tl.arange(0, BLOCK_H)
+                m = offs < H
+                xv = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
+                tl.store(slot_p + row * stride_slot + offs, xv, mask=m)
         f_off = row * FLAG_STRIDE
         # sequence derived from MY persistent flag slot, in-kernel (graph-safe)
         cur = tl.atomic_add(flag_p + f_off, 0, sem="acquire", scope="sys")
@@ -180,14 +315,11 @@ def _norm_quant_int8_kernel(
     for base in range(0, H, BLOCK_H):
         offs = base + tl.arange(0, BLOCK_H)
         m = offs < H
-        if PEER:
-            a = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-            b = tl.load(peer_p + row * stride_slot + offs, mask=m, other=0.0)
-            xf = (a.to(tl.float32) + b.to(tl.float32)).to(tl.bfloat16)
-        else:
-            xf = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-        rs = tl.load(res_ptr + row * stride_res + offs, mask=m, other=0.0)
-        s = xf.to(tl.float32) + rs.to(tl.float32)
+        s = _ar_combined_s(
+            x_ptr, x_scale_ptr, slot_ptr, peer_ptr, slot_scale_ptr,
+            peer_scale_ptr, res_ptr, row, offs, m, stride_x, stride_slot,
+            stride_x_scale, stride_res, SCALE_TILE, SCALE_TILES, PEER, IN8,
+        )
         var_acc += tl.sum(s * s)
     # H is a power of two for this model (2048 = 2^11): the division is exact,
     # only the summation order above can differ from the baseline tree.
@@ -199,14 +331,11 @@ def _norm_quant_int8_kernel(
     for base in range(0, H, BLOCK_H):
         offs = base + tl.arange(0, BLOCK_H)
         m = offs < H
-        if PEER:
-            a = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-            b = tl.load(peer_p + row * stride_slot + offs, mask=m, other=0.0)
-            xf = (a.to(tl.float32) + b.to(tl.float32)).to(tl.bfloat16)
-        else:
-            xf = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-        rs = tl.load(res_ptr + row * stride_res + offs, mask=m, other=0.0)
-        s = xf.to(tl.float32) + rs.to(tl.float32)
+        s = _ar_combined_s(
+            x_ptr, x_scale_ptr, slot_ptr, peer_ptr, slot_scale_ptr,
+            peer_scale_ptr, res_ptr, row, offs, m, stride_x, stride_slot,
+            stride_x_scale, stride_res, SCALE_TILE, SCALE_TILES, PEER, IN8,
+        )
         w = tl.load(weight_ptr + offs, mask=m, other=0.0)
         y = (s * rstd) * w.to(tl.float32)
         yb = y.to(tl.bfloat16)
@@ -222,14 +351,11 @@ def _norm_quant_int8_kernel(
     for base in range(0, H, BLOCK_H):
         offs = base + tl.arange(0, BLOCK_H)
         m = offs < H
-        if PEER:
-            a = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-            b = tl.load(peer_p + row * stride_slot + offs, mask=m, other=0.0)
-            xf = (a.to(tl.float32) + b.to(tl.float32)).to(tl.bfloat16)
-        else:
-            xf = tl.load(x_ptr + row * stride_x + offs, mask=m, other=0.0)
-        rs = tl.load(res_ptr + row * stride_res + offs, mask=m, other=0.0)
-        s = xf.to(tl.float32) + rs.to(tl.float32)
+        s = _ar_combined_s(
+            x_ptr, x_scale_ptr, slot_ptr, peer_ptr, slot_scale_ptr,
+            peer_scale_ptr, res_ptr, row, offs, m, stride_x, stride_slot,
+            stride_x_scale, stride_res, SCALE_TILE, SCALE_TILES, PEER, IN8,
+        )
         w = tl.load(weight_ptr + offs, mask=m, other=0.0)
         y = (s * rstd) * w.to(tl.float32)
         yb = y.to(tl.bfloat16)
@@ -291,6 +417,26 @@ class ArNormQuantComm:
         self.flag_stride = FLAG_STRIDE_BYTES // 4  # int32 elements
         # flags start at 0 -> first derived sequence is 1
         _zero_flags(self.flag_ptr, rows * self.flag_stride)
+        # IN8 layout (increment 2b): the symmetric DATA buffer holds int8
+        # contribution rows at byte offset 0 ([rows, hidden] bytes) and the
+        # per-(row, tile) scale rows in the SCALE AREA at byte offset
+        # rows*hidden ([rows, tiles] fp32).  Capacity check: the bf16 sizing
+        # (rows*hidden*2) covers int8 data + scales as long as tiles >= 4
+        # (every GEMM tile is >= 16 wide).
+        self.scale_area_offset = rows * hidden
+        # scale area capacity: tiles <= hidden/16 (the narrowest GEMM tile is
+        # 16 wide) -> rows*hidden/4 bytes, well inside the bf16 sizing.
+        assert rows * hidden + rows * (hidden // 16) * 4 <= data_bytes
+
+    @property
+    def data_scale_ptr(self) -> int:
+        """Byte address of MY scale area inside my symmetric data buffer."""
+        return self.data_ptr + self.scale_area_offset
+
+    @property
+    def peer_data_scale_ptr(self) -> int:
+        """Byte address of the PEER's scale area inside its data buffer."""
+        return self.peer_data_ptr + self.scale_area_offset
 
     @property
     def peer_args(self) -> tuple[int, int, int, int]:
@@ -511,22 +657,45 @@ def _launch(
     normed: torch.Tensor,
     epsilon: float,
     comm: ArNormQuantComm | None,
+    x_scale: torch.Tensor | None = None,
+    scale_tile: int = 0,
 ) -> None:
+    """``x_scale`` (increment 2b) selects the IN8 transport: ``input`` is then
+    the int8 contribution and ``x_scale`` its [rows, tiles] fp32 scales
+    (``scale_tile`` = the producing GEMM's BLOCK_SIZE_N)."""
     rows, hidden = input.shape
     block = min(triton.next_power_of_2(hidden), 2048)
     grid = (rows,)
     assert scale.stride(0) == 1, "scale must be [rows, 1] contiguous"
+    in8 = x_scale is not None
+    if in8:
+        assert comm is not None, "the IN8 transport is one-shot only"
+        assert input.dtype == torch.int8
+        assert x_scale.dtype == torch.float32 and x_scale.is_contiguous()
+        assert x_scale.shape[0] == rows and scale_tile > 0
+        assert (x_scale.shape[1] - 1) * scale_tile < hidden <= x_scale.shape[1] * scale_tile
+        scale_tiles = x_scale.shape[1]
+        scale_block = triton.next_power_of_2(scale_tiles)
+        stride_x_scale = x_scale.stride(0)
+    else:
+        scale_tiles = 0
+        scale_block = 0
+        stride_x_scale = 1
     if comm is None:
         slot_ptr = 0
         peer_ptr = 0
         flag_ptr = 0
         peer_flag_ptr = 0
+        slot_scale_ptr = 0
+        peer_scale_ptr = 0
         flag_stride = FLAG_STRIDE_BYTES // 4
     else:
         slot_ptr = comm.data_ptr
         peer_ptr = comm.peer_data_ptr
         flag_ptr = comm.flag_ptr
         peer_flag_ptr = comm.peer_flag_ptr
+        slot_scale_ptr = comm.data_scale_ptr if in8 else 0
+        peer_scale_ptr = comm.peer_data_scale_ptr if in8 else 0
         flag_stride = comm.flag_stride
     _norm_quant_int8_kernel[grid](
         input,
@@ -549,6 +718,14 @@ def _launch(
         BLOCK_H=block,
         PEER=comm is not None,
         FLAG_STRIDE=flag_stride,
+        x_scale_ptr=x_scale if in8 else 0,
+        slot_scale_ptr=slot_scale_ptr,
+        peer_scale_ptr=peer_scale_ptr,
+        stride_x_scale=stride_x_scale,
+        SCALE_TILE=scale_tile if in8 else 0,
+        SCALE_TILES=scale_tiles,
+        SCALE_BLOCK=scale_block,
+        IN8=in8,
         num_warps=_NUM_WARPS,
     )
 
@@ -751,6 +928,136 @@ direct_register_custom_op(
 
 
 # ---------------------------------------------------------------------------
+# Increment 2b (research/ar-vol-count-2026-10-25, ETAPE-E section 4): the AR
+# INT8 NATIVE path.  Same gate machinery as above (get_decision, collective,
+# per-call bounds, row gate); the TRANSPORT carries int8 contributions + their
+# per-(row, tile) scales (the requant-epilogue output of increment 2a) instead
+# of bf16 values -- half the bytes on the wire and through HBM, int32
+# accumulation of the composed contributions, zero dequantized HBM traffic.
+# ---------------------------------------------------------------------------
+def _contract_ok_in8(
+    result: torch.Tensor,
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    residual: torch.Tensor,
+) -> bool:
+    return (
+        result.dtype == torch.int8
+        and scale.dtype == torch.float32
+        and residual.dtype == torch.bfloat16
+        and x_q.dtype == torch.int8
+        and x_scale.dtype == torch.float32
+        and weight.dtype == torch.float32
+    )
+
+
+def _dequant_contributions(
+    x_q: torch.Tensor, x_scale: torch.Tensor, scale_tile: int
+) -> torch.Tensor:
+    """The IN8 fallback's dequant: per-(row, tile) scales -> bf16 contribution
+    values (the pre-2b transport value).  The fallback chain is then the
+    bf16 chain VERBATIM on the dequantized input -- the EXACT variant (the
+    one-shot pays one requant per contribution instead)."""
+    rows, hidden = x_q.shape
+    idx = torch.arange(hidden, device=x_q.device) // scale_tile
+    v = x_q.to(torch.float32) * x_scale[:, idx]
+    return v.to(torch.bfloat16)
+
+
+def _ar_norm_quant_int8_in_impl(
+    result: torch.Tensor,
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    scale_tile: int,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """AR int8 natif (increment 2b).  Mutates result/scale/residual in place,
+    RETURNS the normed value (same return contract as the bf16 op: the normed
+    value has OTHER consumers at some sites)."""
+    rows, hidden = x_q.shape
+    use, reason, comm = get_decision(rows, hidden)
+    if use and comm is not None and _contract_ok_in8(
+        result, x_q, x_scale, weight, scale, residual
+    ):
+        _log_once(
+            "active_ar_in8",
+            f"triton_ar_norm_quant_int8_in path ACTIVE (one-shot; shape="
+            f"{tuple(x_q.shape)}, scale_tile={scale_tile})",
+        )
+        _log_capture_regime(
+            rows, "fused", "one-stage AR+norm+quant (int8 transport)"
+        )
+        normed = torch.empty(
+            (rows, hidden), dtype=residual.dtype, device=x_q.device
+        )
+        _launch(
+            result,
+            x_q,
+            weight,
+            scale,
+            residual,
+            normed,
+            epsilon,
+            comm,
+            x_scale=x_scale,
+            scale_tile=scale_tile,
+        )
+        return normed
+    if use:
+        reason = "dtype contract (result/scale/residual/weight)"
+    if rows > FUSE_MAX_ROWS:
+        _log_once(
+            "fallback_ar_in8_regime",
+            f"triton_ar_norm_quant_int8_in two-stage chain above the fused "
+            f"regime (one-shot; shape={tuple(x_q.shape)}): {reason}",
+        )
+    else:
+        _log_once(
+            "fallback_ar_in8",
+            f"triton_ar_norm_quant_int8_in two-stage chain (one-shot; "
+            f"shape={tuple(x_q.shape)}): {reason}",
+            "warning",
+        )
+    _log_capture_regime(rows, "two-stage", reason)
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    # the pre-2b semantics, verbatim: dequantized contributions over the
+    # standard all-reduce, then the rank-local norm+quant kernel.
+    reduced = tensor_model_parallel_all_reduce(
+        _dequant_contributions(x_q, x_scale, scale_tile)
+    )
+    return _norm_quant_int8_impl(
+        result, reduced, weight, scale, epsilon, residual
+    )
+
+
+def _ar_norm_quant_int8_in_fake(
+    result: torch.Tensor,
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    scale_tile: int,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    epsilon: float,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(residual)
+
+
+direct_register_custom_op(
+    op_name="triton_ar_norm_quant_int8_in",
+    op_func=_ar_norm_quant_int8_in_impl,
+    mutates_args=["result", "scale", "residual"],
+    fake_impl=_ar_norm_quant_int8_in_fake,
+)
+
+
+# ---------------------------------------------------------------------------
 # reference implementation (tests only): the contract above in plain torch.
 # ---------------------------------------------------------------------------
 def reference_norm_quant_int8(
@@ -778,3 +1085,64 @@ def reference_norm_quant_int8(
     q = torch.round(y_bf16.to(torch.float32) * inv_s)  # half-to-even
     q = q.clamp(-128, 127)
     return q.to(torch.int8), scale, res_out
+
+
+def reference_ar_norm_quant_int8_in(
+    x_q_self: torch.Tensor,
+    s_self: torch.Tensor,
+    x_q_peer: torch.Tensor,
+    s_peer: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+    scale_tile: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The IN8 contract in plain torch (tests only).  Returns
+    ``(quant int8 [M,H], scale fp32 [M,1], res_out bf16 [M,H], x_f fp32)``.
+
+    Mirrors the kernel expression for expression:
+    s_out = max(s_self, s_peer) per (row, tile); q_i' = nearbyint(q_i * s_i /
+    s_out) (half-to-even); acc = q_self' + q_peer' (int32 exact); x_f =
+    acc * s_out (dequantized in registers); then the norm+quant chain of
+    ``reference_norm_quant_int8``.
+    """
+    rows, hidden = x_q_self.shape
+    idx = torch.arange(hidden, device=x_q_self.device) // scale_tile
+    s_self_e = s_self[:, idx].to(torch.float32)
+    s_peer_e = s_peer[:, idx].to(torch.float32)
+    s_out = torch.maximum(s_self_e, s_peer_e)
+    f_self = torch.where(s_out == 0, torch.zeros_like(s_out), s_self_e / s_out)
+    f_peer = torch.where(s_out == 0, torch.zeros_like(s_out), s_peer_e / s_out)
+    a_r = torch.round(x_q_self.to(torch.float32) * f_self)  # half-to-even
+    b_r = torch.round(x_q_peer.to(torch.float32) * f_peer)
+    acc = a_r + b_r
+    x_f = acc * s_out
+    s = x_f + residual.to(torch.float32)
+    res_out = s.to(torch.bfloat16)
+    var = (s * s).mean(dim=-1, keepdim=True)
+    y = (s * torch.rsqrt(var + epsilon)).to(weight.dtype) * weight
+    y_bf16 = y.to(torch.bfloat16)
+    amax = y_bf16.to(torch.float32).abs().amax(dim=-1, keepdim=True)
+    scale = amax / 127.0
+    inv_s = torch.where(amax == 0, torch.zeros_like(amax), 127.0 / amax)
+    q = torch.round(y_bf16.to(torch.float32) * inv_s)  # half-to-even
+    q = q.clamp(-128, 127)
+    return q.to(torch.int8), scale, res_out, x_f
+
+
+def reference_ar_exact_sum(
+    x_q_self: torch.Tensor,
+    s_self: torch.Tensor,
+    x_q_peer: torch.Tensor,
+    s_peer: torch.Tensor,
+    scale_tile: int,
+) -> torch.Tensor:
+    """The fp32-exact combined value (NO requant): x_f = q_self*s_self +
+    q_peer*s_peer.  The IN8 kernel's x_f stays within one composed-scale LSB
+    of this (each contribution pays at most s_out/2)."""
+    rows, hidden = x_q_self.shape
+    idx = torch.arange(hidden, device=x_q_self.device) // scale_tile
+    return (
+        x_q_self.to(torch.float32) * s_self[:, idx].to(torch.float32)
+        + x_q_peer.to(torch.float32) * s_peer[:, idx].to(torch.float32)
+    )
