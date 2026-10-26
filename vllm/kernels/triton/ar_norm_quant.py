@@ -81,6 +81,20 @@ except ImportError:  # pragma: no cover - non-ROCm toolchains
 MAX_ROWS = 256
 """Decode-only regime bound (matches the one-stage custom-AR limit)."""
 
+FUSE_MAX_ROWS = 32
+"""Measured fused-regime row bound (research/ar-vol-count-2026-10-25, ETAPE-B3).
+
+Above this bound the one-stage kernel is SLOWER than the chain it replaces
+(serie M, 2026-10-25, 128 rows: 31.29 vs 27.74 us/call, +2.3% end-to-end at
+c128), so the AR op takes the fused path at rows <= 32 only and answers with
+the TWO-STAGE chain above (all-reduce + the rank-local norm+quant kernel of
+``triton_norm_quant_int8``, same expressions). The decode universe stays
+covered without the eager chain -- whose ~7 extra launches per site are
+themselves a regression (measured cost model 2026-10-22).
+
+``MAX_ROWS`` above is the COMM-BUFFER capacity; this is the PROFITABLE
+regime. Two different facts sharing one kernel."""
+
 FLAG_STRIDE_BYTES = 128
 """Padding between per-row flags (AITER Signal layout: flags must not share a
 cache line -- the 2026-10-22 probe's data-then-flag anomaly tracked a
@@ -308,6 +322,27 @@ def _log_once(key: str, msg: str, level: str = "info") -> None:
     getattr(logger, level)(msg)
 
 
+def _log_capture_regime(rows: int, branch: str, why: str) -> None:
+    """One-shot per capture bucket: which buckets baked the fused kernel and
+    which baked the two-stage chain. Bounded (CUDA-graph capture only, never
+    replay) and falsifiable -- the 128-row bucket must log ``two-stage`` and
+    the 32-row bucket ``fused``. Lesson 2026-10-25: a log line that never
+    executed proves nothing, so the battery asserts this one."""
+    try:
+        capturing = (
+            torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
+    except Exception:  # noqa: BLE001 - no CUDA context: not capturing
+        return
+    if not capturing:
+        return
+    _log_once(
+        f"capture_regime_{branch}_{rows}",
+        f"[ar3way] graph capture rows={rows} -> {branch} ({why})",
+    )
+
+
 def _local_readiness() -> tuple[bool, str, Any]:
     if torch.distributed.get_world_size(group=None) != 2:
         return False, "world_size != 2", None
@@ -364,6 +399,24 @@ def _norm_gate(rows: int) -> tuple[bool, str]:
     return True, "ready"
 
 
+def _per_call_bounds_ok(
+    rows: int, hidden: int, comm: ArNormQuantComm
+) -> tuple[bool, str]:
+    """Per-call shape/regime conditions (rank-symmetric by construction: TP
+    ranks execute the same graphs with the same shapes -- the all-reduce
+    itself requires it). The fused kernel is only launched inside the comm
+    buffer (never out of bounds into local AND peer memory) and inside the
+    MEASURED regime (``FUSE_MAX_ROWS``); above either bound the caller takes
+    the two-stage chain."""
+    if comm.hidden != hidden:
+        return False, f"hidden {hidden} != comm hidden {comm.hidden}"
+    if rows > comm.rows:
+        return False, f"rows {rows} > comm rows {comm.rows}"
+    if rows > FUSE_MAX_ROWS:
+        return False, f"rows {rows} > {FUSE_MAX_ROWS} (measured fused regime)"
+    return True, ""
+
+
 def get_decision(rows: int, hidden: int) -> tuple[bool, str, Any]:
     """The COLLECTIVE activation predicate, decided exactly once.
 
@@ -392,18 +445,9 @@ def get_decision(rows: int, hidden: int) -> tuple[bool, str, Any]:
         if _decision is not None:
             comm = _decision["comm"]
             if comm is not None:
-                if comm.hidden != hidden:
-                    return (
-                        False,
-                        f"hidden {hidden} != comm hidden {comm.hidden}",
-                        None,
-                    )
-                if rows > comm.rows:
-                    return (
-                        False,
-                        f"rows {rows} > comm rows {comm.rows}",
-                        None,
-                    )
+                ok, why = _per_call_bounds_ok(rows, hidden, comm)
+                if not ok:
+                    return (False, why, None)
             return _decision["enabled"], _decision["reason"], comm
         # FIRST CALL (warmup: eager, before any graph capture)
         ready, info, cpu_group = _local_readiness()
@@ -449,18 +493,9 @@ def get_decision(rows: int, hidden: int) -> tuple[bool, str, Any]:
         # page" at engine warmup). Rank-symmetric like every per-call
         # condition (TP ranks execute the same shapes).
         if comm is not None:
-            if comm.hidden != hidden:
-                return (
-                    False,
-                    f"hidden {hidden} != comm hidden {comm.hidden}",
-                    None,
-                )
-            if rows > comm.rows:
-                return (
-                    False,
-                    f"rows {rows} > comm rows {comm.rows}",
-                    None,
-                )
+            ok, why = _per_call_bounds_ok(rows, hidden, comm)
+            if not ok:
+                return (False, why, None)
         return _decision["enabled"], _decision["reason"], comm
 
 
@@ -525,19 +560,22 @@ def _fallback_norm_quant(
     scale: torch.Tensor,
     residual: torch.Tensor,
     epsilon: float,
-    reduced: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """The exact chain this op replaces, executed inside the single node:
-    (all-reduce +) the native fused_add_rms_norm decomposition
-    (vllm/ir/ops/layernorm.py, expression for expression) +
-    ``_C.dynamic_scaled_int8_quant`` into the same buffers. No extra kernels
-    over the unfused graph beyond the chain itself.
+    """The exact chain this op replaces, executed inside the single node: the
+    native fused_add_rms_norm decomposition (vllm/ir/ops/layernorm.py,
+    expression for expression) + ``_C.dynamic_scaled_int8_quant`` into the
+    same buffers. The caller reduces first when the site carries an
+    all-reduce; ``input`` is the already-reduced value. No extra kernels over
+    the unfused graph beyond the chain itself.
 
     Note: the expressions are identical to the baseline chain, but this
     fallback runs EAGER torch while the baseline is inductor-compiled --
     the same class-3 reduction-order caveat (~1e-7) applies between them.
+    This is the PREFILL-scale answer (rows > MAX_ROWS); decode sizes take the
+    two-stage kernel chain (see ``_ar_norm_quant_int8_impl``) precisely because
+    the eager launches above are not free.
     """
-    x_in = input if reduced is None else reduced
+    x_in = input
     orig_dtype = x_in.dtype
     xf = x_in.to(torch.float32)
     s = xf + residual.to(torch.float32)
@@ -638,33 +676,52 @@ def _ar_norm_quant_int8_impl(
 ) -> torch.Tensor:
     rows, hidden = input.shape
     use, reason, comm = get_decision(rows, hidden)
-    if not use or comm is None or not _contract_ok(
+    if use and comm is not None and _contract_ok(
         result, input, weight, scale, residual
     ):
-        if use:
-            reason = "dtype contract (result/scale/residual/weight)"
+        _log_once(
+            "active_ar",
+            f"triton_ar_norm_quant_int8 path ACTIVE (one-shot; shape="
+            f"{tuple(input.shape)})",
+        )
+        _log_capture_regime(rows, "fused", "one-stage AR+norm+quant")
+        normed = torch.empty(
+            (rows, hidden), dtype=input.dtype, device=input.device
+        )
+        _launch(result, input, weight, scale, residual, normed, epsilon, comm)
+        return normed
+    # Out of the fused regime: the measured row gate (rows > FUSE_MAX_ROWS,
+    # ETAPE-B3), a contract miss, or no comm. Take the TWO-STAGE chain -- the
+    # all-reduce plus the rank-local norm+quant op, which owns its own bounds
+    # and falls back to the exact eager chain only at prefill-scale rows. The
+    # eager chain must NOT answer decode-sized calls: its ~7 extra launches
+    # per site (measured cost model 2026-10-22) are themselves a regression,
+    # bigger than the c128 kernel cost this gate exists to avoid.
+    if use:
+        reason = "dtype contract (result/scale/residual/weight)"
+    if rows > FUSE_MAX_ROWS:
+        # expected path for the out-of-regime buckets (c128): info, not a
+        # warning -- and a distinct key so a real in-regime fallback can never
+        # be masked by it.
+        _log_once(
+            "fallback_ar_regime",
+            f"triton_ar_norm_quant_int8 two-stage chain above the fused "
+            f"regime (one-shot; shape={tuple(input.shape)}): {reason}",
+        )
+    else:
         _log_once(
             "fallback_ar",
-            f"triton_ar_norm_quant_int8 falling back to the unfused chain "
-            f"(one-shot): {reason}",
+            f"triton_ar_norm_quant_int8 two-stage chain (one-shot; "
+            f"shape={tuple(input.shape)}): {reason}",
             "warning",
         )
-        from vllm.distributed import tensor_model_parallel_all_reduce
+    _log_capture_regime(rows, "two-stage", reason)
+    from vllm.distributed import tensor_model_parallel_all_reduce
 
-        reduced = tensor_model_parallel_all_reduce(input)
-        return _fallback_norm_quant(
-            result, input, weight, scale, residual, epsilon, reduced=reduced
-        )
-    _log_once(
-        "active_ar",
-        f"triton_ar_norm_quant_int8 path ACTIVE (one-shot; shape="
-        f"{tuple(input.shape)})",
+    reduced = tensor_model_parallel_all_reduce(input)
+    return _norm_quant_int8_impl(
+        result, reduced, weight, scale, epsilon, residual
     )
-    normed = torch.empty(
-        (rows, hidden), dtype=input.dtype, device=input.device
-    )
-    _launch(result, input, weight, scale, residual, normed, epsilon, comm)
-    return normed
 
 
 def _ar_norm_quant_int8_fake(

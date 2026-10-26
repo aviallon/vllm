@@ -572,6 +572,195 @@ class TestPatternWiring:
             for o in fused_ops
         ), f"fused 3-way op absent after rewrite: {fused_ops}"
 
+    def test_ar_fused_gemm_pattern_registers_and_fuses(self):
+        """Increment 1 (research/ar-vol-count-2026-10-25): the motif
+        ``AR -> norm -> fused quant+GEMM`` must rewrite to
+        ``[3-way int8] -> [scaled_mm]`` -- the fused-GEMM node is what today's
+        graphs carry (the megakernel hides the quant node, ETAPE-B1)."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        # force the quantization layer's op registration (fused quant+GEMM)
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmPattern(1e-6)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = PatternMatcherPass(pass_name="test_ar_fused_gemm")
+                    pm.register_replacement(
+                        pr.pattern,
+                        pr.replacement,
+                        pr.get_inputs(),
+                        pm.fwd_only,
+                        pm_pass,
+                        extra_check=pr.extra_check,
+                    )
+                    gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                    pre_ops = {
+                        f.called_op(n)
+                        for n in gm.graph.nodes
+                        if n.op == "call_function"
+                    }
+                    matched = pm_pass.apply(gm.graph)
+                    return gm, matched, pre_ops
+
+                gm, matched, pre_ops = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert f._AR_OP in pre_ops, f"AR node missing: {pre_ops}"
+        assert f._FUSED_ADD_RMS_NORM_OP in pre_ops
+        assert any(
+            o is not None and "triton_scaled_mm_fused_quant" in str(o)
+            for o in pre_ops
+        ), f"fused quant+GEMM node missing from the motif: {pre_ops}"
+        assert matched >= 1, (
+            "fused-GEMM motif did not match its own traced chain "
+            "(extra_check declining, or the quantized-GEMM node form changed?)"
+        )
+        post_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in post_ops
+        ), f"3-way op absent after rewrite: {post_ops}"
+        assert any(
+            o is torch.ops.vllm.triton_scaled_mm.default for o in post_ops
+        ), f"plain scaled_mm absent after rewrite: {post_ops}"
+        assert not any(
+            o is torch.ops.vllm.triton_scaled_mm_fused_quant.default
+            for o in post_ops
+        ), f"fused quant+GEMM survived the rewrite: {post_ops}"
+
+    def test_ar_fused_gemm_output_only_variant(self):
+        """The residual-dead variant of the fused-GEMM motif must match too."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmOutputOnlyPattern(1e-6)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = PatternMatcherPass(
+                        pass_name="test_ar_fused_gemm_outonly"
+                    )
+                    pm.register_replacement(
+                        pr.pattern,
+                        pr.replacement,
+                        pr.get_inputs(),
+                        pm.fwd_only,
+                        pm_pass,
+                        extra_check=pr.extra_check,
+                    )
+                    gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                    matched = pm_pass.apply(gm.graph)
+                    return gm, matched
+
+                gm, matched = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched >= 1, "output-only fused-GEMM variant did not match"
+        post_ops = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        assert any(
+            o is not None and "triton_ar_norm_quant_int8" in str(o)
+            for o in post_ops
+        ), f"3-way op absent after rewrite: {post_ops}"
+
+    def test_ar_fused_gemm_matches_the_real_consumption(self):
+        """REGRESSION TEST (research/ar-vol-count-2026-10-25, 2026-10-26): the
+        motif must match the form the engine REALLY has -- the fused op's
+        ``x_s`` output DEAD (the azp correction never runs on symmetric sites,
+        so ``getitem(op, 1)`` is eliminated). The wiring tests above matched
+        the motif against its OWN trace (which returns ``x_s``) and passed
+        while the real engine matched ZERO sites: a test that mirrors the
+        implementation proves nothing about the consumer's contract."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            def real_consumption(residual, input, weight, w_q, w_s):
+                # scaled_mm/triton.py:apply_weights, verbatim: contiguous +
+                # kwargs + the scale output unused (x_s dead)
+                ar = fake_ar(input)
+                rms, res_out = f.vllm.ir.ops.fused_add_rms_norm(
+                    ar, residual, weight, 1e-6)
+                out, x_s = torch.ops.vllm.triton_scaled_mm_fused_quant(
+                    rms.contiguous(), w_q, scale_b=w_s,
+                    out_dtype=torch.bfloat16, bias=None)
+                return out, res_out, rms
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmScaleDeadPattern(1e-6)
+                    inputs = [
+                        pr.empty_bf16(5, 16),
+                        pr.empty_bf16(5, 16),
+                        pr.empty_fp32(16),
+                        pr.empty(16, 8, dtype=torch.int8),
+                        pr.empty_fp32(8, 1),
+                    ]
+                    gm = pm.fwd_only(real_consumption, inputs)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = pm.PatternMatcherPass(pass_name="test_scale_dead")
+                    pm.register_replacement(
+                        pr.pattern, pr.replacement, pr.get_inputs(),
+                        pm.fwd_only, pm_pass, extra_check=pr.extra_check,
+                    )
+                    torch._inductor.pattern_matcher._seen_patterns.clear()
+                    return pm_pass.apply(gm.graph)
+
+                matched = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched >= 1, (
+            "the x_s-dead real consumption form did not match -- the motif is "
+            "again out of sync with the engine's graph (2026-10-26 class)"
+        )
+
     def test_pass_config_flags_exist(self):
         from vllm.config.compilation import PassConfig
 
@@ -800,5 +989,117 @@ class TestCollectiveDecision:
             # across ranks too, or the peer blocks in an unmatched collective
             assert votes == [0, 0], f"a local 'no' must still vote twice, got {votes}"
             assert enabled is False and comm is None
+        finally:
+            self._reset()
+
+
+class TestFusedRegimeRowGate:
+    """ETAPE-B3 row gate (research/ar-vol-count-2026-10-25, serie M): above
+    FUSE_MAX_ROWS the one-stage kernel inherits a MEASURED regression (+2.3% at
+    c128, 31.29 vs 27.74 us/call at 128 rows) -- and the eager chain must not
+    answer decode sizes either (its ~7 extra launches per site are themselves a
+    regression, cost model 2026-10-22). The two-stage chain (all-reduce + the
+    rank-local norm+quant kernel) is what serves the out-of-regime rows."""
+
+    def _reset(self):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        kk._decision = None
+        kk._logged.clear()
+
+    @staticmethod
+    def _tensors(rows: int, hidden: int = 2048):
+        return (
+            torch.zeros((rows, hidden), dtype=torch.int8),  # result
+            torch.zeros((rows, hidden), dtype=torch.bfloat16),  # input
+            torch.ones((hidden,), dtype=torch.float32),  # weight
+            torch.zeros((rows, 1), dtype=torch.float32),  # scale
+            torch.zeros((rows, hidden), dtype=torch.bfloat16),  # residual
+        )
+
+    def test_row_gate_splits_the_decode_regimes(self):
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+
+        class FakeComm:
+            hidden = 2048
+            rows = kk.MAX_ROWS
+
+        try:
+            kk._decision = {
+                "enabled": True, "reason": "ready", "comm": FakeComm()}
+            # c32 bucket: inside the measured regime -> fused
+            enabled, _, comm = kk.get_decision(kk.FUSE_MAX_ROWS, 2048)
+            assert enabled is True and comm is not None
+            # c128 bucket: outside -> two-stage (the gate must split the two)
+            enabled, reason, comm = kk.get_decision(128, 2048)
+            assert enabled is False and comm is None
+            assert str(kk.FUSE_MAX_ROWS) in reason, reason
+        finally:
+            self._reset()
+
+    def test_two_stage_chain_serves_out_of_regime_decode_rows(
+        self, monkeypatch
+    ):
+        """The branch choice per regime: one-stage fused kernel in-regime,
+        AR + rank-local kernel above the gate, eager chain only at
+        prefill-scale rows."""
+        import vllm.kernels.triton.ar_norm_quant as kk
+
+        self._reset()
+        launches: list = []
+        eager: list = []
+        ar_calls: list = []
+
+        class FakeComm:
+            hidden = 2048
+            rows = kk.MAX_ROWS
+
+        def fake_launch(result, input, weight, scale, residual, normed,
+                        epsilon, comm):
+            launches.append(comm)
+
+        def fake_eager(*args, **kwargs):
+            eager.append(1)
+            return args[1]
+
+        def fake_ar(tensor):
+            ar_calls.append(1)
+            return tensor
+
+        monkeypatch.setattr(kk, "_launch", fake_launch)
+        monkeypatch.setattr(kk, "_fallback_norm_quant", fake_eager)
+        monkeypatch.setattr(
+            "vllm.distributed.tensor_model_parallel_all_reduce", fake_ar
+        )
+        kk._decision = {
+            "enabled": True, "reason": "ready", "comm": FakeComm()}
+        try:
+            # c128 bucket: two-stage = the AR then the rank-local kernel
+            result, inp, weight, scale, res = self._tensors(128)
+            kk._ar_norm_quant_int8_impl(result, inp, weight, scale, 1e-6, res)
+            assert ar_calls == [1], "the two-stage chain must reduce first"
+            assert launches == [None], (
+                f"two-stage must launch with comm=None, got {launches}")
+            assert eager == [], "decode rows must never take the eager chain"
+
+            # prefill-scale rows: the eager chain (outside the kernel regime)
+            result, inp, weight, scale, res = self._tensors(kk.MAX_ROWS + 1)
+            kk._ar_norm_quant_int8_impl(result, inp, weight, scale, 1e-6, res)
+            assert len(eager) == 1, (
+                "prefill-scale rows must take the eager chain")
+            assert launches == [None], (
+                "prefill-scale rows must not launch the kernel")
+            assert ar_calls == [1, 1], (
+                "every out-of-fused-regime call reduces first")
+
+            # in-regime: the one-stage fused kernel, no AR call
+            result, inp, weight, scale, res = self._tensors(8)
+            kk._ar_norm_quant_int8_impl(result, inp, weight, scale, 1e-6, res)
+            assert len(launches) == 2 and isinstance(launches[1], FakeComm), (
+                f"in-regime rows must take the fused kernel, got {launches}")
+            assert ar_calls == [1, 1], (
+                "the fused kernel must absorb the all-reduce")
         finally:
             self._reset()
