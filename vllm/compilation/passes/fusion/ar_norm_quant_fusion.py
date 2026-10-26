@@ -225,6 +225,14 @@ class ArNormQuantFusedGemmPattern(_TritonNormQuantPatternBase):
     ``scale_a * scale_b * (A_q @ B_q)`` with the quant produced one stage
     earlier. ``x_s`` (the fused op's scale output) is answered by the 3-way's
     own per-token scale -- the same quantity the fused kernel computed.
+
+    ⚠ The ``x_s`` output is only part of the motif where the engine keeps it:
+    on symmetric sites the azp correction that reads ``x_s`` never runs
+    (``fused_quant_eligible`` requires ``i_zp is None``), so dead-code
+    elimination removes ``getitem(op, 1)`` from the real graph and a motif
+    referencing it matches NOTHING (measured 2026-10-26 on the I1 arm:
+    ``matched_this_run=0`` with every site present). The ``ScaleDead``
+    variants below cover exactly that -- the common -- form.
     """
 
     def __init__(self, epsilon: float) -> None:
@@ -294,7 +302,6 @@ class ArNormQuantFusedGemmPattern(_TritonNormQuantPatternBase):
 
 class ArNormQuantFusedGemmOutputOnlyPattern(ArNormQuantFusedGemmPattern):
     """fused-GEMM variant for sites whose residual output is dead."""
-
     @property
     def pattern(self) -> Any:
         inner = super().pattern
@@ -324,6 +331,95 @@ class ArNormQuantFusedGemmOutputOnlyPattern(ArNormQuantFusedGemmPattern):
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             gemm_out, x_s, _, rms = inner(residual, input, weight, w_q, w_s)
             return gemm_out, x_s, rms
+
+        return _replacement
+
+
+class ArNormQuantFusedGemmScaleDeadPattern(ArNormQuantFusedGemmPattern):
+    """fused-GEMM variant for the form the engine REALLY has: the fused op's
+    ``x_s`` output is DEAD.
+
+    Measured root cause (2026-10-26, arm I1 of
+    research/ar-vol-count-2026-10-25): on symmetric sites the azp correction
+    that reads ``x_s`` never runs (``fused_quant_eligible`` requires
+    ``i_zp is None``), so dead-code elimination removes ``getitem(op, 1)``
+    from the graph and a motif that references it matches NOTHING -- all 80
+    real sites present, ``matched_this_run=0``. The motif must not ask for a
+    node the graph does not have; the scale is consumed INSIDE the
+    replacement (the bare ``scaled_mm`` reads it) and needs no output.
+    """
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _x_s, residual_out, rms = inner(
+                residual, input, weight, w_q, w_s
+            )
+            return gemm_out, residual_out, rms
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _scale, residual_out, rms = inner(
+                residual, input, weight, w_q, w_s
+            )
+            return gemm_out, residual_out, rms
+
+        return _replacement
+
+
+class ArNormQuantFusedGemmScaleDeadOutputOnlyPattern(
+    ArNormQuantFusedGemmScaleDeadPattern
+):
+    """x_s-dead AND residual-dead variant (the two dead outputs together)."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            gemm_out, _res, rms = inner(residual, input, weight, w_q, w_s)
+            return gemm_out, rms
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            gemm_out, _res, rms = inner(residual, input, weight, w_q, w_s)
+            return gemm_out, rms
 
         return _replacement
 
@@ -554,9 +650,14 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
                     # fused-GEMM motif FIRST: today's graphs carry the quant
                     # inside the GEMM node (ETAPE-B1), and within one
                     # PatternMatcherPass patterns keyed at the same output
-                    # nodes are tried in registration order.
+                    # nodes are tried in registration order. The x_s-alive
+                    # forms come before the ScaleDead ones: they cannot match
+                    # the dead form (a missing getitem has no counterpart) and
+                    # they keep the scale output available where it is alive.
                     ArNormQuantFusedGemmPattern,
                     ArNormQuantFusedGemmOutputOnlyPattern,
+                    ArNormQuantFusedGemmScaleDeadPattern,
+                    ArNormQuantFusedGemmScaleDeadOutputOnlyPattern,
                     ArNormQuantInt8Pattern,
                     ArNormQuantInt8OutputOnlyPattern,
                 ]

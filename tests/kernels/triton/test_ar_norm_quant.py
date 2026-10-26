@@ -697,6 +697,70 @@ class TestPatternWiring:
             for o in post_ops
         ), f"3-way op absent after rewrite: {post_ops}"
 
+    def test_ar_fused_gemm_matches_the_real_consumption(self):
+        """REGRESSION TEST (research/ar-vol-count-2026-10-25, 2026-10-26): the
+        motif must match the form the engine REALLY has -- the fused op's
+        ``x_s`` output DEAD (the azp correction never runs on symmetric sites,
+        so ``getitem(op, 1)`` is eliminated). The wiring tests above matched
+        the motif against its OWN trace (which returns ``x_s``) and passed
+        while the real engine matched ZERO sites: a test that mirrors the
+        implementation proves nothing about the consumer's contract."""
+        _ensure_c_stubs()
+        import torch._inductor.pattern_matcher as pm
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        import vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm  # noqa: F401
+
+        with self._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            def real_consumption(residual, input, weight, w_q, w_s):
+                # scaled_mm/triton.py:apply_weights, verbatim: contiguous +
+                # kwargs + the scale output unused (x_s dead)
+                ar = fake_ar(input)
+                rms, res_out = f.vllm.ir.ops.fused_add_rms_norm(
+                    ar, residual, weight, 1e-6)
+                out, x_s = torch.ops.vllm.triton_scaled_mm_fused_quant(
+                    rms.contiguous(), w_q, scale_b=w_s,
+                    out_dtype=torch.bfloat16, bias=None)
+                return out, res_out, rms
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+            try:
+
+                @enable_fake_mode
+                def _build():
+                    pr = f.ArNormQuantFusedGemmScaleDeadPattern(1e-6)
+                    inputs = [
+                        pr.empty_bf16(5, 16),
+                        pr.empty_bf16(5, 16),
+                        pr.empty_fp32(16),
+                        pr.empty(16, 8, dtype=torch.int8),
+                        pr.empty_fp32(8, 1),
+                    ]
+                    gm = pm.fwd_only(real_consumption, inputs)
+                    pr.extra_check = f._composite_check(pr.quant_op)
+                    pm_pass = pm.PatternMatcherPass(pass_name="test_scale_dead")
+                    pm.register_replacement(
+                        pr.pattern, pr.replacement, pr.get_inputs(),
+                        pm.fwd_only, pm_pass, extra_check=pr.extra_check,
+                    )
+                    torch._inductor.pattern_matcher._seen_patterns.clear()
+                    return pm_pass.apply(gm.graph)
+
+                matched = _build()
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        assert matched >= 1, (
+            "the x_s-dead real consumption form did not match -- the motif is "
+            "again out of sync with the engine's graph (2026-10-26 class)"
+        )
+
     def test_pass_config_flags_exist(self):
         from vllm.config.compilation import PassConfig
 
