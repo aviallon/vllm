@@ -1107,8 +1107,13 @@ def _requant_gate_on() -> bool:
 def _fake_requant_outs(
     M: int, N: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    tile = _choose_tile_shape(M, N, True, (32, 32, 32))
-    n_tiles = triton.cdiv(N, tile[1])
+    # SYMBOLIC-ROWS SAFE (pitfall M9): the scale tile count is invisible at
+    # runtime -- the consumer derives scale_tile from the real x_scale shape
+    # -- so a fixed decode-tile guess is enough for the meta, and NO SymInt
+    # may be compared here (the fusion pass re-executes the replacement with
+    # backed-dynamic shapes; comparing them creates guards and crash-loops the
+    # engine).
+    n_tiles = triton.cdiv(N, 64)
     return (
         torch.empty((M, N), dtype=torch.int8, device=device),
         torch.empty((M, n_tiles), dtype=torch.float32, device=device),

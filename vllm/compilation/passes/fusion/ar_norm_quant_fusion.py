@@ -641,11 +641,30 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
         # patterns are simply not registered there (its flag then matches
         # nothing -- documented, predictable).
         tp2 = get_tensor_model_parallel_world_size() == 2
+        # Increment 2c gate (VLLM_SCALED_MM_REQUANT_OUT): with the gate OFF
+        # the v2 family is NOT registered and every site keeps the bf16
+        # transport (the increment-1 family below = byte-identical shipped
+        # behaviour) -- this is where the designed "repli bf16" lives.
+        from vllm import envs as _envs
+
+        self.requant_wiring = bool(_envs.VLLM_SCALED_MM_REQUANT_OUT)
         for epsilon in (1e-5, 1e-6):
             # 3-way FIRST: within one PatternMatcherPass, patterns keyed at
             # the same output nodes are tried in registration order.
             classes: list[type] = []
             if want_ar and tp2:
+                if self.requant_wiring:
+                    # V2 family FIRST (increment 2c): the requant-epilogue
+                    # GEMM feeds the AR int8 leg.  A site whose producing
+                    # GEMM is a fused-quant node takes the int8 transport;
+                    # every other site falls through to the increment-1
+                    # family below (bf16 transport).
+                    classes += [
+                        ArNormQuantInt8InGemmPattern,
+                        ArNormQuantInt8InGemmOutputOnlyPattern,
+                        ArNormQuantInt8InGemmScaleDeadPattern,
+                        ArNormQuantInt8InGemmScaleDeadOutputOnlyPattern,
+                    ]
                 classes += [
                     # fused-GEMM motif FIRST: today's graphs carry the quant
                     # inside the GEMM node (ETAPE-B1), and within one
@@ -686,3 +705,308 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
         self.matched_count = self.pm_pass.apply(graph)
         logger.debug("Replaced %s patterns", self.matched_count)
         log_pattern_match_summary(self.pm_pass.pass_name, self.matched_count)
+
+
+# ---------------------------------------------------------------------------
+# INCREMENT 2c -- the V2 family (research/ar-vol-count-2026-10-25, ETAPE-E
+# section 4): the requant-epilogue GEMM feeds the AR int8 leg ("câblage des
+# deux ensemble" -- 2a's int8 GEMM output + 2b's AR int8).
+#
+# The motif matches
+#
+#     down  = scaled_mm_fused_quant(x_core, w_down, w_down_s)   # e.g. o_proj /
+#                                                               # down_proj
+#     ar    = all_reduce(down)
+#     rms, res_out = fused_add_rms_norm(ar, residual, weight, eps)
+#     out, x_s = scaled_mm_fused_quant(rms, w_q, w_s)            # next GEMM
+#
+# and rewrites it to
+#
+#     q_d, s_d = scaled_mm_fused_quant_requant(x_core, w_down, w_down_s)
+#         # same GEMM, but the epilogue writes INT8 + per-(row, tile) scales
+#     result, res_out, scale, rms = triton_ar_norm_quant_int8_in(
+#         result_buf, q_d, s_d, weight, scale_buf, eps, residual)
+#         # AR int8 natif: half the transport bytes, int32 accumulation,
+#         # composed scale, then the shared norm+quant -> int8
+#     out = scaled_mm(result, w_q, scale, w_s)                   # bare GEMM
+#
+# GATE + BF16 FALLBACK: registered only when VLLM_SCALED_MM_REQUANT_OUT is
+# on; with the gate off the increment-1 family keeps every site on the bf16
+# transport (byte-identical shipped behaviour).
+#
+# The producing GEMM's ``x_s`` output is only referenced as ``[0]`` (the
+# ScaleDead lesson of the increment-1 family: demanding a dead getitem matches
+# nothing on the real graphs).
+# ---------------------------------------------------------------------------
+def _scaled_mm_fused_quant_requant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: Any,
+    bias: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = torch.ops.vllm.triton_scaled_mm_fused_quant_requant.default
+    return op(input, weight, scale_b, out_dtype, bias)
+
+
+_AR_NORM_QUANT_IN_OP = torch.ops.vllm.triton_ar_norm_quant_int8_in.default
+
+
+class ArNormQuantInt8InGemmPattern(_TritonNormQuantPatternBase):
+    """V2: ``GEMM requant -> all_reduce -> norm -> GEMM quant-fused`` ->
+    ``GEMM requant (int8) -> AR int8 (3-way v2) -> bare scaled_mm``."""
+
+    def __init__(self, epsilon: float) -> None:
+        super().__init__(
+            epsilon, _AR_NORM_QUANT_IN_OP, "ArNormQuantInt8InGemmPattern"
+        )
+
+    def _replacement_call(
+        self,
+        result_buf: torch.Tensor,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight: torch.Tensor,
+        scale_buf: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        at = auto_functionalized(
+            self.quant_op,
+            result=result_buf,
+            x_q=x_q,
+            x_scale=x_scale,
+            weight=weight,
+            scale=scale_buf,
+            epsilon=self.epsilon,
+            residual=residual,
+        )
+        outs = functionalized_mutable_args(self.quant_op, at)
+        values = at if isinstance(at, tuple) else (at,)
+        normed = values[0]
+        return outs["result"], outs["residual"], outs["scale"], normed
+
+    @property
+    def pattern(self) -> Any:
+        def _pattern(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor,
+        ]:
+            down_out = _scaled_mm_fused_quant(
+                x_core, w_down, w_down_s, torch.bfloat16, None
+            )[0]
+            allreduce_output = tensor_model_parallel_all_reduce(down_out)
+            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                allreduce_output, residual, weight, self.epsilon
+            )
+            gemm_out, x_s = _scaled_mm_fused_quant(
+                rms, w_q, w_s, torch.bfloat16, None
+            )
+            # down_out is returned LAST: the rewrite replaces the producing
+            # GEMM's bf16 output with an int8 one, so any OTHER consumer of
+            # that value must be served too (the reconstruction below is DCE'd
+            # when the AR is the only consumer -- the common case).
+            return gemm_out, x_s, residual_out, rms, down_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        def _replacement(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor,
+        ]:
+            q_down, s_down = _scaled_mm_fused_quant_requant(
+                x_core, w_down, w_down_s, torch.bfloat16, None
+            )
+            rows, hidden = residual.shape[0], residual.shape[1]
+            result_buf = torch.empty(
+                (rows, hidden), dtype=torch.int8, device=residual.device
+            )
+            scale_buf = torch.empty(
+                (rows, 1), dtype=torch.float32, device=residual.device
+            )
+            result, residual_out, scale, rms = self._replacement_call(
+                result_buf, q_down, s_down, weight, scale_buf, residual
+            )
+            gemm_out = _scaled_mm(
+                result, w_q, scale, w_s, torch.bfloat16, None
+            )
+            # the producer's bf16 value, reconstructed from the requant pair
+            # for any OTHER consumer (DCE'd when the AR is the only one; the
+            # numeric delta there is the named requantisation)
+            q_rows, q_hidden = q_down.shape[0], q_down.shape[1]
+            s_tiles = s_down.shape[1]
+            s_tile = q_hidden // s_tiles
+            idx = torch.arange(
+                q_hidden, device=q_down.device
+            ) // s_tile
+            down_out = (
+                q_down.to(torch.float32) * s_down[:, idx]
+            ).to(torch.bfloat16)
+            return gemm_out, scale, residual_out, rms, down_out
+
+        return _replacement
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        # residual, x_core, w_down (int8), w_down_s, weight (fp32 Gemma
+        # gamma), w_q (int8), w_s
+        return [
+            self.empty_bf16(5, 16),
+            self.empty_bf16(5, 16),
+            self.empty(16, 16, dtype=torch.int8),
+            self.empty_fp32(16, 1),
+            self.empty_fp32(16),
+            self.empty(16, 8, dtype=torch.int8),
+            self.empty_fp32(8, 1),
+        ]
+
+
+class ArNormQuantInt8InGemmOutputOnlyPattern(ArNormQuantInt8InGemmPattern):
+    """v2 variant for sites whose residual output is dead."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, x_s, _, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, x_s, rms, down_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, x_s, _, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, x_s, rms, down_out
+
+        return _replacement
+
+
+class ArNormQuantInt8InGemmScaleDeadPattern(ArNormQuantInt8InGemmPattern):
+    """v2 variant for the form the engine really has: the downstream GEMM's
+    ``x_s`` output is dead (the ScaleDead lesson, increment 1)."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _x_s, residual_out, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, residual_out, rms, down_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _scale, residual_out, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, residual_out, rms, down_out
+
+        return _replacement
+
+
+class ArNormQuantInt8InGemmScaleDeadOutputOnlyPattern(
+    ArNormQuantInt8InGemmScaleDeadPattern
+):
+    """x_s-dead AND residual-dead v2 variant."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            gemm_out, _res, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, rms, down_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            x_core: torch.Tensor,
+            w_down: torch.Tensor,
+            w_down_s: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _res, rms, down_out = inner(
+                residual, x_core, w_down, w_down_s, weight, w_q, w_s
+            )
+            return gemm_out, rms, down_out
+
+        return _replacement

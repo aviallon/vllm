@@ -55,6 +55,16 @@ _C_STUBS = [
     "rms_norm(Tensor! result, Tensor input, Tensor weight, float epsilon) -> ()",
     "fused_add_rms_norm(Tensor! result, Tensor! residual, Tensor weight, "
     "float epsilon) -> ()",
+    "rms_norm_static_fp8_quant(Tensor! result, Tensor input, Tensor weight, "
+    "Tensor scale, float epsilon, Tensor? scale_ub, Tensor? residual) -> ()",
+    "fused_add_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+    "Tensor weight, Tensor scale, float epsilon, Tensor? scale_ub, "
+    "Tensor? residual) -> ()",
+    "rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
+    "Tensor weight, Tensor! scale, float epsilon, Tensor? scale_ub, "
+    "Tensor? residual) -> ()",
+    "rms_norm_per_block_quant(Tensor! result, Tensor input, Tensor weight, "
+    "Tensor! scale, float epsilon, Tensor? scale_ub, Tensor? residual) -> ()",
 ]
 
 _STUB_LIB = None
@@ -169,7 +179,7 @@ class TestFallbackParity:
         res = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
         w = torch.randn(hidden, device="cuda").to(torch.float32)
 
-        dequant = k._dequant_contributions(x_q, x_s, tile)
+        dequant = k._dequant_contributions(x_q, x_s)
         out2 = torch.empty((rows, hidden), dtype=torch.int8, device="cuda")
         scale2 = torch.empty((rows, 1), dtype=torch.float32, device="cuda")
         res2 = res.clone()
@@ -232,7 +242,7 @@ class TestFallbackParity:
         result = torch.empty((rows, hidden), dtype=torch.int8, device="cuda")
         scale = torch.empty((rows, 1), dtype=torch.float32, device="cuda")
 
-        dequant = k._dequant_contributions(x_q, x_s, tile)
+        dequant = k._dequant_contributions(x_q, x_s)
         q_ref, scale_ref, res_ref = k.reference_norm_quant_int8(
             dequant, res, w, 1e-6
         )
@@ -249,7 +259,7 @@ class TestFallbackParity:
         k._decision = forced
         try:
             res_out = torch.ops.vllm.triton_ar_norm_quant_int8_in(
-                result, x_q, x_s, tile, w, scale, 1e-6, res
+                result, x_q, x_s, w, scale, 1e-6, res
             )
         finally:
             dist_mod.tensor_model_parallel_all_reduce = orig_ar
@@ -292,7 +302,7 @@ def _worker_two_rank(rank, world, port, outq):
     k._decision = {"enabled": True, "reason": "test", "comm": comm}
     try:
         res_out = torch.ops.vllm.triton_ar_norm_quant_int8_in(
-            result, x_q, x_s, tile, w, scale, 1e-6, res
+            result, x_q, x_s, w, scale, 1e-6, res
         )
     finally:
         k._decision = None
@@ -408,3 +418,125 @@ class TestTwoRankInt8Transport:
             assert ((x_f - exact).abs() <= s_out + 1e-9).all(), (
                 f"rank {rank}: composed-scale bound violated"
             )
+
+
+# ---------------------------------------------------------------------------
+# 5. pattern wiring (CPU): the increment-2c V2 motif must trace, register and
+# fuse -- the requant GEMM feeds the AR int8 leg ("câblage des deux ensemble").
+# ---------------------------------------------------------------------------
+class TestPatternWiringV2:
+    @staticmethod
+    def _cfg_ctx():
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.config.device import DeviceConfig
+
+        import vllm.compilation.passes.vllm_inductor_pass as _vip
+
+        if not _vip.DEVICE_TYPE:  # GPU-less dev box: trace on CPU
+            _vip.DEVICE_TYPE = "cpu"
+        return set_current_vllm_config(
+            VllmConfig(device_config=DeviceConfig(device="cpu")),
+            check_compile=False,
+        )
+
+    @staticmethod
+    def _trace_and_apply(pr_cls, epsilon=1e-6):
+        import torch._inductor.pattern_matcher as pm
+        from torch._inductor.pattern_matcher import PatternMatcherPass
+
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+        from vllm.compilation.passes.inductor_pass import enable_fake_mode
+
+        # register the scaled_mm custom ops (the requant ones live there)
+        import vllm.model_executor.layers.quantization.compressed_tensors.  \
+            triton_scaled_mm  # noqa: F401
+
+        with TestPatternWiringV2._cfg_ctx():
+
+            def fake_ar(inp):
+                return torch.ops.vllm.all_reduce(inp, group_name="test-tp2")
+
+            orig = f.tensor_model_parallel_all_reduce
+            f.tensor_model_parallel_all_reduce = fake_ar
+
+            @enable_fake_mode
+            def _build():
+                pr = pr_cls(epsilon)
+                pm_pass = PatternMatcherPass(pass_name="test_ar_v2")
+                pm.register_replacement(
+                    pr.pattern,
+                    pr.replacement,
+                    pr.get_inputs(),
+                    pm.fwd_only,
+                    pm_pass,
+                )
+                gm = pm.fwd_only(pr.pattern, pr.get_inputs())
+                return gm, pm_pass
+
+            try:
+                gm, pm_pass = _build()
+                # apply() re-traces the pattern per match (check_fn ->
+                # fwd_only -> make_fx): the fake AR MUST stay patched through
+                # it, or the real tensor_model_parallel_all_reduce asserts on
+                # an uninitialized TP group (measured 2026-10-26).
+                matched = pm_pass.apply(gm.graph)
+            finally:
+                f.tensor_model_parallel_all_reduce = orig
+        fused = {
+            f.called_op(n) for n in gm.graph.nodes if n.op == "call_function"
+        }
+        return matched, fused
+
+    def test_v2_pattern_traces_and_fuses(self):
+        _ensure_c_stubs()
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+
+        matched, fused = self._trace_and_apply(f.ArNormQuantInt8InGemmPattern)
+        assert matched >= 1, "the v2 pattern did not re-match its own chain"
+        names = {str(o) for o in fused if o is not None}
+        assert any("triton_scaled_mm_fused_quant_requant" in n for n in names), (
+            f"the requant GEMM node is absent after rewrite: {names}"
+        )
+        assert any("triton_ar_norm_quant_int8_in" in n for n in names), (
+            f"the AR-int8 op is absent after rewrite: {names}"
+        )
+        assert any(
+            "triton_scaled_mm.default" in n for n in names
+        ), f"the bare scaled_mm (consumer) is absent: {names}"
+        # the OLD nodes must be GONE (the exact op, not its requant sibling)
+        assert not any(
+            "triton_scaled_mm_fused_quant.default" in n for n in names
+        ), f"an old fused-quant node survived the rewrite: {names}"
+
+    def test_v2_scale_dead_variant_fuses(self):
+        """The form the engine really has (ScaleDead lesson): the downstream
+        GEMM's x_s output is dead."""
+        _ensure_c_stubs()
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+
+        matched, fused = self._trace_and_apply(
+            f.ArNormQuantInt8InGemmScaleDeadPattern
+        )
+        assert matched >= 1, "the ScaleDead v2 variant matched nothing"
+        names = {str(o) for o in fused if o is not None}
+        assert any("triton_scaled_mm_fused_quant_requant" in n for n in names)
+        assert any("triton_ar_norm_quant_int8_in" in n for n in names)
+        assert not any(
+            "triton_scaled_mm_fused_quant.default" in n for n in names
+        ), f"an old fused-quant node survived the rewrite: {names}"
+
+    def test_v2_reconstruction_keeps_the_producer_value(self):
+        """The producer's bf16 output is returned (and reconstructed) so an
+        escaping consumer keeps a value; when the AR is the only consumer the
+        node is dead (DCE removes it later)."""
+        _ensure_c_stubs()
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+
+        matched, fused = self._trace_and_apply(f.ArNormQuantInt8InGemmPattern)
+        names = {str(o) for o in fused if o is not None}
+        # the rewrite ran (see the first test); the reconstruction is torch
+        # arithmetic nodes (mul/cast), so no dedicated op name to look for --
+        # the guard here is that the match succeeded WITH the fifth output,
+        # which is the property under test.
+        assert matched >= 1
+        assert any("triton_ar_norm_quant_int8_in" in n for n in names)

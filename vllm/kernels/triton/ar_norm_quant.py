@@ -954,13 +954,22 @@ def _contract_ok_in8(
 
 
 def _dequant_contributions(
-    x_q: torch.Tensor, x_scale: torch.Tensor, scale_tile: int
+    x_q: torch.Tensor, x_scale: torch.Tensor
 ) -> torch.Tensor:
     """The IN8 fallback's dequant: per-(row, tile) scales -> bf16 contribution
     values (the pre-2b transport value).  The fallback chain is then the
     bf16 chain VERBATIM on the dequantized input -- the EXACT variant (the
-    one-shot pays one requant per contribution instead)."""
+    one-shot pays one requant per contribution instead).
+
+    ``scale_tile`` is DERIVED from the scales' shape (never a baked constant:
+    the fusion wiring passes this op around backed-dynamic shapes and a
+    trace-time constant would be wrong for another capture bucket)."""
     rows, hidden = x_q.shape
+    tiles = x_scale.shape[1]
+    assert hidden % tiles == 0, (
+        f"scale tiles {tiles} must divide hidden {hidden}"
+    )
+    scale_tile = hidden // tiles
     idx = torch.arange(hidden, device=x_q.device) // scale_tile
     v = x_q.to(torch.float32) * x_scale[:, idx]
     return v.to(torch.bfloat16)
@@ -970,7 +979,6 @@ def _ar_norm_quant_int8_in_impl(
     result: torch.Tensor,
     x_q: torch.Tensor,
     x_scale: torch.Tensor,
-    scale_tile: int,
     weight: torch.Tensor,
     scale: torch.Tensor,
     epsilon: float,
@@ -978,8 +986,18 @@ def _ar_norm_quant_int8_in_impl(
 ) -> torch.Tensor:
     """AR int8 natif (increment 2b).  Mutates result/scale/residual in place,
     RETURNS the normed value (same return contract as the bf16 op: the normed
-    value has OTHER consumers at some sites)."""
+    value has OTHER consumers at some sites).
+
+    ``scale_tile`` (the producing GEMM's BLOCK_SIZE_N) is DERIVED from
+    ``x_scale.shape[1]`` at runtime -- never a baked argument: the fusion
+    wiring sees backed-dynamic shapes and a trace-time constant would be
+    wrong for another capture bucket."""
     rows, hidden = x_q.shape
+    tiles = x_scale.shape[1]
+    assert hidden % tiles == 0, (
+        f"scale tiles {tiles} must divide hidden {hidden}"
+    )
+    scale_tile = hidden // tiles
     use, reason, comm = get_decision(rows, hidden)
     if use and comm is not None and _contract_ok_in8(
         result, x_q, x_scale, weight, scale, residual
@@ -1029,7 +1047,7 @@ def _ar_norm_quant_int8_in_impl(
     # the pre-2b semantics, verbatim: dequantized contributions over the
     # standard all-reduce, then the rank-local norm+quant kernel.
     reduced = tensor_model_parallel_all_reduce(
-        _dequant_contributions(x_q, x_scale, scale_tile)
+        _dequant_contributions(x_q, x_scale)
     )
     return _norm_quant_int8_impl(
         result, reduced, weight, scale, epsilon, residual
@@ -1040,7 +1058,6 @@ def _ar_norm_quant_int8_in_fake(
     result: torch.Tensor,
     x_q: torch.Tensor,
     x_scale: torch.Tensor,
-    scale_tile: int,
     weight: torch.Tensor,
     scale: torch.Tensor,
     epsilon: float,
@@ -1095,7 +1112,7 @@ def reference_ar_norm_quant_int8_in(
     residual: torch.Tensor,
     weight: torch.Tensor,
     epsilon: float,
-    scale_tile: int,
+    scale_tile: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The IN8 contract in plain torch (tests only).  Returns
     ``(quant int8 [M,H], scale fp32 [M,1], res_out bf16 [M,H], x_f fp32)``.
@@ -1107,6 +1124,8 @@ def reference_ar_norm_quant_int8_in(
     ``reference_norm_quant_int8``.
     """
     rows, hidden = x_q_self.shape
+    if scale_tile is None:
+        scale_tile = hidden // s_self.shape[1]
     idx = torch.arange(hidden, device=x_q_self.device) // scale_tile
     s_self_e = s_self[:, idx].to(torch.float32)
     s_peer_e = s_peer[:, idx].to(torch.float32)
@@ -1135,12 +1154,14 @@ def reference_ar_exact_sum(
     s_self: torch.Tensor,
     x_q_peer: torch.Tensor,
     s_peer: torch.Tensor,
-    scale_tile: int,
+    scale_tile: int | None = None,
 ) -> torch.Tensor:
     """The fp32-exact combined value (NO requant): x_f = q_self*s_self +
     q_peer*s_peer.  The IN8 kernel's x_f stays within one composed-scale LSB
     of this (each contribution pays at most s_out/2)."""
     rows, hidden = x_q_self.shape
+    if scale_tile is None:
+        scale_tile = hidden // s_self.shape[1]
     idx = torch.arange(hidden, device=x_q_self.device) // scale_tile
     return (
         x_q_self.to(torch.float32) * s_self[:, idx].to(torch.float32)
