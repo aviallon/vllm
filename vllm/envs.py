@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_SCALED_MM_FUSED_QUANT: bool = False
+    VLLM_SCALED_MM_REQUANT_OUT: bool = False
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
     VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS: int = 1
@@ -684,6 +685,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # csrc/quantization/w8a8/int8/scaled_quant.cu, same epilogue order.
     "VLLM_SCALED_MM_FUSED_QUANT": lambda: bool(
         int(os.getenv("VLLM_SCALED_MM_FUSED_QUANT", "0") or 0)
+    ),
+    # Increment 2a (research/ar-vol-count-2026-10-25, ETAPE-E): requant
+    # epilogue on the W8A8 GEMMs -- the GEMM writes its output as INT8 plus
+    # per-(row, output-tile) scales instead of bf16, so the AR leg can
+    # transport int8 (increment 2b/2c).  Default OFF = the shipped bf16
+    # epilogue (byte-identical fallback, both kernels).  The requant math is
+    # the exact dynamic_scaled_int8_quant contract applied to the value the
+    # bf16 chain would have stored (absmax/127, 127/absmax, nearbyint +
+    # saturate); only the absmax REDUCTION DOMAIN is per output tile of the
+    # GEMM grid (a true per-token absmax over N needs a cross-program
+    # reduction, i.e. a grid barrier -- deadlock-prone inside captured
+    # graphs, see the kernel epilogue comment).
+    "VLLM_SCALED_MM_REQUANT_OUT": lambda: bool(
+        int(os.getenv("VLLM_SCALED_MM_REQUANT_OUT", "0") or 0)
     ),
     # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
     # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the

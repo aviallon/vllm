@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import threading
 
 import torch
 
@@ -12,6 +13,66 @@ from vllm.triton_utils.allocation import set_triton_allocator
 _TD_ALLOCATOR_DEVICES: set[torch.device] = set()
 # One-shot activation log (prod branch proof, deployment verification 2026-10-25).
 _SKINNY_N_TILES_LOGGED = [False]
+
+# ---------------------------------------------------------------------------
+# Runtime call counters, 2 classes (increment 2a, ETAPE-E section 3.1 -- the
+# paper census said 110-190 prologue calls per step; R1 says the population is
+# the sites EXECUTED, so N and its regime split are pinned by these counters,
+# never by a paper count).  Class 1 = the in-kernel fused prologue
+# (scaled_mm_fused_quant_kernel, M<=32 regime); class 2 = the shipped chain
+# fallback of the same op (standalone quant kernel + bare scaled_mm, M>32
+# regime -- the c128 mass).  Counted ONE per launch (pid == 0), by an atomic on
+# a persistent device buffer: it counts CUDA-graph REPLAYED launches too,
+# which a host-side counter cannot see.  Read back by the gate0 step flush
+# (zero extra sync: the copy rides the flush's own stream sync, and the flush
+# never runs during graph capture -- see async_utils.gate0_close_step).
+_VOL_COUNT: torch.Tensor | None = None
+_VOL_COUNT_LOCK = threading.Lock()
+_VOL_HOST: torch.Tensor | None = None
+_VOL_PREV = [0, 0]
+_VOL_COUNT_LOGGED = [False]
+
+
+def _vol_count_device_tensor(device: torch.device) -> torch.Tensor:
+    """The persistent int32[2] launch counter (class 1, class 2)."""
+    global _VOL_COUNT
+    with _VOL_COUNT_LOCK:
+        if _VOL_COUNT is None:
+            _VOL_COUNT = torch.zeros(2, dtype=torch.int32, device=device)
+        return _VOL_COUNT
+
+
+def vol_count_enqueue_read() -> torch.Tensor | None:
+    """Queue the counter D2H copy on the CURRENT stream and return the pinned
+    host buffer.  The caller must synchronize the stream before
+    ``vol_count_take``.  Safe during graph capture only if the caller's stream
+    is not being captured (the gate0 flush guarantees this)."""
+    global _VOL_HOST
+    t = _VOL_COUNT
+    if t is None:
+        return None
+    with _VOL_COUNT_LOCK:
+        if _VOL_HOST is None:
+            _VOL_HOST = torch.empty(2, dtype=torch.int32, pin_memory=True)
+        host = _VOL_HOST
+    host.copy_(t, non_blocking=True)
+    return host
+
+
+def vol_count_take(host: torch.Tensor) -> tuple[int, int]:
+    """Deltas since the previous take: (class1_in_kernel, class2_chain)."""
+    cur = [int(host[0]), int(host[1])]
+    out = (cur[0] - _VOL_PREV[0], cur[1] - _VOL_PREV[1])
+    _VOL_PREV[0], _VOL_PREV[1] = cur
+    return out
+
+
+def read_vol_counts() -> tuple[int, int]:
+    """Cumulative (class1, class2) -- blocking read (tests / probes only)."""
+    t = _VOL_COUNT
+    if t is None:
+        return (0, 0)
+    return (int(t[0]), int(t[1]))
 
 
 def is_weak_contiguous(x: torch.Tensor):
@@ -39,6 +100,9 @@ def scaled_mm_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    scale_c_ptr,
+    stats_ptr,
+    stride_scale_c,
     ACCUMULATOR_DTYPE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -47,8 +111,16 @@ def scaled_mm_kernel(
     BLOCK_SIZE_SCALE_B: tl.constexpr,
     USE_TD: tl.constexpr = False,
     B_T: tl.constexpr = False,
+    REQUANT_OUT: tl.constexpr = False,
+    STATS_CLASS: tl.constexpr = 0,
 ):
     pid = tl.program_id(axis=0)
+
+    # One launch = one count (increment 2a census; class 0 = not counted).
+    if STATS_CLASS != 0:
+        if pid == 0:
+            stats_p = tl.cast(stats_ptr.to(tl.int64), tl.pointer_type(tl.int32))
+            tl.atomic_add(stats_p + (STATS_CLASS - 1), 1)
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -155,7 +227,13 @@ def scaled_mm_kernel(
     accumulator = scale_b.T * accumulator.to(tl.float32)
 
     # Convert to output format.
-    c = accumulator.to(c_ptr.type.element_ty)
+    if REQUANT_OUT:
+        # Requant epilogue (increment 2a): the reference value is the one the
+        # bf16 chain would STORE (the accumulator rounded to bf16, then bias --
+        # the same expressions as the shipped branch below).
+        c = accumulator.to(tl.bfloat16)
+    else:
+        c = accumulator.to(c_ptr.type.element_ty)
 
     # Add bias, it's already in output format, so add it after conversion.
     if bias_ptr:
@@ -173,7 +251,46 @@ def scaled_mm_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    tl.store(c_ptrs, c, mask=c_mask)
+    if REQUANT_OUT:
+        # INCREMENT 2a REQUANT EPILOGUE -- KEEP IN LOCKSTEP with
+        # scaled_mm_fused_quant_kernel (bit-exactness contract between the two
+        # epilogues; the tests assert torch.equal between their outputs).
+        #
+        # Quantization is the exact dynamic_scaled_int8_quant contract
+        # (csrc/quantization/w8a8/int8/scaled_quant.cu) applied to the value
+        # the bf16 chain would have stored: scale = absmax/127 (no clamp),
+        # inv_s = 0 if absmax == 0 else 127/absmax, q =
+        # clamp(nearbyint(v*inv_s), -128, 127) (float_to_int8_rn = nearbyint +
+        # saturate).  DEVIATION, named: the absmax reduction domain is THIS
+        # program's output tile (per row x per output-N tile), not the full
+        # output row.  A true per-token absmax over N is a cross-PROGRAM
+        # reduction (the grid tiles N), and the only single-launch way to do
+        # that is a grid-wide barrier (atomic max + spin) -- which deadlocks
+        # whenever the grid exceeds the resident CU count, i.e. exactly inside
+        # the captured decode graphs (trap: graph capture + spin = deadlock).
+        # The consumer contract stays per-token where it matters: the 3-way
+        # kernel (one program per row) composes the per-tile scales and emits
+        # true per-token scales at ITS output.
+        v = c.to(tl.float32)
+        # masked lanes (row >= M, col >= N) must NOT pollute the tile absmax:
+        # masked tl.load without `other` is UNDEFINED there (the same edge
+        # undefinedness the shipped chain has at partial K), and the lockstep
+        # contract requires both kernels to reduce over the SAME domain.
+        v = tl.where(c_mask, v, 0.0)
+        amax = tl.max(tl.abs(v), axis=1)
+        scale_c = amax / 127.0
+        inv_s_c = tl.where(amax == 0.0, 0.0, 127.0 / amax)
+        q_c = tl.extra.hip.libdevice.nearbyint(v * inv_s_c[:, None])
+        q_c = tl.maximum(tl.minimum(q_c, 127.0), -128.0).to(tl.int8)
+        tl.store(c_ptrs, q_c, mask=c_mask)
+        # per-(row, output-tile) scales: scale_c is [M, num_pid_n] row-major.
+        tl.store(
+            scale_c_ptr + offs_cm * stride_scale_c + pid_n,
+            scale_c,
+            mask=offs_cm < M,
+        )
+    else:
+        tl.store(c_ptrs, c, mask=c_mask)
 
 
 @triton.jit
@@ -193,12 +310,17 @@ def scaled_mm_fused_quant_kernel(
     stride_bn,
     stride_cm,
     stride_cn,
+    scale_c_ptr,
+    stats_ptr,
+    stride_scale_c,
     ACCUMULATOR_DTYPE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_SCALE_B: tl.constexpr,
     AMAX_SCAN: tl.constexpr = True,
+    REQUANT_OUT: tl.constexpr = False,
+    STATS_CLASS: tl.constexpr = 1,
 ):
     """W8A8 GEMM with the dynamic per-token int8 quantization of A fused into
     the prologue (megakernel campaign 2026-10-23, pair (a)).
@@ -228,6 +350,13 @@ def scaled_mm_fused_quant_kernel(
     """
 
     pid = tl.program_id(axis=0)
+
+    # One launch = one count (increment 2a census, class 1 = in-kernel
+    # prologue; see the vol-count block at the top of this file).
+    if STATS_CLASS != 0:
+        if pid == 0:
+            stats_p = tl.cast(stats_ptr.to(tl.int64), tl.pointer_type(tl.int32))
+            tl.atomic_add(stats_p + (STATS_CLASS - 1), 1)
 
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
@@ -335,7 +464,13 @@ def scaled_mm_fused_quant_kernel(
     accumulator = scale_b.T * accumulator.to(tl.float32)
 
     # Convert to output format.
-    c = accumulator.to(c_ptr.type.element_ty)
+    if REQUANT_OUT:
+        # Requant epilogue (increment 2a): the reference value is the one the
+        # bf16 chain would STORE (the accumulator rounded to bf16, then bias --
+        # the same expressions as the shipped branch below).
+        c = accumulator.to(tl.bfloat16)
+    else:
+        c = accumulator.to(c_ptr.type.element_ty)
 
     # Add bias, it's already in output format, so add it after conversion.
     if bias_ptr:
@@ -353,7 +488,28 @@ def scaled_mm_fused_quant_kernel(
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    tl.store(c_ptrs, c, mask=c_mask)
+    if REQUANT_OUT:
+        # INCREMENT 2a REQUANT EPILOGUE -- KEEP IN LOCKSTEP with
+        # scaled_mm_kernel (bit-exactness contract between the two epilogues;
+        # the tests assert torch.equal between their outputs).  Same
+        # expressions, same reduction domain note as there (including the
+        # c_mask clamp: masked lanes must not pollute the tile absmax).
+        v = c.to(tl.float32)
+        v = tl.where(c_mask, v, 0.0)
+        amax_out = tl.max(tl.abs(v), axis=1)
+        scale_c = amax_out / 127.0
+        inv_s_c = tl.where(amax_out == 0.0, 0.0, 127.0 / amax_out)
+        q_c = tl.extra.hip.libdevice.nearbyint(v * inv_s_c[:, None])
+        q_c = tl.maximum(tl.minimum(q_c, 127.0), -128.0).to(tl.int8)
+        tl.store(c_ptrs, q_c, mask=c_mask)
+        # per-(row, output-tile) scales: scale_c is [M, num_pid_n] row-major.
+        tl.store(
+            scale_c_ptr + offs_cm * stride_scale_c + pid_n,
+            scale_c,
+            mask=offs_cm < M,
+        )
+    else:
+        tl.store(c_ptrs, c, mask=c_mask)
 
     # Publish the per-row scales — same values the two-kernel chain would
     # have written via dynamic_scaled_int8_quant's scale_out ([M, 1] fp32).
@@ -427,9 +583,19 @@ def _triton_scaled_mm_impl(
     block_size_k: int = 32,
     use_heuristic=True,
     use_td: bool | None = None,
-) -> torch.Tensor:
+    requant_out: bool = False,
+    stats_class: int = 0,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """``requant_out`` (increment 2a): write the output as int8 +
+    per-(row, output-tile) scales instead of ``out_dtype`` (the reference
+    rounding is bf16, what the shipped chain would store -- fail loud on any
+    other out_dtype).  Returns ``(int8 [M, N], scale_c [M, num_n_tiles])``
+    then.  ``stats_class``: 0 = not counted, 2 = the shipped chain of the
+    fused-quant op (see the vol-count block at the top of this file)."""
     M, K = input.shape
     N = weight.shape[1]
+    if requant_out:
+        _log_requant_shape(M, K, N)
 
     assert N > 0 and K > 0 and M > 0
     assert weight.shape[0] == K
@@ -445,12 +611,20 @@ def _triton_scaled_mm_impl(
     assert bias is None or bias.is_floating_point()
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
+    if requant_out:
+        assert out_dtype == torch.bfloat16, (
+            "the requant epilogue rounds its reference value to bf16 (what the "
+            "shipped chain stores); out_dtype must be torch.bfloat16"
+        )
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+    if requant_out:
+        result = torch.empty((M, N), dtype=torch.int8, device=input.device)
+    else:
+        result = torch.empty((M, N), dtype=out_dtype, device=input.device)
 
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
@@ -462,6 +636,15 @@ def _triton_scaled_mm_impl(
 
     block_size_sa = 1 if has_scalar(scale_a) else block_size_m
     block_size_sb = 1 if has_scalar(scale_b) else block_size_n
+
+    if requant_out:
+        n_tiles = triton.cdiv(N, block_size_n)
+        scale_c = torch.empty((M, n_tiles), dtype=torch.float32, device=input.device)
+        stride_scale_c = scale_c.stride(0)
+    else:
+        scale_c = None
+        stride_scale_c = 1
+    stats = _vol_count_device_tensor(input.device) if stats_class else None
 
     accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
 
@@ -502,6 +685,9 @@ def _triton_scaled_mm_impl(
         weight.stride(1),
         result.stride(0),
         result.stride(1),
+        scale_c,
+        stats,
+        stride_scale_c,
         accumulator_dtype,
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=block_size_n,
@@ -510,8 +696,12 @@ def _triton_scaled_mm_impl(
         BLOCK_SIZE_SCALE_B=block_size_sb,
         USE_TD=use_td,
         B_T=b_t,
+        REQUANT_OUT=requant_out,
+        STATS_CLASS=stats_class,
     )
 
+    if requant_out:
+        return result, scale_c
     return result.to(out_dtype)
 
 
@@ -623,6 +813,8 @@ def triton_scaled_mm(
 # runtime inside the custom op so the dims are concrete, but str() costs
 # nothing and keeps the helper safe from either caller.
 _FUSED_QUANT_LOGGED: set[str] = set()
+# Branch proof for the increment-2a requant epilogue (one-shot per shape).
+_REQUANT_LOGGED: set[str] = set()
 
 _logger = logging.getLogger(__name__)
 
@@ -635,6 +827,18 @@ def _log_fused_quant_shape(M: int, K: int, N: int) -> None:
     _logger.info(
         "scaled_mm fused-quant ACTIVE (VLLM_SCALED_MM_FUSED_QUANT=1): "
         "dynamic per-token int8 quant in the GEMM prologue, %s",
+        key,
+    )
+
+
+def _log_requant_shape(M: int, K: int, N: int) -> None:
+    key = f"x({M}, {K})-w({K}, {N})"
+    if key in _REQUANT_LOGGED or len(_REQUANT_LOGGED) >= 128:
+        return
+    _REQUANT_LOGGED.add(key)
+    _logger.info(
+        "requant epilogue ACTIVE (VLLM_SCALED_MM_REQUANT_OUT=1): "
+        "int8 output + per-(row, output-tile) scales, %s",
         key,
     )
 
@@ -661,10 +865,16 @@ def _triton_scaled_mm_fused_quant_impl(
     use_heuristic=True,
     amax_scan: bool = True,
     scale_a_in: torch.Tensor | None = None,
+    requant_out: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """``requant_out`` (increment 2a): return ``(int8 [M, N],
+    scale_c [M, num_n_tiles])`` instead of ``(out_dtype, x_s)`` -- the output
+    is requantized in the epilogue (see the kernel contract)."""
     M, K = input.shape
     N = weight.shape[1]
     _log_fused_quant_shape(M, K, N)
+    if requant_out:
+        _log_requant_shape(M, K, N)
 
     assert N > 0 and K > 0 and M > 0
     assert weight.shape[0] == K
@@ -680,12 +890,20 @@ def _triton_scaled_mm_fused_quant_impl(
     assert bias is None or bias.is_floating_point()
     assert is_weak_contiguous(input)
     assert is_weak_contiguous(weight)
+    if requant_out:
+        assert out_dtype == torch.bfloat16, (
+            "the requant epilogue rounds its reference value to bf16 (what the "
+            "shipped chain stores); out_dtype must be torch.bfloat16"
+        )
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
-    result = torch.empty((M, N), dtype=out_dtype, device=input.device)
+    if requant_out:
+        result = torch.empty((M, N), dtype=torch.int8, device=input.device)
+    else:
+        result = torch.empty((M, N), dtype=out_dtype, device=input.device)
     scale_a_out = torch.empty((M, 1), dtype=torch.float32, device=input.device)
     if not amax_scan:
         # probe/ablation path: the per-row scales come from outside
@@ -700,6 +918,17 @@ def _triton_scaled_mm_fused_quant_impl(
     block_size_m, block_size_n, block_size_k = tile_shape
 
     block_size_sb = 1 if has_scalar(scale_b) else block_size_n
+
+    if requant_out:
+        n_tiles = triton.cdiv(N, block_size_n)
+        scale_c = torch.empty((M, n_tiles), dtype=torch.float32, device=input.device)
+        stride_scale_c = scale_c.stride(0)
+    else:
+        scale_c = None
+        stride_scale_c = 1
+    # Class-1 counter: every fused-prologue call counts (the in-kernel prologue
+    # class of the increment-2a census), independent of the requant gate.
+    stats = _vol_count_device_tensor(input.device)
 
     # int8 x int8 -> int32 accumulation, like the quantized `scaled_mm_kernel`.
     accumulator_dtype = tl.int32
@@ -720,14 +949,20 @@ def _triton_scaled_mm_fused_quant_impl(
         weight.stride(1),
         result.stride(0),
         result.stride(1),
+        scale_c,
+        stats,
+        stride_scale_c,
         accumulator_dtype,
         BLOCK_SIZE_M=block_size_m,
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_SCALE_B=block_size_sb,
         AMAX_SCAN=amax_scan,
+        REQUANT_OUT=requant_out,
     )
 
+    if requant_out:
+        return result, scale_c
     return result.to(out_dtype), scale_a_out
 
 
@@ -754,7 +989,12 @@ def _triton_scaled_mm_fused_quant_op(
         # ASYMMETRIC quantizer and dropped the zero-point (found by the GLM
         # review, 2026-10-23 — wrong prefill outputs, gate ON).
         x_q, x_s, _ = _scaled_int8_quant_chain(input, symmetric=True)
-        out = _triton_scaled_mm_impl(x_q, weight, x_s, scale_b, out_dtype, bias)
+        # stats_class=2: the increment-2a census counts this shipped chain
+        # (standalone quant kernel + bare GEMM) as its own class -- the c128
+        # mass that the requant epilogue is meant to remove (ETAPE-E 1.3).
+        out = _triton_scaled_mm_impl(
+            x_q, weight, x_s, scale_b, out_dtype, bias, stats_class=2
+        )
         return out, x_s
     return _triton_scaled_mm_fused_quant_impl(input, weight, scale_b, out_dtype, bias)
 
@@ -840,4 +1080,159 @@ def triton_scaled_mm_fused_quant(
         "triton_scaled_mm_fused_quant: custom op not registered; "
         "callers must gate on has_triton_scaled_mm_fused_quant_op() "
         "and keep the two-kernel chain"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Increment 2a requant entry points (research/ar-vol-count-2026-10-25,
+# ETAPE-E section 5).  The GEMM writes its output as INT8 plus per-(row,
+# output-tile) fp32 scales instead of bf16 -- the output is already quantized
+# for the next consumer (the AR-int8 leg of increment 2b / the twin consumers
+# of the 3-way's normed value), so the consumer's own quant work disappears.
+#
+# ENV GATE + BF16 FALLBACK: the gate is VLLM_SCALED_MM_REQUANT_OUT (default
+# OFF = shipped bf16 epilogue everywhere).  The fallback lives at NODE
+# SELECTION level -- the fusion wiring (increment 2c) only emits requant nodes
+# when the gate is on; with the gate off the graph keeps the shipped nodes and
+# the bf16 epilogue runs byte-identically.  These ops themselves ALWAYS
+# requant and fail loud if called with the gate off: a silent bf16 answer in a
+# caller expecting int8+scales would be the catastrophic failure mode.
+# ---------------------------------------------------------------------------
+def _requant_gate_on() -> bool:
+    from vllm import envs as _envs
+
+    return bool(_envs.VLLM_SCALED_MM_REQUANT_OUT)
+
+
+def _fake_requant_outs(
+    M: int, N: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    tile = _choose_tile_shape(M, N, True, (32, 32, 32))
+    n_tiles = triton.cdiv(N, tile[1])
+    return (
+        torch.empty((M, N), dtype=torch.int8, device=device),
+        torch.empty((M, n_tiles), dtype=torch.float32, device=device),
+    )
+
+
+def _triton_scaled_mm_requant_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _requant_gate_on():
+        raise RuntimeError(
+            "triton_scaled_mm_requant: VLLM_SCALED_MM_REQUANT_OUT is OFF -- "
+            "the wiring must not emit requant nodes with the gate off"
+        )
+    return _triton_scaled_mm_impl(
+        input, weight, scale_a, scale_b, out_dtype, bias, requant_out=True
+    )
+
+
+def _triton_scaled_mm_requant_op_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fake_requant_outs(input.shape[0], weight.shape[1], input.device)
+
+
+def _triton_scaled_mm_fused_quant_requant_op(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not _requant_gate_on():
+        raise RuntimeError(
+            "triton_scaled_mm_fused_quant_requant: "
+            "VLLM_SCALED_MM_REQUANT_OUT is OFF -- the wiring must not emit "
+            "requant nodes with the gate off"
+        )
+    return _triton_scaled_mm_fused_quant_impl(
+        input, weight, scale_b, out_dtype, bias, requant_out=True
+    )
+
+
+def _triton_scaled_mm_fused_quant_requant_op_fake(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _fake_requant_outs(input.shape[0], weight.shape[1], input.device)
+
+
+try:
+    direct_register_custom_op(
+        op_name="triton_scaled_mm_requant",
+        op_func=_triton_scaled_mm_requant_op,
+        mutates_args=[],
+        fake_impl=_triton_scaled_mm_requant_op_fake,
+    )
+    direct_register_custom_op(
+        op_name="triton_scaled_mm_fused_quant_requant",
+        op_func=_triton_scaled_mm_fused_quant_requant_op,
+        mutates_args=[],
+        fake_impl=_triton_scaled_mm_fused_quant_requant_op_fake,
+    )
+    _HAS_TRITON_SCALED_MM_REQUANT_OP = True
+except Exception:
+    # Registration failure keeps the shipped bf16 path (the wiring checks
+    # this flag and declines the requant nodes, same contract as the
+    # fused-quant op above).
+    _HAS_TRITON_SCALED_MM_REQUANT_OP = False
+
+
+def has_triton_scaled_mm_requant_op() -> bool:
+    return _HAS_TRITON_SCALED_MM_REQUANT_OP
+
+
+def triton_scaled_mm_requant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """W8A8 GEMM with the INCREMENT-2a requant epilogue: returns
+    ``(int8 [M, N], scale_c [M, num_n_tiles] fp32)``.  See
+    ``scaled_mm_kernel``'s epilogue for the numeric contract."""
+    if _HAS_TRITON_SCALED_MM_REQUANT_OP:
+        return torch.ops.vllm.triton_scaled_mm_requant(
+            input, weight, scale_a, scale_b, out_dtype, bias
+        )
+    raise RuntimeError(
+        "triton_scaled_mm_requant: custom op not registered; "
+        "callers must gate on has_triton_scaled_mm_requant_op()"
+    )
+
+
+def triton_scaled_mm_fused_quant_requant(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_b: torch.Tensor,
+    out_dtype: type[torch.dtype],
+    bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused-quant GEMM (per-token int8 quant of A in the prologue) with the
+    INCREMENT-2a requant epilogue: returns ``(int8 [M, N],
+    scale_c [M, num_n_tiles] fp32)``."""
+    if _HAS_TRITON_SCALED_MM_REQUANT_OP:
+        return torch.ops.vllm.triton_scaled_mm_fused_quant_requant(
+            input, weight, scale_b, out_dtype, bias
+        )
+    raise RuntimeError(
+        "triton_scaled_mm_fused_quant_requant: custom op not registered; "
+        "callers must gate on has_triton_scaled_mm_requant_op()"
     )

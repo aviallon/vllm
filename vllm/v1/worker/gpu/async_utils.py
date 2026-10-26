@@ -144,6 +144,19 @@ class StepTimingCollector:
         self._g0_walls = []
         if not timed:
             return
+        # Increment-2a call counters (research/ar-vol-count-2026-10-25,
+        # ETAPE-E 3.1): queue the D2H on the SAME stream so the sync below
+        # covers it (zero extra sync).  This flush never runs during graph
+        # capture (dummy runs skip gate0_close_step), so the copy cannot be
+        # captured nor deadlock a capture.
+        vol_host = None
+        try:
+            from vllm.model_executor.layers.quantization.compressed_tensors.\
+                triton_scaled_mm import vol_count_enqueue_read
+
+            vol_host = vol_count_enqueue_read()
+        except Exception:  # noqa: BLE001 - a missing counter must not break timing
+            vol_host = None
         # Same stream, issue order: once the last is done, so are the rest.
         timed[-1].forward_end.synchronize()
         fwd = [e.forward_start.elapsed_time(e.forward_end) for e in timed]
@@ -162,6 +175,21 @@ class StepTimingCollector:
             wall_p50,
             (p50 / wall_p50) if wall_p50 > 0 else 0.0,
         )
+        if vol_host is not None:
+            try:
+                from vllm.model_executor.layers.quantization.compressed_tensors.\
+                    triton_scaled_mm import vol_count_take
+
+                c1, c2 = vol_count_take(vol_host)
+                # class1 = in-kernel fused prologue calls, class2 = shipped
+                # chain calls (standalone quant kernel) -- launches, so calls
+                # per step = delta / n within this flush window.
+                logger.info(
+                    "[volcount] n=%d class1_in_kernel=%d class2_chain=%d",
+                    len(fwd), c1, c2,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def drafter_start(self) -> None:
         if self._step is not None:
