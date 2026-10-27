@@ -312,6 +312,29 @@ def moe_megakernel_finalize_kernel(
     tl.store(out_ptr + idx, v, mask=mask)
 
 
+@triton.jit
+def moe_megakernel_finalize_int8_kernel(
+    out_acc_ptr, q_ptr, s_ptr, K: tl.constexpr, BLOCK: tl.constexpr,
+):
+    """Requant sortant per-token (contrat `_per_token_quant_int8`) —
+    INTERFACE consommée par le motif v2' megakernel→AR int8 (2b).
+
+    1 programme = 1 rangée (token) : absmax sur K entier (clamp 1e-10),
+    s = absmax/127, q = round(v·127/absmax) (libdevice.round, même
+    rounding que le chemin livré). Échelle par (rangée) = cas particulier
+    de (rangée, tuile) avec une seule tuile (scale_tile = K, dérivé à
+    l'exécution par l'op AR int8).
+    """
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    v = tl.load(out_acc_ptr + pid * K + offs, mask=offs < K, other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(v)), 1e-10)
+    s = amax / 127.0
+    q = _round_i8(v * (127.0 / amax))
+    tl.store(q_ptr + pid * K + offs, q, mask=offs < K)
+    tl.store(s_ptr + pid, s)
+
+
 # ---------------------------------------------------------------------------
 # API python
 # ---------------------------------------------------------------------------
@@ -391,6 +414,28 @@ def moe_megakernel_finalize(
     moe_megakernel_finalize_kernel[grid](out_acc, output, n=n, BLOCK=BLOCK)
 
 
+def moe_megakernel_output_int8(
+    out_acc: torch.Tensor, M: int, K: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sortie INT8 du megakernel (interface v2', gate
+    VLLM_MOE_MEGAKERNEL_INT8_OUT).
+
+    Contrat (documenté REPORT §5.4) :
+      q     : int8 [M, K] contiguous, q[b,k] = round(out[b,k]/s[b])
+      s     : fp32 [M, 1], s[b] = max|out[b,:]|/127 (clamp 1e-10)
+    Rounding et expressions = `_per_token_quant_int8` (chemin livré).
+    """
+    q = torch.empty((M, K), device=out_acc.device, dtype=torch.int8)
+    s = torch.empty((M, 1), device=out_acc.device, dtype=torch.float32)
+    assert K % 1024 == 0, f"K={K} not multiple of finalize BLOCK"
+    moe_megakernel_finalize_int8_kernel[(M,)](out_acc, q, s, K=K, BLOCK=1024)
+    return q, s
+
+
+def moe_megakernel_int8_out_enabled() -> bool:
+    return bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_INT8_OUT", False))
+
+
 def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Contrat `_per_token_quant_int8` (mêmes expressions)."""
     from vllm.model_executor.layers.quantization.utils.int8_utils import (
@@ -459,6 +504,20 @@ def fused_moe_megakernel(
             w2.stride(0), w2.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, NAIVE=naive,
         )
+        if getattr(envs, "VLLM_MOE_MEGAKERNEL_INT8_OUT", False):
+            # variante interface v2' : requant per-token depuis l'acc fp32
+            # (qualité max) au lieu du cast bf16.
+            q_out, s_out = moe_megakernel_output_int8(out_acc, M, K)
+            _log_once(
+                "mk-int8out",
+                "[moe-megakernel] sortie INT8 (interface v2') ACTIVE "
+                "(M=%d K=%d)", M, K,
+            )
+            # la copie vers `output` (bf16) maintient le contrat aval
+            # immédiat ; le motif v2' consommera (q_out, s_out) directement
+            # quand il sera câblé.
+            output.copy_((q_out.float() * s_out).to(output.dtype))
+            return
         moe_megakernel_finalize(out_acc, output)
     else:
         BN2 = 256
