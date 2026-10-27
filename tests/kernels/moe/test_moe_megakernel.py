@@ -302,3 +302,136 @@ def test_fallback_with_gate_on_does_not_raise(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--no-header", "-x"]))
+
+
+# ---------------------------------------------------------------------------
+# INCREMENT 1 (tour 2) — routing in-kernel
+# ---------------------------------------------------------------------------
+def _torch_routing(x_bf16, router_w, top_k, renormalize=True):
+    """Référence du routing livré : logits bf16 -> topk_softmax (le VRAI
+    kernel) — la comparaison d'ids est implicite : des experts différents
+    donneraient une sortie hors tolérance."""
+    from vllm import _custom_ops as ops
+    M = x_bf16.size(0)
+    E = router_w.size(0)
+    logits = (x_bf16.float() @ router_w.float().T)
+    topk_weights = torch.empty(M, top_k, device=x_bf16.device,
+                               dtype=torch.float32)
+    topk_ids = torch.empty(M, top_k, device=x_bf16.device, dtype=torch.int32)
+    tei = torch.empty(M, top_k, device=x_bf16.device, dtype=torch.int32)
+    ops.topk_softmax(topk_weights, topk_ids, tei, logits, renormalize)
+    return topk_weights, topk_ids
+
+
+def _torch_softmax_topk(x_bf16, router_w, top_k):
+    """Mêmes expressions que le prologue du kernel (softmax fp32 + argmax
+    itératif + renormalize) — pour isoler un écart de sélection."""
+    M = x_bf16.size(0)
+    E = router_w.size(0)
+    logits = (x_bf16.float() @ router_w.float().T)
+    p = torch.exp(logits - logits.max(dim=1, keepdim=True).values)
+    p = p / p.sum(dim=1, keepdim=True)
+    ids = torch.zeros(M, top_k, device=x_bf16.device, dtype=torch.int64)
+    wts = torch.zeros(M, top_k, device=x_bf16.device)
+    pwork = p.clone()
+    for s in range(top_k):
+        e = pwork.argmax(dim=1)
+        ids[:, s] = e
+        wts[:, s] = p.gather(1, e[:, None])[:, 0]
+        pwork.scatter_(1, e[:, None], -1.0)
+    wts = wts / wts.sum(dim=1, keepdim=True)
+    return wts, ids.to(torch.int32)
+
+
+@pytest.mark.parametrize("M,top_k,E,I,K", [
+    (1, 8, 256, 256, 2048),   # c1 réel TP=2
+    (4, 8, 64, 64, 512),
+])
+def test_increment1_routing_vs_shipped(M, top_k, E, I, K):
+    """Incrément 1 : le kernel calcule router+topk lui-même.
+
+    Deux contrats vérifiés séparément (pour ne pas confondre un basculement
+    de frontière topk avec une erreur du travail d'expert) :
+    1. ROUTING : la sélection du kernel == topk_softmax du livré, sauf
+       frontières d'égalité (marge 8e/9e faible — documentée) ;
+    2. TRAVAIL D'EXPERT : la sortie ≈ la chaîne de référence construite avec
+       la sélection DU KERNEL (tolérance serrée)."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+
+    x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
+    router_w = torch.randn(E, K, device=x.device,
+                           dtype=torch.bfloat16) * 0.02
+
+    r_wts, r_ids = _torch_routing(x, router_w, top_k)
+
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    dbg_ids = torch.zeros(M, top_k, device=x.device, dtype=torch.int32)
+    dbg_w = torch.zeros(M, top_k, device=x.device)
+    fused_moe_megakernel(
+        out, x, w1, w2, None, None, None, w1s, w2s,
+        naive=True, cache3=None, router_w=router_w, top_k_override=top_k,
+        dbg_ids=dbg_ids, dbg_w=dbg_w,
+    )
+    torch.cuda.synchronize()
+
+    # 1. contrat ROUTING (ids), marge de frontière tolérée
+    logits = x.float() @ router_w.float().T
+    srt = logits.sort(dim=1, descending=True).values
+    margin = srt[:, top_k - 1] - srt[:, top_k]
+    ids_match = (dbg_ids.to(torch.int64) == r_ids.to(torch.int64)).all(dim=1)
+    for t in range(M):
+        if not bool(ids_match[t]):
+            assert float(margin[t]) < 1e-2, (
+                f"topk flip hors frontière (marge {float(margin[t]):.4f}): "
+                f"kernel={dbg_ids[t].tolist()} ref={r_ids[t].tolist()}")
+    # poids du kernel ≈ poids livrés (même sélection)
+    w_err = float((dbg_w - r_wts).abs().max() / r_wts.abs().max())
+    assert w_err < 2e-2, f"poids topk kernel err={w_err:.4f}"
+
+    # 2. contrat TRAVAIL D'EXPERT : référence avec la sélection DU KERNEL
+    ref = reference_chain(x, w1, w2, w1s, w2s, dbg_ids, dbg_w, naive=True)
+    err = _rel_err(out, ref)
+    assert err < 0.03, f"expert-work rel_err={err:.4f}"
+    assert ref.abs().max() > 0
+
+
+def test_increment1_topk_math_matches():
+    """Le softmax+argmax du prologue reproduit les poids de topk_softmax."""
+    M, top_k, E, K = 8, 8, 64, 256
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    router_w = torch.randn(E, K, device="cuda", dtype=torch.bfloat16) * 0.02
+    w_a, i_a = _torch_routing(x, router_w, top_k)
+    w_b, i_b = _torch_softmax_topk(x, router_w, top_k)
+    # ids identiques (pas de tirage au sort dans les données)
+    assert (i_a.to(torch.int64) == i_b).all(), (
+        f"topk ids divergent: {i_a} vs {i_b}")
+    assert (w_a - w_b).abs().max() < 2e-3, "poids topk divergents"
+
+
+def test_increment1_fallbacks():
+    """Inéligibilités du mode routing : grouped, x int8, router absent."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+    M, top_k, E, I, K = 8, 8, 8, 32, 256   # grouped (M*topk*4 > E)
+    x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
+    router_w = torch.randn(E, K, device=x.device, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError):
+        fused_moe_megakernel(
+            torch.zeros(M, K, device=x.device, dtype=torch.bfloat16),
+            x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=False, router_w=router_w, top_k_override=top_k,
+        )
+    # router absent
+    M2 = 2
+    x2, w12, w22, w1s2, w2s2, ids2, wts2 = make_problem(M2, top_k, 256, I, K)
+    with pytest.raises(AssertionError):
+        fused_moe_megakernel(
+            torch.zeros(M2, K, device=x2.device, dtype=torch.bfloat16),
+            x2, w12, w22, wts2, ids2, None, w1s2, w2s2,
+            naive=True, router_w=None, top_k_override=top_k,
+        )

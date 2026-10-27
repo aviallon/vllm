@@ -209,6 +209,66 @@ def qwen3_moe_pair_fusion_kernel(
 # stratégie `atomic` (v2) — pipeline entier + somme pondérée atomique
 # ---------------------------------------------------------------------------
 @triton.jit
+def _expert_chunk_work(
+    x_rows, valid, inv_amax, sx_rows,
+    w1_ptr, w1_scale_ptr, w2_ptr, w2_scale_ptr,
+    out_acc_ptr, tokens,
+    e64, w_s,
+    stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
+    offs_i, offs_k, offs_o,
+    top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
+    BM: tl.constexpr, BKO: tl.constexpr, CI: tl.constexpr,
+    X_IS_INT8: tl.constexpr = False,
+):
+    """Travail d'expert : gemm1(chunk) -> silu -> quant (rangée,chunk) ->
+    gemm2 -> contribution pondérée atomique.  Intermédiaires en registres.
+
+    Double contrat d'entrée :
+    * X_IS_INT8=True  : x int8 déjà quantifié (chemin tour 1), déquant par
+      `sx_rows` (per-token) ;
+    * X_IS_INT8=False : x bf16 (ROUTING) re-quantifié à la volée — contrat
+      `_per_token_quant_int8` via `inv_amax` = 127/absmax du prologue.
+    """
+    acc_g = tl.zeros((BM, CI), dtype=tl.float32)
+    acc_u = tl.zeros((BM, CI), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BKO)):
+        xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
+                     mask=valid[:, None], other=0)
+        if X_IS_INT8:
+            xq = xk
+        else:
+            xq = _round_i8(xk.to(tl.float32) * inv_amax[:, None])
+        wg = tl.load(w1_ptr + e64 * stride_w1e
+                     + offs_i[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        wu = tl.load(w1_ptr + e64 * stride_w1e
+                     + (I + offs_i)[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        acc_g += tl.dot(xq, wg)
+        acc_u += tl.dot(xq, wu)
+
+    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
+    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + offs_i)
+    acc_g = acc_g * s1g * sx_rows[:, None]
+    acc_u = acc_u * s1u * sx_rows[:, None]
+
+    mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
+    amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
+    sc = amax / 127.0
+    q = _round_i8(mid * (127.0 / amax)[:, None])
+
+    w2t = tl.load(w2_ptr + e64 * stride_w2e
+                  + offs_i[:, None]
+                  + offs_o[None, :] * stride_w2k)
+    acc2 = tl.zeros((BM, K), dtype=tl.float32) + tl.dot(q, w2t)
+    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o)
+    contrib = acc2 * (sc * w_s)[:, None] * s2[None, :]
+    tl.atomic_add(out_acc_ptr + tokens.to(tl.int64)[:, None] * K
+                  + offs_o[None, :], contrib, mask=valid[:, None],
+                  sem="relaxed", scope="gpu")
+
+
+@triton.jit
 def qwen3_moe_megakernel(
     x_ptr,
     x_scale_ptr,
@@ -222,6 +282,9 @@ def qwen3_moe_megakernel(
     expert_ids_ptr,
     out_acc_ptr,     # [M, K] fp32 pré-zérodé (accumulation atomique)
     num_valid,
+    router_w_ptr,    # [E, K] bf16 (poids du router, K contiguous) — ROUTING
+    dbg_ids_ptr,     # [M, top_k] int32 — sélection topk (contrat routing)
+    dbg_w_ptr,       # [M, top_k] fp32
     stride_xm,
     stride_w1e,
     stride_w1n,
@@ -234,8 +297,12 @@ def qwen3_moe_megakernel(
     BKO: tl.constexpr,
     CI: tl.constexpr,
     NAIVE: tl.constexpr,
+    ROUTING: tl.constexpr = False,
+    RENORM: tl.constexpr = True,
+    E: tl.constexpr = 256,
 ):
-    """1 CTA = (bloc de paires, chunk intermédiaire).
+    """1 CTA = (bloc de paires, chunk intermédiaire) — ou (token, chunk)
+    avec ROUTING (incrément tour 2 : router+topk absorbés).
 
     Même pipeline que la stratégie `pair` mais le CTA ne couvre que `CI`
     colonnes intermédiaires (quant par (rangée, chunk) — écart nommé 2) et
@@ -246,68 +313,110 @@ def qwen3_moe_megakernel(
     pid = tl.program_id(0)
     chunk = tl.program_id(1)
 
-    offs_pair = pid * BM + tl.arange(0, BM)
-    if NAIVE:
-        # 1 paire valide (ligne 0) + lignes PAD masquées : les dots restent
-        # [BM, ...] = MFMA, comme le kernel livré (BLOCK_M=16 avec 1 rangée
-        # valide) — BM=1 tombait en v_dot4 (mesuré : 6-19x plus lent).
-        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
-    else:
-        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
-    valid = pairs < num_valid
-    pairs_i64 = pairs.to(tl.int64)
-
-    tokens = pairs // top_k
-    wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
-    # un seul expert par CTA-bloc, indexé par le pid (les lignes pad sont
-    # masquées) — en naive le launcher passe topk_ids.view(-1) comme
-    # expert_ids, exactement le contrat du kernel livré.
-    e = tl.load(expert_ids_ptr + pid)
-    e64 = e.to(tl.int64)
-
     offs_i = chunk * CI + tl.arange(0, CI)
     offs_k = tl.arange(0, BKO)
     offs_o = tl.arange(0, K)
 
-    acc_g = tl.zeros((BM, CI), dtype=tl.float32)
-    acc_u = tl.zeros((BM, CI), dtype=tl.float32)
-    x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
-    for k in range(0, tl.cdiv(K, BKO)):
-        x = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
-                    mask=valid[:, None], other=0)
-        wg = tl.load(w1_ptr + e64 * stride_w1e
-                     + offs_i[None, :] * stride_w1n
-                     + (k * BKO + offs_k)[:, None])
-        wu = tl.load(w1_ptr + e64 * stride_w1e
-                     + (I + offs_i)[None, :] * stride_w1n
-                     + (k * BKO + offs_k)[:, None])
-        acc_g += tl.dot(x, wg)
-        acc_u += tl.dot(x, wu)
+    if ROUTING:
+        # ---- INCRÉMENT 1 : router + topk absorbés (CTA = (token, chunk)) --
+        # prologue : router dot (bf16 x, contrat du router livré) -> softmax
+        # fp32 -> topk (argmax itératif, expressions topk_softmax) -> quant
+        # per-token de x (contrat `_per_token_quant_int8`).  Puis boucle des
+        # experts de CE token dans la CTA (travail partagé ci-dessous) ->
+        # somme pondérée atomique.  BM=1 (1 token/CTA — les lignes pad ne
+        # partagent pas d'expert : voir TOUR2-DESIGN §0).
+        tokens = tl.where(tl.arange(0, BM) == 0, pid, num_valid)
+        valid = tokens < num_valid
+        x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
+        offs_e = tl.arange(0, E)
 
-    sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
-    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
-    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + offs_i)
-    acc_g = acc_g * s1g * sx[:, None]
-    acc_u = acc_u * s1u * sx[:, None]
+        # passe router+amax : tuile K dédiée (BKO_R) — la tuile B du dot
+        # [BKO_R, E] bf16 = 32 Ko (fenêtre OK) ; le dot bf16×bf16->fp32 est
+        # le contrat exact du router livré (GateLinear).
+        logits = tl.zeros((BM, E), dtype=tl.float32)
+        amax_x = tl.full((BM,), 1e-10, dtype=tl.float32)
+        offs_kr = tl.arange(0, 64)
+        for k in range(0, tl.cdiv(K, 64)):
+            xk = tl.load(x_rows[:, None] + (k * 64 + offs_kr)[None, :],
+                         mask=valid[:, None], other=0)
+            wr = tl.load(router_w_ptr + (k * 64 + offs_kr)[:, None]
+                         + offs_e[None, :] * K)
+            logits += tl.dot(xk.to(tl.bfloat16), wr)
+            amax_x = tl.maximum(
+                amax_x, tl.max(tl.abs(xk.to(tl.float32)), axis=1))
 
-    mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
-    amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
-    sc = amax / 127.0
-    q = _round_i8(mid * (127.0 / amax)[:, None])
+        # softmax fp32 (mêmes opérations que topk_softmax, ordre près)
+        p = tl.exp(logits - tl.max(logits, axis=1)[:, None])
+        p = p / tl.sum(p, axis=1)[:, None]
+        inv_amax = 127.0 / amax_x
+        s_x = amax_x / 127.0  # échelle de déquant per-token (contrat livré)
 
-    # gemm2 : I entier du chunk, toute la ligne de sortie
-    w2t = tl.load(w2_ptr + e64 * stride_w2e
-                  + offs_i[:, None]
-                  + offs_o[None, :] * stride_w2k)
-    acc2 = tl.zeros((BM, K), dtype=tl.float32) + tl.dot(q, w2t)
-    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o)
-    contrib = acc2 * (sc * wt)[:, None] * s2[None, :]
+        # topk : pass A = somme des poids sélectionnés (renormalize) ;
+        # pass B = boucle d'experts (même ordre de sélection, déterministe).
+        sum_sel = tl.zeros((BM,), dtype=tl.float32)
+        p_work = p
+        for _s in tl.static_range(top_k):
+            e_t = tl.argmax(p_work, axis=1).to(tl.int32)
+            picked = tl.sum(
+                tl.where(offs_e[None, :] == e_t[:, None], p, 0.0), axis=1)
+            sum_sel += picked
+            p_work = tl.where(offs_e[None, :] == e_t[:, None], -1.0, p_work)
 
-    # scope="gpu" : accumulateur local au GPU (pas d'accès pair — le piège
-    # atomics fine-grained PCIe = NOP silencieux sur MI200 ne s'applique pas).
-    tl.atomic_add(out_acc_ptr + tokens.to(tl.int64)[:, None] * K
-                  + offs_o[None, :], contrib, mask=valid[:, None],
-                  sem="relaxed", scope="gpu")
+        p_work = p
+        for _s in tl.static_range(top_k):
+            e_t = tl.argmax(p_work, axis=1).to(tl.int32)
+            w_s = tl.sum(
+                tl.where(offs_e[None, :] == e_t[:, None], p, 0.0), axis=1)
+            if RENORM:
+                w_s = w_s / sum_sel
+            p_work = tl.where(offs_e[None, :] == e_t[:, None], -1.0, p_work)
+            # contrat de routing : publier la sélection (tests de contrat)
+            tl.store(dbg_ids_ptr + tokens.to(tl.int64) * top_k + _s, e_t,
+                     mask=valid)
+            tl.store(dbg_w_ptr + tokens.to(tl.int64) * top_k + _s, w_s,
+                     mask=valid)
+            _expert_chunk_work(
+                x_rows, valid, inv_amax, s_x,
+                w1_ptr, w1_scale_ptr, w2_ptr, w2_scale_ptr,
+                out_acc_ptr, tokens,
+                e_t.to(tl.int64), w_s,
+                stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
+                offs_i, offs_k, offs_o,
+                top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
+                X_IS_INT8=False,
+            )
+    else:
+        # ---- chemin tour 1 : 1 expert par CTA-bloc (topk consommé) ----
+        offs_pair = pid * BM + tl.arange(0, BM)
+        if NAIVE:
+            # 1 paire valide (ligne 0) + lignes PAD masquées : les dots
+            # restent [BM, ...] = MFMA, comme le kernel livré.
+            pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+        else:
+            pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+        valid = pairs < num_valid
+        pairs_i64 = pairs.to(tl.int64)
+
+        tokens = pairs // top_k
+        wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
+        # un seul expert par CTA-bloc, indexé par le pid (les lignes pad sont
+        # masquées) — en naive le launcher passe topk_ids.view(-1) comme
+        # expert_ids, exactement le contrat du kernel livré.
+        e = tl.load(expert_ids_ptr + pid)
+        e64 = e.to(tl.int64)
+
+        x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
+        sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
+        _expert_chunk_work(
+            x_rows, valid, tl.zeros((BM,), dtype=tl.float32), sx,
+            w1_ptr, w1_scale_ptr, w2_ptr, w2_scale_ptr,
+            out_acc_ptr, tokens,
+            e64, wt,
+            stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
+            offs_i, offs_k, offs_o,
+            top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
+            X_IS_INT8=True,
+        )
 
 
 @triton.jit
@@ -437,8 +546,8 @@ def moe_megakernel_output_int8(
     """
     q = torch.empty((M, K), device=out_acc.device, dtype=torch.int8)
     s = torch.empty((M, 1), device=out_acc.device, dtype=torch.float32)
-    assert K % 1024 == 0, f"K={K} not multiple of finalize BLOCK"
-    moe_megakernel_finalize_int8_kernel[(M,)](out_acc, q, s, K=K, BLOCK=1024)
+    BLOCK = triton.next_power_of_2(K)
+    moe_megakernel_finalize_int8_kernel[(M,)](out_acc, q, s, K=K, BLOCK=BLOCK)
     return q, s
 
 
@@ -469,6 +578,10 @@ def fused_moe_megakernel(
     sorted_token_ids: torch.Tensor | None = None,
     expert_ids: torch.Tensor | None = None,
     cache3: torch.Tensor | None = None,
+    router_w: torch.Tensor | None = None,
+    top_k_override: int | None = None,
+    dbg_ids: torch.Tensor | None = None,
+    dbg_w: torch.Tensor | None = None,
 ) -> None:
     """Exécute la forward pass MoE routée fusionnée.
 
@@ -477,12 +590,20 @@ def fused_moe_megakernel(
     Sortie : `output` [M, K] bf16 (contrat `moe_sum` livré).
     """
     M = hidden_states.size(0)
-    top_k = topk_ids.size(1)
+    if topk_ids is not None:
+        top_k = topk_ids.size(1)
+    elif topk_weights is not None:
+        top_k = topk_weights.size(1)
+    else:
+        assert top_k_override is not None, "topk absent: top_k_override requis"
+        top_k = top_k_override
     K = w1.size(2)
     I = w2.size(2)
     strategy = moe_megakernel_strategy()
 
-    if hidden_states.dtype is torch.bfloat16:
+    if strategy == "routing":
+        x, x_scale = hidden_states, None  # le prologue requantifie
+    elif hidden_states.dtype is torch.bfloat16:
         x, x_scale = _quantize_rows(hidden_states)
     else:
         x = hidden_states
@@ -497,6 +618,53 @@ def fused_moe_megakernel(
     BM = 16  # lignes pad (MFMA) — naive ET grouped, comme le kernel livré
     BKO = 128
 
+    if strategy == "routing":
+        # INCRÉMENT 1 (tour 2) : router+topk absorbés — CTA = (token, chunk),
+        # boucle d'experts in-kernel, sortie int8 (contrat v2') + copie bf16
+        # pour le contrat aval immédiat.  Régime naive uniquement (le tri
+        # grouped est un travail de données-dépendant — TOUR2-DESIGN §0).
+        assert router_w is not None, "routing: router_w requis"
+        assert naive, "routing in-kernel: regime naive only"
+        assert hidden_states.dtype is torch.bfloat16, (
+            "routing in-kernel: bf16 x requis (le router livré voit le bf16)")
+        CI = 8
+        out_acc = torch.zeros((M, K), device=output.device,
+                              dtype=torch.float32)
+        grid = (M, triton.cdiv(I, CI))
+        # x bf16 TEL QUEL (le prologue requantifie — contrat
+        # `_per_token_quant_int8`) ; échelle factice (non lue en ROUTING).
+        dbg_i = dbg_ids if dbg_ids is not None else torch.zeros(
+            M, top_k, device=output.device, dtype=torch.int32)
+        dbg_ww = dbg_w if dbg_w is not None else torch.zeros(
+            M, top_k, device=output.device)
+        qwen3_moe_megakernel[grid](
+            hidden_states, torch.zeros(1, 1, device=output.device),
+            w1, w1_scale, w2, w2_scale,
+            topk_weights if topk_weights is not None else
+            torch.zeros(1, device=output.device),
+            topk_ids if topk_ids is not None else
+            torch.zeros(1, device=output.device, dtype=torch.int32),
+            torch.zeros(1, device=output.device, dtype=torch.int32),
+            torch.zeros(1, device=output.device, dtype=torch.int32),
+            out_acc,
+            M,
+            router_w,
+            dbg_i, dbg_ww,
+            x.stride(0), w1.stride(0), w1.stride(1),
+            w2.stride(0), w2.stride(1),
+            top_k=top_k, K=K, I=I, BM=1, BKO=128, CI=CI, NAIVE=True,
+            ROUTING=True, RENORM=True, E=w1.size(0),
+            num_warps=4, num_stages=1,
+        )
+        q_out, s_out = moe_megakernel_output_int8(out_acc, M, K)
+        output.copy_((q_out.float() * s_out).to(output.dtype))
+        _log_once(
+            "mk-routing",
+            "[moe-megakernel] INCREMENT 1 routing in-kernel ACTIVE "
+            "(M=%d topk=%d E=%d K=%d)", M, top_k, w1.size(0), K,
+        )
+        return
+
     if strategy == "atomic":
         CI = 8
         out_acc = torch.zeros((M, K), device=output.device,
@@ -509,6 +677,9 @@ def fused_moe_megakernel(
             expert_ids if expert_ids is not None else topk_ids,
             out_acc,
             num_valid,
+            w1.new_zeros((1, 1)),  # router_w factice (non lu hors ROUTING)
+            w1.new_zeros((1,), dtype=torch.int32),  # dbg_ids factice
+            w1.new_zeros((1,)),                      # dbg_w factice
             x.stride(0), w1.stride(0), w1.stride(1),
             w2.stride(0), w2.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, NAIVE=naive,
