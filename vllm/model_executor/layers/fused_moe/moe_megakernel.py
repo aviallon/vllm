@@ -99,7 +99,9 @@ def qwen3_moe_pair_fusion_kernel(
     sorted_token_ids_ptr,  # [EM] int32 (grouped) ; ignoré en NAIVE
     expert_ids_ptr,        # [n_blocs] int32 (grouped) ; ignoré en NAIVE
     c3_ptr,          # [num_pairs, K] bf16 (intermediate_cache3)
-    num_valid_ptr,   # [1] int32 (sentinelles de padding au-delà)
+    # sentinelles de padding au-delà : scalaire (jamais une copie H2D —
+    # non capturable en graphe CUDA)
+    num_valid,
     # strides
     stride_xm,
     stride_w1e,
@@ -130,19 +132,21 @@ def qwen3_moe_pair_fusion_kernel(
 
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
-        pairs = offs_pair
+        # 1 paire valide (ligne 0) + lignes PAD masquées : les dots restent
+        # [BM, ...] = MFMA, comme le kernel livré (BLOCK_M=16 avec 1 rangée
+        # valide) — BM=1 tombait en v_dot4 (mesuré : 6-19x plus lent).
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
     else:
         pairs = tl.load(sorted_token_ids_ptr + offs_pair)
-    num_valid = tl.load(num_valid_ptr)
     valid = pairs < num_valid
     pairs_i64 = pairs.to(tl.int64)
 
     tokens = pairs // top_k
     wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
-    if NAIVE:
-        e = tl.load(topk_ids_ptr + pairs_i64, mask=valid, other=0)
-    else:
-        e = tl.load(expert_ids_ptr + pid)
+    # un seul expert par CTA-bloc, indexé par le pid (les lignes pad sont
+    # masquées) — en naive le launcher passe topk_ids.view(-1) comme
+    # expert_ids, exactement le contrat du kernel livré.
+    e = tl.load(expert_ids_ptr + pid)
     e64 = e.to(tl.int64)
 
     offs_k = tl.arange(0, BKO)
@@ -157,13 +161,17 @@ def qwen3_moe_pair_fusion_kernel(
     for k in range(0, tl.cdiv(K, BKO)):
         x = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
                     mask=valid[:, None], other=0)
+        # gate et up CHARGE-EN-SEQUENCE : leurs tuiles B ([BKO,I] chacune)
+        # ne doivent pas être vivantes ensemble — sinon la fenêtre LDS
+        # somme (2×32 Ko + staging = OutOfResources 65 664 > 65 536,
+        # mesuré sur GPU).  En séquence : shared = max = 32 Ko.
         wg = tl.load(w1_ptr + e64 * stride_w1e
                      + tl.arange(0, I)[None, :] * stride_w1n
                      + (k * BKO + offs_k)[:, None])
+        acc_g += tl.dot(x, wg)
         wu = tl.load(w1_ptr + e64 * stride_w1e
                      + (I + tl.arange(0, I))[None, :] * stride_w1n
                      + (k * BKO + offs_k)[:, None])
-        acc_g += tl.dot(x, wg)
         acc_u += tl.dot(x, wu)
 
     sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
@@ -213,7 +221,7 @@ def qwen3_moe_megakernel(
     sorted_token_ids_ptr,
     expert_ids_ptr,
     out_acc_ptr,     # [M, K] fp32 pré-zérodé (accumulation atomique)
-    num_valid_ptr,
+    num_valid,
     stride_xm,
     stride_w1e,
     stride_w1n,
@@ -240,19 +248,21 @@ def qwen3_moe_megakernel(
 
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
-        pairs = offs_pair
+        # 1 paire valide (ligne 0) + lignes PAD masquées : les dots restent
+        # [BM, ...] = MFMA, comme le kernel livré (BLOCK_M=16 avec 1 rangée
+        # valide) — BM=1 tombait en v_dot4 (mesuré : 6-19x plus lent).
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
     else:
         pairs = tl.load(sorted_token_ids_ptr + offs_pair)
-    num_valid = tl.load(num_valid_ptr)
     valid = pairs < num_valid
     pairs_i64 = pairs.to(tl.int64)
 
     tokens = pairs // top_k
     wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
-    if NAIVE:
-        e = tl.load(topk_ids_ptr + pairs_i64, mask=valid, other=0)
-    else:
-        e = tl.load(expert_ids_ptr + pid)
+    # un seul expert par CTA-bloc, indexé par le pid (les lignes pad sont
+    # masquées) — en naive le launcher passe topk_ids.view(-1) comme
+    # expert_ids, exactement le contrat du kernel livré.
+    e = tl.load(expert_ids_ptr + pid)
     e64 = e.to(tl.int64)
 
     offs_i = chunk * CI + tl.arange(0, CI)
@@ -266,17 +276,17 @@ def qwen3_moe_megakernel(
         x = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
                     mask=valid[:, None], other=0)
         wg = tl.load(w1_ptr + e64 * stride_w1e
-                     + (chunk * CI + offs_i)[None, :] * stride_w1n
+                     + offs_i[None, :] * stride_w1n
                      + (k * BKO + offs_k)[:, None])
         wu = tl.load(w1_ptr + e64 * stride_w1e
-                     + (I + chunk * CI + offs_i)[None, :] * stride_w1n
+                     + (I + offs_i)[None, :] * stride_w1n
                      + (k * BKO + offs_k)[:, None])
         acc_g += tl.dot(x, wg)
         acc_u += tl.dot(x, wu)
 
     sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
-    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + chunk * CI + offs_i)
-    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + chunk * CI + offs_i)
+    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
+    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + offs_i)
     acc_g = acc_g * s1g * sx[:, None]
     acc_u = acc_u * s1u * sx[:, None]
 
@@ -484,7 +494,7 @@ def fused_moe_megakernel(
     else:
         assert sorted_token_ids is not None and expert_ids is not None
         n_blocks = triton.cdiv(sorted_token_ids.size(0), 16)
-    BM = 1 if naive else 16
+    BM = 16  # lignes pad (MFMA) — naive ET grouped, comme le kernel livré
     BKO = 128
 
     if strategy == "atomic":
@@ -498,11 +508,11 @@ def fused_moe_megakernel(
             sorted_token_ids if sorted_token_ids is not None else topk_ids,
             expert_ids if expert_ids is not None else topk_ids,
             out_acc,
-            torch.tensor([num_valid], device=output.device,
-                         dtype=torch.int32),
+            num_valid,
             x.stride(0), w1.stride(0), w1.stride(1),
             w2.stride(0), w2.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, NAIVE=naive,
+            num_warps=4,
         )
         if getattr(envs, "VLLM_MOE_MEGAKERNEL_INT8_OUT", False):
             # variante interface v2' : requant per-token depuis l'acc fp32
@@ -520,7 +530,10 @@ def fused_moe_megakernel(
             return
         moe_megakernel_finalize(out_acc, output)
     else:
-        BN2 = 256
+        # BN2=64 + num_warps=8 = config mesurée au smoke (shared 32 Ko,
+        # VGPR 256) ; BN2=256 déborde la fenêtre LDS (65 536 + 128 B de
+        # staging = OutOfResources mesuré sur GPU).
+        BN2 = 64
         assert cache3 is not None, "stratégie pair: cache3 requis"
         grid = (n_blocks, triton.cdiv(K, BN2))
         qwen3_moe_pair_fusion_kernel[grid](
@@ -529,11 +542,15 @@ def fused_moe_megakernel(
             sorted_token_ids if sorted_token_ids is not None else topk_ids,
             expert_ids if expert_ids is not None else topk_ids,
             cache3,
-            torch.tensor([num_valid], device=output.device,
-                         dtype=torch.int32),
+            num_valid,
             x.stride(0), w1.stride(0), w1.stride(1),
             w2.stride(0), w2.stride(1), cache3.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, BN2=BN2, NAIVE=naive,
+            num_warps=8,
+            # liveness séquentielle gate/up exigée (fenêtre LDS = max, pas
+            # somme) — le pipeliner ne doit pas pré-charger wg(k+1) pendant
+            # wu(k) : num_stages=1.
+            num_stages=1,
         )
         # moe_sum aval = le chemin livré (contrat identique).
         from vllm import _custom_ops as ops

@@ -161,6 +161,13 @@ def test_determinism_run_to_run(strategy):
     M, top_k, E, I, K = 4, 8, 64, 64, 512
     x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
     naive = M * top_k * 4 <= E
+    sorted_ids = expert_ids = None
+    if not naive:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            _prepare_expert_assignment,
+        )
+        sorted_ids, expert_ids, _ = _prepare_expert_assignment(
+            ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
     outs = []
     for _ in range(2):
         out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -169,7 +176,8 @@ def test_determinism_run_to_run(strategy):
                   if strategy == "pair" else None)
         fused_moe_megakernel(
             out, x, w1, w2, wts, ids, None, w1s, w2s,
-            naive=naive, cache3=cache3)
+            naive=naive, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+            cache3=cache3)
         torch.cuda.synchronize()
         outs.append(out)
     # bit-identique ou écart de sommation atomique (1 ulp bf16 max)
@@ -257,7 +265,7 @@ def test_fallback_is_shipped_path(monkeypatch):
     assert called["n"] == 0
 
 
-def test_fallback_with_gate_on_does_not_raise():
+def test_fallback_with_gate_on_does_not_raise(monkeypatch):
     """Gate ON + inéligible : le repli doit S'EXÉCUTER (y compris sa ligne
     de log) sans lever.  LEÇON 2026-10-25 : une ligne de log avec `logger`
     non défini a crash-loopé un pod prod — la ligne de repli n'avait jamais
@@ -269,12 +277,16 @@ def test_fallback_with_gate_on_does_not_raise():
     exp = object.__new__(TritonExperts)
     exp._lora_context = None
     exp.quant_config = type("Q", (), {"use_int8_w8a8": True})()
-    exp.per_act_token_quant = True
-    exp.block_shape = None
+    # per_act_token_quant est une propriété du parent (pas de setter) :
+    # monkeypatch de la classe.
+    monkeypatch.setattr(TritonExperts, "per_act_token_quant", True,
+                        raising=False)
+    monkeypatch.setattr(TritonExperts, "block_shape", None, raising=False)
+    # w1_bias/w2_bias sont aussi des propriétés du parent.
+    monkeypatch.setattr(TritonExperts, "w1_bias", None, raising=False)
+    monkeypatch.setattr(TritonExperts, "w2_bias", None, raising=False)
     exp.quantization_emulation = False
     exp.activation_config = type("A", (), {"clamp_limit": None})()
-    exp.w1_bias = None
-    exp.w2_bias = None
 
     M, top_k, E, I, K = 9, 8, 256, 32, 256   # M=9 > seuil -> repli
     x = torch.zeros(M, K, device="cuda", dtype=torch.int8)
