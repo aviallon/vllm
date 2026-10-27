@@ -48,6 +48,40 @@ per-channel, poids routé fp32 avant cast, sortie bf16 [M, K].
 
 Gates : `VLLM_MOE_MEGAKERNEL` (défaut OFF = le chemin livré verbatim) ;
 `VLLM_MOE_MEGAKERNEL_STRATEGY` = `pair` | `atomic` (défaut `pair`).
+
+TOUR 2 — incréments 2+3 (spec verbatim :
+`research/moe-megakernel-campaign-2026-10-27/TOUR2-DESIGN.md` §6) :
+
+* **INC 2 (gate `VLLM_MOE_MEGAKERNEL_NORM`, défaut OFF)** — norm+quant v2
+  dans le PROLOGUE du kernel (mode ROUTING, 3 passes sur rangées L2-hot,
+  BM=1) : `x_f → s = fp32(x_f)+fp32(res) → res_out=bf16(s) → var →
+  y_bf16 → amax → scale=amax/127 (SANS clamp) → q=clamp(nearbyint(y_bf16·
+  inv_s))`.  Le contrat numérique est le natif v2 VERBATIM (store
+  `ar-rms-quant-v2-spec`, §3.2) — ⚠ **PAS** le clamp FLT_EPSILON (la
+  « mauvaise référence » de v1) ; `nearbyint` half-even (libdevice), PAS le
+  `round` half-away de `_per_token_quant_int8` — écart NOMMÉ.  Le router voit
+  `y_bf16` (la sortie de norm bf16, comme le router livré) ; l'échelle de
+  déquant de gemm1 = `scale`.
+* **INC 3 (gate `VLLM_MOE_MEGAKERNEL_AR`, défaut OFF, exige NORM)** — phase 0
+  AR in-kernel (primitives PROUVÉES, store `triton-3way-cap` 2026-10-22 +
+  `ar_norm_quant.py` phase 0) : publish = **store LOCAL** de ma rangée (⚠ les
+  stores pairs nus sont une ANOMALIE mesurée — jamais), séquence dérivée par
+  **slot** in-kernel (jamais un scalar arg : cuit dans le graphe = replays
+  périmés silencieux), xchg release/sys de MON flag, spin `!= seq` (fail
+  loud : hang > corruption silencieuse) acquire/sys, puis **peer-loads**
+  seuls (i64 cast load-bearing).  ⚠ DESIGN FINDING de la grille chunked : la
+  table de flags est par **(rangée, chunk)** `[M, n_chunks]` int32, éléments
+  paddés **256 B** — pas par rangée comme le 3-way : avec la grille
+  (token × chunk) un flag par rangée ferait xchg la séquence 32×
+  (corruption).  Chaque CTA (t,c) xchg SON flag (t,c), spin sur le flag PAIR
+  (t,c) — symétrique et sans race.
+
+Contrats INC 2/3 : `res_out` exige un tampon **DISTINCT** de `res` (la grille
+chunked relit `res` pendant que d'autres CTAs écrivent — l'in-place du 3-way
+est la seule chose que la structure interdit) ; sortie int8 (contrat v2')
+inchangée.  Repli = chemin livré (les gates s'empilent ROUTING→NORM→AR ;
+sans les entrées du prologue le site d'appel moteur replie sur la chaîne
+livrée — le raccordement au graphe réel est l'étape nommée restante).
 """
 from __future__ import annotations
 
@@ -69,8 +103,26 @@ __all__ = [
     "fused_moe_megakernel",
     "moe_megakernel_enabled",
     "moe_megakernel_strategy",
+    "moe_megakernel_flags",
     "moe_megakernel_eligible",
+    "MoeMegakernelComm",
+    "FLAG_ELEMS",
+    "AR_MAX_CTAS",
 ]
+
+# Plafond de co-résidence de la grille AR (inc 3) : le spin inter-rangs
+# (`!= seq`, fail loud) exige que TOUTES les CTA de la grille finissent par
+# tourner sur CHAQUE rang — une CTA en attente de scheduling derrière des
+# CTAs qui spin = deadlock de scheduling entre rangs (les rangs n'ont pas
+# les mêmes CTA résidentes au même instant).  Grille = M × n_chunks CTAs ;
+# au-delà du plafond = repli sur le chemin livré (compté + logué).  96 =
+# conservateur vs l'occupation mesurée au smoke (à ré-étalonner avec le
+# compteur d'occupation du build inc 2/3 — R2 : instrument nommé).
+def _ar_max_ctas() -> int:
+    return int(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", 96))
+
+
+AR_MAX_CTAS = 96
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +130,82 @@ __all__ = [
 # ---------------------------------------------------------------------------
 @triton.jit
 def _round_i8(x):
-    """Rounding du contrat `_per_token_quant_int8` (libdevice.round)."""
+    """Rounding du contrat `_per_token_quant_int8` (libdevice.round,
+    half-away-from-zero).  Chemin livré — inchangé."""
     return tl.extra.hip.libdevice.round(x).to(tl.int8)
+
+
+@triton.jit
+def _rint_clamp_i8(v):
+    """Contrat NATIF v2 `dynamic_scaled_int8_quant` : `nearbyint` half-even
+    (libdevice — PAS `round` half-away) + saturation [-128, 127].
+    ⚠ L'écart nommé tour 2 : le prologue NORM passe à ce contrat ; le chemin
+    livré `_per_token_quant_int8` garde `_round_i8` (TOUR2-DESIGN §6.1)."""
+    q = tl.extra.hip.libdevice.nearbyint(v)
+    return tl.minimum(tl.maximum(q, -128.0), 127.0).to(tl.int8)
+
+
+# Éléments int32 entre deux flags de la table AR : 256 B de padding par
+# (rangée, chunk) — la spec tour 2 (§6.2) exige l'absence de ligne de cache
+# partagée entre slots, sinon les CTAs d'une même rangée se corrompent la
+# séquence.  (Le 3-way utilisait 128 B ; ici c'est 256 B, verbatim spec.)
+FLAG_ELEMS = 256 // 4
+
+
+@triton.jit
+def _mk_norm_chunk(x_rows, peer_rows, res_rows, norm_w_ptr,
+                   offs, valid, rstd,
+                   K: tl.constexpr, AR: tl.constexpr):
+    """Chunk (s, y_bf16) de la chaîne norm+quant v2 (contrat §3.2 verbatim) :
+    xf = bf16(fp32(x_self)+fp32(x_peer)) (AR) ou x tel quel ;
+    s  = fp32(xf) + fp32(res)  (residual add EN FP32) ;
+    y_bf16 = bf16(s · rstd · w_fp32)  (unique arrondi de sortie de norm).
+    Retourne (s, y_bf16) — `s` NON arrondi (var = mean(s·s) en fp32)."""
+    m = valid[:, None] & (offs < K)[None, :]
+    xk = tl.load(x_rows[:, None] + offs[None, :], mask=m, other=0.0)
+    if AR:
+        pb = tl.load(peer_rows[:, None] + offs[None, :], mask=m, other=0.0)
+        xf = (xk.to(tl.float32) + pb.to(tl.float32)).to(tl.bfloat16)
+    else:
+        xf = xk
+    rs = tl.load(res_rows[:, None] + offs[None, :], mask=m, other=0.0)
+    s = xf.to(tl.float32) + rs.to(tl.float32)
+    wc = tl.load(norm_w_ptr + offs, mask=offs < K, other=0.0)
+    yb = ((s * rstd) * wc.to(tl.float32)).to(tl.bfloat16)
+    return s, yb
+
+
+@triton.jit
+def _mk_ar_rendezvous(x_row, slot_row, row, chunk, flag_p, pflag_p,
+                      n_chunks: tl.constexpr, flag_elems: tl.constexpr,
+                      K: tl.constexpr, BLOCK_H: tl.constexpr):
+    """Phase 0 AR (inc 3) — primitives PROUVÉES (micro-exp triton-3way-cap
+    2026-10-22 : peer-loads exacts ; peer-STORES nus = anomalie 65536/65536
+    — ICI store LOCAL uniquement) :
+
+    1. publish = store LOCAL de ma rangée dans mon slot symétrique
+       (identique pour chaque (t,c) de la rangée — redondance bénigne,
+       valeurs identiques ; coût nommé au rapport) — ou, si l'entrée est
+       déjà matérialisée par le kernel précédent en ordre de stream, ce
+       store est la borne d'ordre du release de toute façon ;
+    2. séquence dérivée PAR SLOT in-kernel (`atomic_add(0, acquire)` puis
+       `atomic_xchg(seq, release)`) — jamais un scalar arg (cuit dans le
+       graphe = replays périmés silencieux) ;
+    3. spin `!= seq` (fail loud : hang > corruption silencieuse) sur le flag
+       PAIR avec un RMW `atomic_add(0, acquire, sys)` — non hoistable.
+    """
+    for base in range(0, K, BLOCK_H):
+        offs = base + tl.arange(0, BLOCK_H)
+        m = offs < K
+        xv = tl.load(x_row + offs, mask=m, other=0.0)
+        tl.store(slot_row + offs, xv, mask=m)
+    f_off = (row * n_chunks + chunk) * flag_elems
+    cur = tl.atomic_add(flag_p + f_off, 0, sem="acquire", scope="sys")
+    seq = cur + 1
+    tl.atomic_xchg(flag_p + f_off, seq, sem="release", scope="sys")
+    v = tl.atomic_add(pflag_p + f_off, 0, sem="acquire", scope="sys")
+    while v != seq:
+        v = tl.atomic_add(pflag_p + f_off, 0, sem="acquire", scope="sys")
 
 
 # ---------------------------------------------------------------------------
@@ -219,25 +345,47 @@ def _expert_chunk_work(
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
     BM: tl.constexpr, BKO: tl.constexpr, CI: tl.constexpr,
     X_IS_INT8: tl.constexpr = False,
+    # --- INC 2/3 (tour 2) : source de q = chaîne norm+quant v2 ---
+    NORM: tl.constexpr = False,
+    AR: tl.constexpr = False,
+    res_rows=0, peer_rows=0, norm_w_ptr=0,
+    rstd=0.0, dbg_q_ptr=0, do_dbg_q=0,
 ):
     """Travail d'expert : gemm1(chunk) -> silu -> quant (rangée,chunk) ->
     gemm2 -> contribution pondérée atomique.  Intermédiaires en registres.
 
-    Double contrat d'entrée :
+    Triple contrat d'entrée :
     * X_IS_INT8=True  : x int8 déjà quantifié (chemin tour 1), déquant par
       `sx_rows` (per-token) ;
     * X_IS_INT8=False : x bf16 (ROUTING) re-quantifié à la volée — contrat
-      `_per_token_quant_int8` via `inv_amax` = 127/absmax du prologue.
+      `_per_token_quant_int8` via `inv_amax` = 127/absmax du prologue ;
+    * NORM=True       : x est la sortie de la chaîne norm+quant v2 — par
+      chunk `y_bf16` recomputé (pas de slicing de tenseurs de registres,
+      piège constexpr) puis `q = clamp(nearbyint(y_bf16·inv_s))` (contrat
+      v2, half-even) ; `inv_amax` porte `inv_s`, `sx_rows` porte `scale`
+      (échelle de déquant = scale, verbatim spec §6.1).  AR ajoute le
+      peer-load dans xf.  `do_dbg_q` publie q (surface de test, contrat).
     """
     acc_g = tl.zeros((BM, CI), dtype=tl.float32)
     acc_u = tl.zeros((BM, CI), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BKO)):
-        xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
-                     mask=valid[:, None], other=0)
-        if X_IS_INT8:
-            xq = xk
+        if NORM:
+            # inc 2 : q recomputé par chunk depuis la chaîne norm+quant v2
+            _s, yb = _mk_norm_chunk(
+                x_rows, peer_rows, res_rows, norm_w_ptr,
+                k * BKO + offs_k, valid, rstd, K=K, AR=AR)
+            xq = _rint_clamp_i8(yb.to(tl.float32) * inv_amax[:, None])
+            if do_dbg_q:
+                tl.store(
+                    dbg_q_ptr + tokens.to(tl.int64)[:, None] * K
+                    + (k * BKO + offs_k)[None, :], xq, mask=valid[:, None])
         else:
-            xq = _round_i8(xk.to(tl.float32) * inv_amax[:, None])
+            xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
+                         mask=valid[:, None], other=0)
+            if X_IS_INT8:
+                xq = xk
+            else:
+                xq = _round_i8(xk.to(tl.float32) * inv_amax[:, None])
         wg = tl.load(w1_ptr + e64 * stride_w1e
                      + offs_i[None, :] * stride_w1n
                      + (k * BKO + offs_k)[:, None])
@@ -290,6 +438,18 @@ def qwen3_moe_megakernel(
     stride_w1n,
     stride_w2e,
     stride_w2k,
+    # --- INC 2 (norm+quant v2, gate NORM) ---
+    res_ptr,         # [M, K] bf16 (tampon DISTINCT de res_out)
+    res_out_ptr,     # [M, K] bf16 — SORTIE : nouveau residual bf16(s)
+    norm_w_ptr,      # [K] fp32
+    eps,             # fp32
+    dbg_scale_ptr,   # [M] fp32 — surface de test : scale = amax/127
+    dbg_q_ptr,       # [M, K] int8 — surface de test : q du prologue
+    # --- INC 3 (AR in-kernel, gate AR) : adresses brutes int64 ---
+    slot_ptr,        # mon slot symétrique [M, K] bf16 (publish LOCAL)
+    peer_x_ptr,      # slot du pair (handles IPC) — peer-LOADS seuls
+    flag_ptr,        # table [M, n_chunks] int32, 256 B/slot
+    peer_flag_ptr,   # table du pair
     top_k: tl.constexpr,
     K: tl.constexpr,
     I: tl.constexpr,
@@ -300,6 +460,9 @@ def qwen3_moe_megakernel(
     ROUTING: tl.constexpr = False,
     RENORM: tl.constexpr = True,
     E: tl.constexpr = 256,
+    NORM: tl.constexpr = False,
+    AR: tl.constexpr = False,
+    FLAG_ELEMS_C: tl.constexpr = 64,
 ):
     """1 CTA = (bloc de paires, chunk intermédiaire) — ou (token, chunk)
     avec ROUTING (incrément tour 2 : router+topk absorbés).
@@ -312,6 +475,15 @@ def qwen3_moe_megakernel(
     """
     pid = tl.program_id(0)
     chunk = tl.program_id(1)
+
+    # Inc 3 : pointeurs pairs en adresses brutes int64 -> pointeurs.  La
+    # promotion i64 est LOAD-BEARING (le JIT infère i32 sinon ;
+    # tt.int_to_ptr rejette i32 — mesuré 2026-10-22).  Casts toujours
+    # présents (comme le 3-way) : les dummies 0 ne sont jamais déréférencés.
+    slot_p = tl.cast(slot_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
+    peer_p = tl.cast(peer_x_ptr.to(tl.int64), tl.pointer_type(tl.bfloat16))
+    flag_p = tl.cast(flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
+    pflag_p = tl.cast(peer_flag_ptr.to(tl.int64), tl.pointer_type(tl.int32))
 
     offs_i = chunk * CI + tl.arange(0, CI)
     offs_k = tl.arange(0, BKO)
@@ -328,28 +500,95 @@ def qwen3_moe_megakernel(
         tokens = tl.where(tl.arange(0, BM) == 0, pid, num_valid)
         valid = tokens < num_valid
         x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
+        res_rows = res_ptr + tokens.to(tl.int64) * K
+        peer_rows = peer_p + tokens.to(tl.int64) * K
         offs_e = tl.arange(0, E)
 
-        # passe router+amax : tuile K dédiée (BKO_R) — la tuile B du dot
+        if AR:
+            # ---- INC 3 : phase 0 AR — rendezvous par slot (rangée, chunk),
+            # table de flags paddée 256 B (design finding : un flag par
+            # rangée ferait xchg la séquence 32× — corruption).  Symétrique
+            # et sans race : xchg de MON flag (t,c), spin sur le flag PAIR.
+            _mk_ar_rendezvous(
+                x_ptr + pid.to(tl.int64) * stride_xm,
+                slot_p + pid.to(tl.int64) * K,
+                pid, chunk, flag_p, pflag_p,
+                n_chunks=tl.cdiv(I, CI), flag_elems=FLAG_ELEMS_C,
+                K=K, BLOCK_H=256)
+
+        if NORM:
+            # ---- INC 2 : prologue norm+quant v2 en 3 passes (contrat §3.2
+            # VERBATIM — pas le clamp FLT_EPSILON ; nearbyint half-even).
+            # BM=1 : la rangée est L2-hot, les passes la re-parcourent.
+            # Passe 1 : s = fp32(x_f)+fp32(res) -> var (fp32) ; sortie
+            # res_out = bf16(s) (un seul écrivain : chunk 0 — le reste du
+            # graphe relit res tant que les autres tournent).
+            var_acc = 0.0
+            for base in range(0, K, 256):
+                offs_h = base + tl.arange(0, 256)
+                s, _yb = _mk_norm_chunk(
+                    x_rows, peer_rows, res_rows, norm_w_ptr,
+                    offs_h, valid, 1.0, K=K, AR=AR)
+                var_acc += tl.sum(s * s)
+                if chunk == 0:
+                    tl.store(res_out_ptr + tokens.to(tl.int64)[:, None] * K
+                             + offs_h[None, :], s.to(tl.bfloat16),
+                             mask=valid[:, None] & (offs_h < K)[None, :])
+            var = var_acc / K
+            rstd = tl.math.rsqrt(var + eps)
+            # Passe 2 : y_bf16 = bf16(s·rstd·w_fp32) -> amax (ordre libre)
+            amax = tl.zeros((BM,), dtype=tl.float32)
+            for base in range(0, K, 256):
+                offs_h = base + tl.arange(0, 256)
+                _s, yb = _mk_norm_chunk(
+                    x_rows, peer_rows, res_rows, norm_w_ptr,
+                    offs_h, valid, rstd, K=K, AR=AR)
+                amax = tl.maximum(
+                    amax, tl.max(tl.abs(yb.to(tl.float32)), axis=1))
+            # scale = amax/127 SANS clamp ; inv_s avec le cas zéro
+            # (0 si amax==0, 1 division) — dynamic_scaled_int8_quant verbatim
+            scale_v = amax / 127.0
+            inv_amax = tl.where(amax == 0.0, tl.zeros_like(amax),
+                                127.0 / amax)
+            sx_rows = scale_v
+            if chunk == 0:
+                tl.store(dbg_scale_ptr + tokens.to(tl.int64), scale_v,
+                         mask=valid)
+        else:
+            # inc 1 (inchangé) : la quant de x est faite à la volée dans la
+            # boucle d'experts ; rstd sans objet (dummy transmis au helper)
+            rstd = 0.0
+
+        # passe router : tuile K dédiée (BKO_R) — la tuile B du dot
         # [BKO_R, E] bf16 = 32 Ko (fenêtre OK) ; le dot bf16×bf16->fp32 est
-        # le contrat exact du router livré (GateLinear).
+        # le contrat exact du router livré (GateLinear).  En NORM le router
+        # voit y_bf16 (la sortie de norm bf16 — comme le router livré).
         logits = tl.zeros((BM, E), dtype=tl.float32)
         amax_x = tl.full((BM,), 1e-10, dtype=tl.float32)
         offs_kr = tl.arange(0, 64)
         for k in range(0, tl.cdiv(K, 64)):
-            xk = tl.load(x_rows[:, None] + (k * 64 + offs_kr)[None, :],
-                         mask=valid[:, None], other=0)
-            wr = tl.load(router_w_ptr + (k * 64 + offs_kr)[:, None]
+            kk = k * 64 + offs_kr
+            if NORM:
+                _s, xin = _mk_norm_chunk(
+                    x_rows, peer_rows, res_rows, norm_w_ptr,
+                    kk, valid, rstd, K=K, AR=AR)
+            else:
+                xk = tl.load(x_rows[:, None] + kk[None, :],
+                             mask=valid[:, None], other=0)
+                xin = xk.to(tl.bfloat16)
+                amax_x = tl.maximum(
+                    amax_x, tl.max(tl.abs(xk.to(tl.float32)), axis=1))
+            wr = tl.load(router_w_ptr + kk[:, None]
                          + offs_e[None, :] * K)
-            logits += tl.dot(xk.to(tl.bfloat16), wr)
-            amax_x = tl.maximum(
-                amax_x, tl.max(tl.abs(xk.to(tl.float32)), axis=1))
+            logits += tl.dot(xin, wr)
 
         # softmax fp32 (mêmes opérations que topk_softmax, ordre près)
         p = tl.exp(logits - tl.max(logits, axis=1)[:, None])
         p = p / tl.sum(p, axis=1)[:, None]
-        inv_amax = 127.0 / amax_x
-        s_x = amax_x / 127.0  # échelle de déquant per-token (contrat livré)
+        if not NORM:
+            # échelle de déquant per-token de x (contrat livré)
+            inv_amax = 127.0 / amax_x
+            sx_rows = amax_x / 127.0
 
         # topk : pass A = somme des poids sélectionnés (renormalize) ;
         # pass B = boucle d'experts (même ordre de sélection, déterministe).
@@ -375,8 +614,11 @@ def qwen3_moe_megakernel(
                      mask=valid)
             tl.store(dbg_w_ptr + tokens.to(tl.int64) * top_k + _s, w_s,
                      mask=valid)
+            # q n'a pas de dépendance à l'expert : publié une seule fois
+            # (première itération, chunk 0) — surface de test (contrat).
+            do_dbg = (chunk == 0) if _s == 0 else 0
             _expert_chunk_work(
-                x_rows, valid, inv_amax, s_x,
+                x_rows, valid, inv_amax, sx_rows,
                 w1_ptr, w1_scale_ptr, w2_ptr, w2_scale_ptr,
                 out_acc_ptr, tokens,
                 e_t.to(tl.int64), w_s,
@@ -384,6 +626,10 @@ def qwen3_moe_megakernel(
                 offs_i, offs_k, offs_o,
                 top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
                 X_IS_INT8=False,
+                NORM=NORM, AR=AR,
+                res_rows=res_rows, peer_rows=peer_rows,
+                norm_w_ptr=norm_w_ptr, rstd=rstd,
+                dbg_q_ptr=dbg_q_ptr, do_dbg_q=do_dbg,
             )
     else:
         # ---- chemin tour 1 : 1 expert par CTA-bloc (topk consommé) ----
@@ -472,6 +718,90 @@ def moe_megakernel_enabled() -> bool:
 
 def moe_megakernel_strategy() -> str:
     return str(getattr(envs, "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair"))
+
+
+def moe_megakernel_flags() -> tuple[bool, bool, bool]:
+    """(ROUTING, NORM, AR) — les 3 gates empilées (spec §6.2, défaut OFF).
+
+    * ROUTING : `VLLM_MOE_MEGAKERNEL_ROUTING=1` OU le mécanisme incrément 1
+      `VLLM_MOE_MEGAKERNEL_STRATEGY=routing` (rétro-compat) ;
+    * NORM    : `VLLM_MOE_MEGAKERNEL_NORM=1` (inc 2) ;
+    * AR      : `VLLM_MOE_MEGAKERNEL_AR=1` (inc 3, exige NORM).
+    """
+    routing = (
+        bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", False))
+        or moe_megakernel_strategy() == "routing"
+    )
+    norm = bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", False))
+    ar = bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR", False))
+    return routing, norm, ar
+
+
+def moe_megakernel_norm_ar_requested() -> bool:
+    """Vrai si une gate de prologue est demandée — le site d'appel moteur
+    (`TritonExperts.apply`) n'a ni residual, ni poids de norm, ni handles
+    IPC : il replie sur la chaîne livrée (raccordement = étape nommée)."""
+    _r, norm, ar = moe_megakernel_flags()
+    return norm or ar
+
+
+@triton.jit
+def _mk_zero_flags_kernel(ptr, n, BLOCK: tl.constexpr):
+    p = tl.cast(ptr.to(tl.int64), tl.pointer_type(tl.int32))
+    offs = tl.arange(0, BLOCK)
+    for base in range(0, n, BLOCK):
+        o = base + offs
+        tl.store(p + o, tl.zeros([BLOCK], dtype=tl.int32), mask=o < n)
+
+
+def _mk_zero_flags(ptr: int, n: int) -> None:
+    block = 1024
+    _mk_zero_flags_kernel[((n + block - 1) // block,)](ptr, n, BLOCK=block)
+
+
+class MoeMegakernelComm:
+    """Buffers symétriques pour l'AR in-kernel (inc 3).
+
+    Même mécanisme IPC que `ArNormQuantComm` (handles hipIpc via
+    `CustomAllreduce.create_shared_buffer`, le chemin d'all-reduce custom de
+    prod) ; layout de flags celui de la spec tour 2 : table `[rows, n_chunks]`
+    int32 avec **256 B par slot** (`FLAG_ELEMS`) — pas de ligne de cache
+    partagée entre slots (design finding : un flag par rangée ferait xchg la
+    séquence n_chunks× — corruption).  Séquence initiale 0 -> première
+    séquence dérivée in-kernel = 1.
+    """
+
+    def __init__(self, group: Any, rows: int, hidden: int, n_chunks: int) -> None:
+        from vllm.distributed.device_communicators.custom_all_reduce import (
+            CustomAllreduce,
+        )
+
+        self.group = group
+        self.rows = rows
+        self.hidden = hidden
+        self.n_chunks = n_chunks
+        data_bytes = rows * hidden * 2  # bf16 (slot de publish)
+        flag_bytes = rows * n_chunks * FLAG_ELEMS * 4
+        # registered BEFORE any graph capture; pointers are process-lifetime
+        self.data_ptrs = CustomAllreduce.create_shared_buffer(
+            data_bytes, group=group
+        )
+        self.flag_ptrs = CustomAllreduce.create_shared_buffer(
+            flag_bytes, group=group
+        )
+        rank = torch.distributed.get_rank(group=group)
+        peer = 1 - rank
+        assert len(self.data_ptrs) == 2, "TP=2 only (v2 scope)"
+        self.rank = rank
+        self.data_ptr = self.data_ptrs[rank]
+        self.peer_data_ptr = self.data_ptrs[peer]
+        self.flag_ptr = self.flag_ptrs[rank]
+        self.peer_flag_ptr = self.flag_ptrs[peer]
+        _mk_zero_flags(self.flag_ptr, rows * n_chunks * FLAG_ELEMS)
+        # ⚠ les flags du pair sont ZÉROS par SON propre constructeur
+        # (construction symétrique) — jamais d'écriture vers la mémoire
+        # PAIRE : les stores pairs nus sont l'anomalie mesurée du probe
+        # 2026-10-22 (65536/65536 mismatch).
 
 
 def moe_megakernel_eligible(
@@ -582,6 +912,15 @@ def fused_moe_megakernel(
     top_k_override: int | None = None,
     dbg_ids: torch.Tensor | None = None,
     dbg_w: torch.Tensor | None = None,
+    # --- INC 2 (gate NORM) : prologue norm+quant v2 ---
+    res: torch.Tensor | None = None,
+    norm_w: torch.Tensor | None = None,
+    eps: float = 1e-6,
+    res_out: torch.Tensor | None = None,
+    dbg_scale: torch.Tensor | None = None,
+    dbg_q: torch.Tensor | None = None,
+    # --- INC 3 (gate AR) : handles IPC (MoeMegakernelComm) ---
+    ar_comm: Any | None = None,
 ) -> None:
     """Exécute la forward pass MoE routée fusionnée.
 
@@ -600,8 +939,15 @@ def fused_moe_megakernel(
     K = w1.size(2)
     I = w2.size(2)
     strategy = moe_megakernel_strategy()
+    routing, norm_flag, ar_flag = moe_megakernel_flags()
 
-    if strategy == "routing":
+    # Empilement des gates (spec §6.2 : ROUTING → NORM → AR) — fail loud.
+    if ar_flag:
+        assert norm_flag, "AR exige NORM (empilement ROUTING→NORM→AR)"
+    if norm_flag or ar_flag:
+        assert routing, "NORM/AR exigent le mode ROUTING"
+
+    if routing:
         x, x_scale = hidden_states, None  # le prologue requantifie
     elif hidden_states.dtype is torch.bfloat16:
         x, x_scale = _quantize_rows(hidden_states)
@@ -618,50 +964,109 @@ def fused_moe_megakernel(
     BM = 16  # lignes pad (MFMA) — naive ET grouped, comme le kernel livré
     BKO = 128
 
-    if strategy == "routing":
-        # INCRÉMENT 1 (tour 2) : router+topk absorbés — CTA = (token, chunk),
-        # boucle d'experts in-kernel, sortie int8 (contrat v2') + copie bf16
-        # pour le contrat aval immédiat.  Régime naive uniquement (le tri
-        # grouped est un travail de données-dépendant — TOUR2-DESIGN §0).
+    if routing:
+        # INCRÉMENTS 1-3 (tour 2) : router+topk absorbés — CTA =
+        # (token, chunk), boucle d'experts in-kernel, sortie int8 (contrat
+        # v2') + copie bf16 pour le contrat aval immédiat.  Régime naive
+        # uniquement (le tri grouped est un travail de données-dépendant —
+        # TOUR2-DESIGN §0).  NORM = prologue norm+quant v2 ; AR = phase 0
+        # in-kernel (spec §6).
         assert router_w is not None, "routing: router_w requis"
         assert naive, "routing in-kernel: regime naive only"
         assert hidden_states.dtype is torch.bfloat16, (
             "routing in-kernel: bf16 x requis (le router livré voit le bf16)")
         CI = 8
+        n_chunks = triton.cdiv(I, CI)
+        if norm_flag:
+            assert res is not None and norm_w is not None and res_out is not None, (
+                "NORM: res/norm_w/res_out requis (contrat v2 §3.2)")
+            assert res_out.data_ptr() != res.data_ptr(), (
+                "NORM: res_out doit être DISTINCT de res — la grille chunked "
+                "relit res pendant que d'autres CTAs écrivent res_out ; "
+                "l'in-place du 3-way est la seule chose que la structure "
+                "interdit (double-buffering du flux residual)")
+            assert res.shape == (M, K) and res_out.shape == (M, K), (
+                "NORM: res/res_out doivent être [M, K]")
+            assert norm_w.numel() == K, "NORM: norm_w doit être [K]"
+        if ar_flag:
+            assert ar_comm is not None, "AR: ar_comm (handles IPC) requis"
+            assert ar_comm.hidden == K and ar_comm.n_chunks == n_chunks, (
+                f"AR: comm {ar_comm.hidden}x{ar_comm.n_chunks} != "
+                f"K={K} n_chunks={n_chunks}")
+            assert ar_comm.rows >= M, "AR: comm trop petite pour M"
+            # plafond de co-résidence : le spin inter-rangs exige que toute
+            # la grille finisse par tourner sur les DEUX rangs (sinon
+            # deadlock de scheduling entre rangs).  Repli = chemin livré,
+            # compté + logué (fail loud côté API : assertion).
+            n_ctas = M * n_chunks
+            if n_ctas > _ar_max_ctas():
+                _log_once(
+                    "mk-ar-over-grid",
+                    "[moe-megakernel] AR hors plafond de co-résidence "
+                    "(%d CTAs > %d) — l'appelant doit replier sur la "
+                    "chaîne livrée",
+                    n_ctas, _ar_max_ctas(),
+                )
+                raise AssertionError(
+                    f"AR: {n_ctas} CTAs > plafond {_ar_max_ctas()} "
+                    "(co-résidence requise par le spin) — repli livré")
         out_acc = torch.zeros((M, K), device=output.device,
                               dtype=torch.float32)
-        grid = (M, triton.cdiv(I, CI))
+        grid = (M, n_chunks)
         # x bf16 TEL QUEL (le prologue requantifie — contrat
-        # `_per_token_quant_int8`) ; échelle factice (non lue en ROUTING).
+        # `_per_token_quant_int8` ou v2 selon NORM) ; échelle factice.
         dbg_i = dbg_ids if dbg_ids is not None else torch.zeros(
             M, top_k, device=output.device, dtype=torch.int32)
         dbg_ww = dbg_w if dbg_w is not None else torch.zeros(
             M, top_k, device=output.device)
+        dev = output.device
+        res_t = res if res is not None else torch.zeros(
+            1, 1, device=dev, dtype=torch.bfloat16)
+        res_out_t = res_out if res_out is not None else torch.zeros(
+            1, 1, device=dev, dtype=torch.bfloat16)
+        norm_w_t = norm_w if norm_w is not None else torch.zeros(
+            1, device=dev)
+        dbg_scale_t = dbg_scale if dbg_scale is not None else torch.zeros(
+            1, device=dev)
+        dbg_q_t = dbg_q if dbg_q is not None else torch.zeros(
+            1, device=dev, dtype=torch.int8)
+        if ar_comm is not None:
+            slot_ptr = ar_comm.data_ptr
+            peer_x_ptr = ar_comm.peer_data_ptr
+            flag_ptr = ar_comm.flag_ptr
+            peer_flag_ptr = ar_comm.peer_flag_ptr
+        else:
+            slot_ptr = peer_x_ptr = flag_ptr = peer_flag_ptr = 0
         qwen3_moe_megakernel[grid](
-            hidden_states, torch.zeros(1, 1, device=output.device),
+            hidden_states, torch.zeros(1, 1, device=dev),
             w1, w1_scale, w2, w2_scale,
             topk_weights if topk_weights is not None else
-            torch.zeros(1, device=output.device),
+            torch.zeros(1, device=dev),
             topk_ids if topk_ids is not None else
-            torch.zeros(1, device=output.device, dtype=torch.int32),
-            torch.zeros(1, device=output.device, dtype=torch.int32),
-            torch.zeros(1, device=output.device, dtype=torch.int32),
+            torch.zeros(1, device=dev, dtype=torch.int32),
+            torch.zeros(1, device=dev, dtype=torch.int32),
+            torch.zeros(1, device=dev, dtype=torch.int32),
             out_acc,
             M,
             router_w,
             dbg_i, dbg_ww,
             x.stride(0), w1.stride(0), w1.stride(1),
             w2.stride(0), w2.stride(1),
+            res_t, res_out_t, norm_w_t, eps, dbg_scale_t, dbg_q_t,
+            slot_ptr, peer_x_ptr, flag_ptr, peer_flag_ptr,
             top_k=top_k, K=K, I=I, BM=1, BKO=128, CI=CI, NAIVE=True,
             ROUTING=True, RENORM=True, E=w1.size(0),
+            NORM=norm_flag, AR=ar_flag, FLAG_ELEMS_C=FLAG_ELEMS,
             num_warps=4, num_stages=1,
         )
         q_out, s_out = moe_megakernel_output_int8(out_acc, M, K)
         output.copy_((q_out.float() * s_out).to(output.dtype))
         _log_once(
-            "mk-routing",
-            "[moe-megakernel] INCREMENT 1 routing in-kernel ACTIVE "
-            "(M=%d topk=%d E=%d K=%d)", M, top_k, w1.size(0), K,
+            "mk-routing" + ("-norm" if norm_flag else "")
+            + ("-ar" if ar_flag else ""),
+            "[moe-megakernel] routing in-kernel ACTIVE (NORM=%s AR=%s "
+            "M=%d topk=%d E=%d K=%d)",
+            norm_flag, ar_flag, M, top_k, w1.size(0), K,
         )
         return
 
@@ -682,6 +1087,14 @@ def fused_moe_megakernel(
             w1.new_zeros((1,)),                      # dbg_w factice
             x.stride(0), w1.stride(0), w1.stride(1),
             w2.stride(0), w2.stride(1),
+            # inc 2/3 : dummies (NORM/AR exigent ROUTING — asserté ci-dessus)
+            w1.new_zeros((1, 1), dtype=torch.bfloat16),   # res
+            w1.new_zeros((1, 1), dtype=torch.bfloat16),   # res_out
+            w1.new_zeros((1,)),                          # norm_w
+            0.0,                                         # eps
+            w1.new_zeros((1,)),                          # dbg_scale
+            w1.new_zeros((1,), dtype=torch.int8),         # dbg_q
+            0, 0, 0, 0,                                  # slot/peer/flags
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, NAIVE=naive,
             num_warps=4,
         )

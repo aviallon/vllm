@@ -435,3 +435,576 @@ def test_increment1_fallbacks():
             x2, w12, w22, wts2, ids2, None, w1s2, w2s2,
             naive=True, router_w=None, top_k_override=top_k,
         )
+
+
+# ===========================================================================
+# INCRÉMENTS 2+3 (tour 2) — norm+quant v2 + AR in-kernel
+# Spec verbatim : research/moe-megakernel-campaign-2026-10-27/TOUR2-DESIGN.md
+# §6 ; contrat numérique = natif v2 (store ar-rms-quant-v2-spec §3.2) —
+# nearbyint half-EVEN (PAS le `round` half-away du chemin livré), scale =
+# amax/127 SANS clamp.
+# ===========================================================================
+import time
+import types
+
+import triton
+import triton.language as tl
+
+from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+    AR_MAX_CTAS,
+    FLAG_ELEMS,
+    MoeMegakernelComm,
+    _rint_clamp_i8,
+    _round_i8,
+    moe_megakernel_flags,
+)
+
+
+def reference_norm_chain(x, res, w, eps, peer=None):
+    """Contrat v2 §3.2 VERBATIM (torch) — retourne
+    (q int8 [M,K], scale fp32 [M,1], res_out bf16 [M,K], y_bf16 [M,K]).
+    `torch.round` = half-to-even = `nearbyint` (la bonne primitive)."""
+    if peer is None:
+        xf = x
+    else:
+        xf = (x.to(torch.float32) + peer.to(torch.float32)).to(
+            torch.bfloat16)
+    s = xf.to(torch.float32) + res.to(torch.float32)
+    res_out = s.to(torch.bfloat16)
+    var = (s * s).mean(dim=-1, keepdim=True)
+    y = s * torch.rsqrt(var + eps)
+    yb = (y * w.to(torch.float32)).to(torch.bfloat16)
+    amax = yb.to(torch.float32).abs().amax(dim=-1, keepdim=True)
+    scale = amax / 127.0
+    inv_s = torch.where(amax == 0, torch.zeros_like(amax), 127.0 / amax)
+    q = torch.round(yb.to(torch.float32) * inv_s).clamp(-128, 127)
+    return q.to(torch.int8), scale, res_out, yb
+
+
+def reference_experts_from_q(q, scale, w1, w2, w1_scale, w2_scale,
+                            sel_ids, sel_w):
+    """Travail d'expert depuis (q, scale) avec la sélection DU KERNEL
+    (sépare la sélection du calcul — méthode incrément 1).  Accumulation
+    fp32 comme le chemin `atomic` (finalize = cast bf16)."""
+    from vllm.model_executor.layers.quantization.utils.int8_utils import (
+        silu_and_mul_per_token_quant_int8,
+    )
+    M, K = q.shape
+    top_k = sel_ids.size(1)
+    out_acc = torch.zeros(M, K, device=q.device, dtype=torch.float32)
+    for t in range(M):
+        for slot in range(top_k):
+            e = int(sel_ids[t, slot])
+            wt = float(sel_w[t, slot])
+            acc = ((q[t].to(torch.float32) @ w1[e].to(torch.float32).T)
+                   * scale[t] * w1_scale[e][None, :])
+            cache1 = acc.to(torch.bfloat16)  # arrondi bf16 du livré
+            q2, s2 = silu_and_mul_per_token_quant_int8(cache1[None])
+            acc2 = ((q2.to(torch.float32) @ w2[e].to(torch.float32).T)
+                    * s2 * w2_scale[e][None, :])
+            out_acc[t] += acc2[0].to(torch.float32) * wt
+    return out_acc
+
+
+def _requant_roundtrip(out_acc):
+    """Miroir du chemin de sortie du mode ROUTING (v2' : requant per-token
+    puis déquant pour le contrat bf16 aval)."""
+    amax = out_acc.abs().amax(dim=-1, keepdim=True).clamp_min(1e-10)
+    s = amax / 127.0
+    q = (torch.round(out_acc / s) * s).to(torch.bfloat16)
+    return q
+
+
+@triton.jit
+def _test_rint_kernel(in_ptr, near_ptr, away_ptr, n, BLOCK: tl.constexpr):
+    """Contraste le primitive v2 (`_rint_clamp_i8`, half-even) avec celui du
+    chemin livré (`_round_i8`, half-away) — MUTATION lisible : si le kernel
+    utilisait `round` au lieu de `nearbyint`, ce test échoue."""
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    v = tl.load(in_ptr + offs, mask=m, other=0.0)
+    tl.store(near_ptr + offs, _rint_clamp_i8(v), mask=m)
+    tl.store(away_ptr + offs, _round_i8(v), mask=m)
+
+
+def test_rint_half_even_primitive():
+    """Le prologue NORM arrondit half-even (`nearbyint`) — écart NOMMÉ vs le
+    `round` half-away du chemin livré (TOUR2-DESIGN §6.1)."""
+    vals = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 3.5, -0.25, 0.25, 7.5,
+            300.0, -300.0, 1000.0, -1000.0, 0.0]
+    inp = torch.tensor(vals, device="cuda", dtype=torch.float32)
+    n = inp.numel()
+    near = torch.empty(n, device="cuda", dtype=torch.int8)
+    away = torch.empty(n, device="cuda", dtype=torch.int8)
+    _test_rint_kernel[((1,))](inp, near, away, n, BLOCK=16)
+    torch.cuda.synchronize()
+    # half-even (nearbyint) : 0.5->0, -0.5->0, 2.5->2, -2.5->-2, 3.5->4
+    assert near.tolist()[:10] == [-2, -2, 0, 0, 2, 2, 4, 0, 0, 8], (
+        f"nearbyint half-even violé: {near.tolist()[:10]}")
+    # half-away (round, chemin livré) : 0.5->1, -0.5->-1, 2.5->3, -2.5->-3
+    assert away.tolist()[:10] == [-3, -2, -1, 1, 2, 3, 4, 0, 0, 8], (
+        f"contrôle round half-away inattendu: {away.tolist()[:10]}")
+    # les deux primitives DIFFÈRENT aux frontières (garde anti-test-vide)
+    assert (near[:10].int() != away[:10].int()).any()
+    # saturation v2 [-128, 127]
+    assert near.tolist()[10:] == [127, -128, 127, -128, 0]
+
+
+def _run_increment23(M, top_k, E, I, K, *, norm, ar_comm=None,
+                     eps=1e-6, seed=20261027, peer_x=None):
+    """Exécute le megakernel ROUTING(+NORM)(+AR) et retourne tous les
+    artefacts de contrat."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = bool(norm)
+    envs.VLLM_MOE_MEGAKERNEL_AR = ar_comm is not None
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_NORM"] = "1" if norm else "0"
+    os.environ["VLLM_MOE_MEGAKERNEL_AR"] = "1" if ar_comm is not None else "0"
+
+    torch.manual_seed(seed)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.5
+    res = torch.randn(M, K, device="cuda", dtype=torch.bfloat16) * 0.2
+    norm_w = torch.randn(K, device="cuda").float() * 0.5 + 1.0
+    w1 = torch.randint(-127, 128, (E, 2 * I, K), device="cuda",
+                       dtype=torch.int8)
+    w2 = torch.randint(-127, 128, (E, K, I), device="cuda", dtype=torch.int8)
+    w1s = (torch.rand(E, 2 * I, device="cuda") * 0.02 + 0.001)
+    w2s = (torch.rand(E, K, device="cuda") * 0.02 + 0.001)
+    router_w = torch.randn(E, K, device="cuda",
+                           dtype=torch.bfloat16) * 0.02
+
+    out = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
+    res_out = torch.empty(M, K, device="cuda", dtype=torch.bfloat16)
+    dbg_q = torch.empty(M, K, device="cuda", dtype=torch.int8)
+    dbg_scale = torch.zeros(M, device="cuda")
+    dbg_ids = torch.zeros(M, top_k, device="cuda", dtype=torch.int32)
+    dbg_w = torch.zeros(M, top_k, device="cuda")
+    fused_moe_megakernel(
+        out, x, w1, w2, None, None, None, w1s, w2s,
+        naive=True, router_w=router_w, top_k_override=top_k,
+        res=res, norm_w=norm_w, eps=eps, res_out=res_out,
+        dbg_scale=dbg_scale, dbg_q=dbg_q, dbg_ids=dbg_ids, dbg_w=dbg_w,
+        ar_comm=ar_comm,
+    )
+    torch.cuda.synchronize()
+    return types.SimpleNamespace(
+        x=x, res=res, norm_w=norm_w, w1=w1, w2=w2, w1s=w1s, w2s=w2s,
+        router_w=router_w, out=out, res_out=res_out, dbg_q=dbg_q,
+        dbg_scale=dbg_scale, dbg_ids=dbg_ids, dbg_w=dbg_w)
+
+
+@pytest.mark.parametrize("M,top_k,E,I,K", [
+    (1, 8, 256, 256, 2048),    # c1 réel TP=2
+    (4, 8, 128, 64, 512),      # synthétique couverture
+])
+def test_increment2_norm_quant_contract(M, top_k, E, I, K):
+    """INC 2 : contrat v2 VERBATIM vs référence torch.
+
+    Sépare (comme l'incrément 1) la sélection du calcul : le travail
+    d'expert est comparé à une référence construite avec la sélection DU
+    KERNEL, et le prologue (norm+quant) est comparé DIRECTEMENT via les
+    surfaces dbg_q/dbg_scale/res_out."""
+    r = _run_increment23(M, top_k, E, I, K, norm=True)
+    q_ref, scale_ref, res_ref, _ = reference_norm_chain(
+        r.x, r.res, r.norm_w, 1e-6)
+
+    # 1. res_out = bf16(s) — BIT-EXACT (ne dépend pas de var)
+    assert torch.equal(r.res_out, res_ref), "res_out != bf16(fp32(xf)+fp32(res))"
+
+    # 2. scale = amax(y_bf16)/127 SANS clamp — classe-3 (ordre de var)
+    assert torch.allclose(r.dbg_scale, scale_ref[:, 0],
+                          rtol=1e-4, atol=1e-8), (
+        f"scale hors contrat: {(r.dbg_scale - scale_ref[:, 0]).abs().max()}")
+
+    # 3. q = clamp(nearbyint(y_bf16·inv_s)) — exact JUSQU'À LA REQUANT
+    #    FINALE (±1 LSB aux frontières d'arrondi, classe-3 via var)
+    flips = (r.dbg_q.int() - q_ref.int()).abs()
+    assert (flips <= 1).all(), f"q diverge de >1 LSB: {flips.max()}"
+    nflips = int((flips > 0).sum())
+    print(f"q +/-1 LSB flips: {nflips}/{flips.numel()}")
+    assert nflips <= flips.numel() // 100, f"trop de flips: {nflips}"
+
+    # 4. le cas zéro est couvert par test_rint / une rangée nulle dédiée
+    # 5. travail d'expert vs référence construite avec la sélection DU KERNEL
+    ref_acc = reference_experts_from_q(
+        q_ref, scale_ref, r.w1, r.w2, r.w1s, r.w2s, r.dbg_ids, r.dbg_w)
+    ref_out = _requant_roundtrip(ref_acc)
+    err = _rel_err(r.out, ref_out)
+    assert err < 0.03, f"expert-work rel_err={err:.4f}"
+    assert ref_out.abs().max() > 0  # garde anti-test-vide
+
+    # 6. sélection : ids cohérents (frontières d'égalité tolérées, inc 1)
+    #    — comparaison par ENSEMBLE (l'ordre de sélection du topk itératif
+    #    peut différer de argsort sans que la sélection diffère)
+    logits = (reference_norm_chain(r.x, r.res, r.norm_w, 1e-6)[3].float()
+              @ r.router_w.float().T)
+    srt = logits.sort(dim=1, descending=True).values
+    margin = srt[:, top_k - 1] - srt[:, top_k]
+    ids_ref = logits.argsort(dim=1, descending=True)[:, :top_k]
+    sets_match = (
+        r.dbg_ids.to(torch.int64).sort(dim=1).values
+        == ids_ref.sort(dim=1).values).all(dim=1)
+    for t in range(M):
+        if not bool(sets_match[t]):
+            assert float(margin[t]) < 1e-2, (
+                f"topk flip hors frontière (marge {float(margin[t]):.4f})")
+
+
+def test_increment2_zero_row():
+    """Cas zéro : amax==0 -> inv_s=0, q=0, scale=0 (contrat v2, SANS clamp
+    FLT_EPSILON — la « mauvaise référence » de v1 donnerait scale=1e-10/127)."""
+    M, top_k, E, I, K = 1, 8, 256, 256, 2048
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = True
+    envs.VLLM_MOE_MEGAKERNEL_AR = False
+    x = torch.zeros(1, K, device="cuda", dtype=torch.bfloat16)
+    res = torch.zeros(1, K, device="cuda", dtype=torch.bfloat16)
+    norm_w = torch.ones(K, device="cuda")
+    w1 = torch.randint(-127, 128, (E, 2 * I, K), device="cuda",
+                       dtype=torch.int8)
+    w2 = torch.randint(-127, 128, (E, K, I), device="cuda", dtype=torch.int8)
+    w1s = (torch.rand(E, 2 * I, device="cuda") * 0.02 + 0.001)
+    w2s = (torch.rand(E, K, device="cuda") * 0.02 + 0.001)
+    router_w = torch.randn(E, K, device="cuda",
+                           dtype=torch.bfloat16) * 0.02
+    out = torch.zeros(1, K, device="cuda", dtype=torch.bfloat16)
+    res_out = torch.empty(1, K, device="cuda", dtype=torch.bfloat16)
+    dbg_scale = torch.full((1,), 7.0, device="cuda")  # sentinelle
+    dbg_q = torch.full((1, K), 9, device="cuda", dtype=torch.int8)
+    fused_moe_megakernel(
+        out, x, w1, w2, None, None, None, w1s, w2s,
+        naive=True, router_w=router_w, top_k_override=top_k,
+        res=res, norm_w=norm_w, eps=1e-6, res_out=res_out,
+        dbg_scale=dbg_scale, dbg_q=dbg_q,
+    )
+    torch.cuda.synchronize()
+    assert torch.all(dbg_scale == 0), f"scale zéro non nul: {dbg_scale}"
+    assert torch.all(dbg_q == 0), "q zéro non nul"
+    assert torch.all(res_out == 0)
+    assert torch.all(out == 0)
+
+
+def test_increment2_res_out_must_not_alias():
+    """res_out aliasant res = corruption croisée entre CTAs (la grille
+    chunked relit res pendant que d'autres CTAs écrivent) — fail loud."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = True
+    envs.VLLM_MOE_MEGAKERNEL_AR = False
+    M, top_k, E, I, K = 1, 8, 256, 256, 512
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    w1s = torch.ones(E, 2 * I, device="cuda")
+    w2s = torch.ones(E, K, device="cuda")
+    router_w = torch.zeros(E, K, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError):
+        fused_moe_megakernel(
+            torch.zeros(M, K, device="cuda", dtype=torch.bfloat16),
+            x, w1, w2, None, None, None, w1s, w2s,
+            naive=True, router_w=router_w, top_k_override=top_k,
+            res=res, norm_w=torch.ones(K, device="cuda"), res_out=res,
+        )
+
+
+def test_gate_stacking_requires_routing_and_norm():
+    """Empilement des gates (spec §6.2 : ROUTING → NORM → AR) — fail loud."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    M, top_k, E, I, K = 1, 8, 256, 256, 512
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    w1s = torch.ones(E, 2 * I, device="cuda")
+    w2s = torch.ones(E, K, device="cuda")
+    rw = torch.zeros(E, K, device="cuda", dtype=torch.bfloat16)
+    common = dict(res=res, norm_w=torch.ones(K, device="cuda"),
+                  res_out=torch.empty_like(res))
+
+    # NORM sans ROUTING
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "pair"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = False
+    envs.VLLM_MOE_MEGAKERNEL_NORM = True
+    envs.VLLM_MOE_MEGAKERNEL_AR = False
+    with pytest.raises(AssertionError, match="ROUTING"):
+        fused_moe_megakernel(
+            torch.zeros(M, K, device="cuda", dtype=torch.bfloat16),
+            x, w1, w2, None, None, None, w1s, w2s,
+            naive=True, router_w=rw, top_k_override=top_k, **common)
+
+    # AR sans NORM
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = False
+    envs.VLLM_MOE_MEGAKERNEL_AR = True
+    with pytest.raises(AssertionError, match="NORM"):
+        fused_moe_megakernel(
+            torch.zeros(M, K, device="cuda", dtype=torch.bfloat16),
+            x, w1, w2, None, None, None, w1s, w2s,
+            naive=True, router_w=rw, top_k_override=top_k, **common)
+
+
+def test_increment3_grid_bound_fails_loud():
+    """Plafond de co-résidence AR : au-delà de AR_MAX_CTAS le spin peut
+    deadlock entre rangs (scheduling) — fail loud, l'appelant replie."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = True
+    envs.VLLM_MOE_MEGAKERNEL_AR = True
+    M, top_k, E, I, K = 8, 8, 256, 256, 512   # 8 × 32 = 256 CTAs > 96
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    res = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    fake_comm = types.SimpleNamespace(
+        rows=256, hidden=K, n_chunks=(I + 7) // 8,
+        data_ptr=0, peer_data_ptr=0, flag_ptr=0, peer_flag_ptr=0)
+    with pytest.raises(AssertionError, match="co-résidence"):
+        fused_moe_megakernel(
+            torch.zeros(M, K, device="cuda", dtype=torch.bfloat16),
+            x, w1, w2, None, None, None,
+            torch.ones(E, 2 * I, device="cuda"),
+            torch.ones(E, K, device="cuda"),
+            naive=True, router_w=torch.zeros(E, K, device="cuda",
+                                             dtype=torch.bfloat16),
+            top_k_override=top_k,
+            res=res, norm_w=torch.ones(K, device="cuda"),
+            res_out=torch.empty_like(res), ar_comm=fake_comm)
+    assert M * ((I + 7) // 8) > AR_MAX_CTAS  # précondition du test
+
+
+def test_engine_site_fallback_without_prologue_inputs(monkeypatch):
+    """Le site d'appel moteur (TritonExperts.apply) n'a ni residual, ni
+    poids de norm, ni poids de router, ni handles IPC : gates NORM/AR/
+    ROUTING demandées => repli sur la chaîne livrée, ligne de log INCLUSE
+    (chaque ligne expédiée exécutée — leçon 2026-10-25)."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+    exp = object.__new__(TritonExperts)
+    exp._lora_context = None
+    exp.quant_config = type("Q", (), {"use_int8_w8a8": True})()
+    monkeypatch.setattr(TritonExperts, "per_act_token_quant", True,
+                        raising=False)
+    monkeypatch.setattr(TritonExperts, "block_shape", None, raising=False)
+    monkeypatch.setattr(TritonExperts, "w1_bias", None, raising=False)
+    monkeypatch.setattr(TritonExperts, "w2_bias", None, raising=False)
+    exp.quantization_emulation = False
+    exp.activation_config = type("A", (), {"clamp_limit": None})()
+    M, top_k, E, I, K = 2, 8, 256, 32, 256
+    x = torch.zeros(M, K, device="cuda", dtype=torch.int8)
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    ids = torch.zeros(M, top_k, device="cuda", dtype=torch.int32)
+
+    def call():
+        return exp._maybe_moe_megakernel(
+            None, x, w1, w2, None, ids, torch.ones(M, 1, device="cuda"),
+            None, False, None)
+
+    # NORM demandé, non câblé au site -> repli + log
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", True)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_AR", False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair")
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", False)
+    assert call() is False
+    # ROUTING demandé (pas de router_w au site) -> repli + log
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", True)
+    assert call() is False
+    assert moe_megakernel_flags() == (True, False, False)
+
+
+@triton.jit
+def _copy_flags_kernel(ptr, out_ptr, n, BLOCK: tl.constexpr):
+    p = tl.cast(ptr.to(tl.int64), tl.pointer_type(tl.int32))
+    offs = tl.arange(0, BLOCK)
+    for base in range(0, n, BLOCK):
+        o = base + offs
+        tl.store(out_ptr + o, tl.load(p + o, mask=o < n, other=0),
+                 mask=o < n)
+
+
+def _mk_two_rank_worker(rank, world, port, outdir, n_calls):
+    """Module-level pour spawn (picklable) ; résultats en FICHIERS (pas de
+    mp.Queue — mesuré 2026-10-22 : EOFError sur le resource_sharer)."""
+    import torch.distributed as dist
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world)
+    torch.cuda.set_device(rank)
+    dev = f"cuda:{rank}"
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
+    envs.VLLM_MOE_MEGAKERNEL_NORM = True
+    envs.VLLM_MOE_MEGAKERNEL_AR = True
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+
+    M, top_k, E, I, K = 1, 8, 256, 256, 2048   # c1 réel TP=2
+    torch.manual_seed(7)  # poids/residual/router IDENTIQUES des deux côtés
+    w1 = torch.randint(-127, 128, (E, 2 * I, K), device=dev,
+                       dtype=torch.int8)
+    w2 = torch.randint(-127, 128, (E, K, I), device=dev, dtype=torch.int8)
+    w1s = (torch.rand(E, 2 * I, device=dev) * 0.02 + 0.001)
+    w2s = (torch.rand(E, K, device=dev) * 0.02 + 0.001)
+    res = torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 0.2
+    norm_w = torch.randn(K, device=dev).float() * 0.5 + 1.0
+    router_w = torch.randn(E, K, device=dev, dtype=torch.bfloat16) * 0.02
+    torch.manual_seed(100 + rank)  # x : shard PROPRE à chaque rang
+    x = torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 0.5
+
+    n_chunks = (I + 7) // 8
+    comm = MoeMegakernelComm(dist.group.WORLD, M, K, n_chunks)
+    out = torch.zeros(M, K, device=dev, dtype=torch.bfloat16)
+    res_out = torch.empty(M, K, device=dev, dtype=torch.bfloat16)
+    dbg_q = torch.empty(M, K, device=dev, dtype=torch.int8)
+    dbg_scale = torch.zeros(M, device=dev)
+    dbg_ids = torch.zeros(M, top_k, device=dev, dtype=torch.int32)
+    dbg_w = torch.zeros(M, top_k, device=dev)
+    times = []
+    for _ in range(n_calls):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        fused_moe_megakernel(
+            out, x, w1, w2, None, None, None, w1s, w2s,
+            naive=True, router_w=router_w, top_k_override=top_k,
+            res=res, norm_w=norm_w, eps=1e-6, res_out=res_out,
+            dbg_scale=dbg_scale, dbg_q=dbg_q,
+            dbg_ids=dbg_ids, dbg_w=dbg_w, ar_comm=comm)
+        torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1e6)
+
+    n_flags = M * n_chunks * FLAG_ELEMS
+    flags = torch.empty(n_flags, device=dev, dtype=torch.int32)
+    _copy_flags_kernel[((n_flags + 1023) // 1024,)](
+        comm.flag_ptr, flags, n_flags, BLOCK=1024)
+    torch.cuda.synchronize()
+    torch.save(
+        {
+            "rank": rank,
+            "out": out.cpu(),
+            "res_out": res_out.cpu(),
+            "res": res.cpu(),
+            "x": x.cpu(),
+            "norm_w": norm_w.cpu(),
+            "dbg_q": dbg_q.cpu(),
+            "dbg_scale": dbg_scale.cpu(),
+            "dbg_ids": dbg_ids.cpu(),
+            "dbg_w": dbg_w.cpu(),
+            "flags": flags.cpu(),
+            "times": times,
+        },
+        f"{outdir}/rank{rank}.pt",
+    )
+    dist.destroy_process_group()
+
+
+class TestIncrement3TwoRank:
+    """INC 3 : AR 2 rangs in-kernel, méthode 2b — exact JUSQU'À la requant
+    finale vs la somme fp32 exacte, accord inter-rangs, flags par slot.
+
+    Opt-in (env `MOEMK_2GPU_TEST=1`) : exige une paire XGMI (sur une paire
+    PCIe les atomiques entiers cross-device du spin ne sont pas garantis —
+    le test pendrait)."""
+
+    @pytest.mark.skipif(
+        os.environ.get("MOEMK_2GPU_TEST") != "1",
+        reason="set MOEMK_2GPU_TEST=1 on an XGMI pair",
+    )
+    def test_increment3_two_ranks(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("needs 2 GPUs")
+        try:
+            import vllm._custom_ops as _ops
+            if not hasattr(_ops, "allocate_shared_buffer_and_handle"):
+                pytest.skip("vllm._C lacks the shared-buffer IPC ops")
+        except Exception as exc:  # noqa: BLE001
+            pytest.skip(f"vllm._custom_ops unavailable: {exc}")
+        import torch.multiprocessing as mp
+
+        n_calls = 2  # la séquence est dérivée par slot : 2 appels -> seq 2
+        ctx = mp.get_context("spawn")
+        outdir = os.environ.get("MOEMK_TEST_OUT", "/tmp/moemk-2rank")
+        os.makedirs(outdir, exist_ok=True)
+        procs = [
+            ctx.Process(target=_mk_two_rank_worker,
+                        args=(r, 2, 29531, outdir, n_calls))
+            for r in (0, 1)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=300)
+        hung = [p for p in procs if p.is_alive()]
+        for p in hung:
+            p.kill()
+        assert not hung, (
+            "worker(s) en SPIN (deadlock de rendezvous ?) — kill après 300s")
+        assert all(p.exitcode == 0 for p in procs), (
+            f"worker exit codes: {[p.exitcode for p in procs]}")
+        got = {r: torch.load(f"{outdir}/rank{r}.pt", weights_only=False)
+               for r in (0, 1)}
+
+        # --- flags par (rangée, chunk) : SÉQUENCE DÉRIVÉE PAR SLOT ---
+        # un flag par rangée ferait xchg la séquence n_chunks× (corruption) :
+        # chaque slot doit valoir EXACTEMENT n_calls (1 xchg/CTA/appel), et
+        # le padding 256 B doit rester à zéro (aucun débordement).
+        for rank in (0, 1):
+            fl = got[rank]["flags"]
+            n_chunks = fl.numel() // FLAG_ELEMS
+            slots = fl.view(-1, FLAG_ELEMS)
+            assert (slots[:, 0] == n_calls).all(), (
+                f"rank {rank}: slots != {n_calls}: {slots[:, 0].tolist()}")
+            assert (slots[:, 1:] == 0).all(), (
+                f"rank {rank}: padding de flag non nul")
+
+        res0, w0 = got[0]["res"], got[0]["norm_w"]
+        for rank in (0, 1):
+            x_self, x_peer = got[rank]["x"], got[1 - rank]["x"]
+            q_ref, scale_ref, res_ref, yb_ref = reference_norm_chain(
+                x_self, res0, w0, 1e-6, peer=x_peer)
+            # 1. res_out BIT-EXACT (xf = bf16(fp32+fp32) identique)
+            assert torch.equal(got[rank]["res_out"], res_ref), (
+                f"rank {rank}: res_out != contrat")
+            # 2. scale : classe-3 (ordre de réduction de var)
+            assert torch.allclose(got[rank]["dbg_scale"], scale_ref[:, 0],
+                                  rtol=1e-4, atol=1e-8), (
+                f"rank {rank}: scale hors contrat")
+            # 3. méthode 2b : q EXACT jusqu'à la requant finale (±1 LSB)
+            flips = (got[rank]["dbg_q"].int() - q_ref.int()).abs()
+            assert (flips <= 1).all(), (
+                f"rank {rank}: q diverge de >1 LSB: {flips.max()}")
+            print(f"rank {rank}: q +/-1 LSB flips: "
+                  f"{int((flips > 0).sum())}/{flips.numel()}")
+        # (le contrat travail d'expert est couvert par
+        # test_increment2_norm_quant_contract ; ici : la chaîne
+        # AR+norm+quant + accord inter-rangs, ci-dessous)
+        # 5. ACCORD INTER-RANGS : les deux rangs calculent la même somme
+        diff = (got[0]["out"].float() - got[1]["out"].float()).abs().max()
+        scale = got[0]["out"].float().abs().max().clamp_min(1e-6)
+        assert float(diff / scale) < 2e-3, (
+            f"les rangs divergent: {float(diff / scale):.4f}")
+        # 6. dbg_q identique entre rangs (même xf -> même y -> même q)
+        assert torch.equal(got[0]["dbg_q"], got[1]["dbg_q"]), (
+            "les rangs divergent sur q")
+        # 7. timing (rapporté — borne, pas un gate)
+        t = max(min(got[r]["times"]) for r in (0, 1))
+        print(f"AR in-kernel (M=1 c1) : {t:.0f} µs/appel (max des rangs, "
+              f"min de {n_calls} appels)")
+        assert got[0]["flags"].numel() == got[1]["flags"].numel()

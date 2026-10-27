@@ -98,6 +98,10 @@ if TYPE_CHECKING:
     VLLM_MOE_MEGAKERNEL_STRATEGY: str = "pair"
     VLLM_MOE_MEGAKERNEL_INT8_OUT: bool = False
     VLLM_MOE_MEGAKERNEL_MAX_TOKENS: int = 8
+    VLLM_MOE_MEGAKERNEL_ROUTING: bool = False
+    VLLM_MOE_MEGAKERNEL_NORM: bool = False
+    VLLM_MOE_MEGAKERNEL_AR: bool = False
+    VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS: int = 96
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
     VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS: int = 1
@@ -703,6 +707,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MOE_MEGAKERNEL_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "8") or 8
+    ),
+    # Tour 2 (incréments 2+3) : gates empilées du prologue — ROUTING
+    # (router+topk in-kernel, alias de STRATEGY=routing), NORM (norm+quant
+    # v2), AR (all-reduce 2 rangs in-kernel, exige NORM). Défaut OFF =
+    # repli sur le chemin livré verbatim.
+    "VLLM_MOE_MEGAKERNEL_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL_ROUTING", "0") or 0)
+    ),
+    "VLLM_MOE_MEGAKERNEL_NORM": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL_NORM", "0") or 0)
+    ),
+    "VLLM_MOE_MEGAKERNEL_AR": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL_AR", "0") or 0)
+    ),
+    "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS": lambda: int(
+        os.getenv("VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", "96") or 96
     ),
     # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
     # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the

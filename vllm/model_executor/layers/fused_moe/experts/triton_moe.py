@@ -675,9 +675,30 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             fused_moe_megakernel,
             moe_megakernel_eligible,
             moe_megakernel_enabled,
+            moe_megakernel_flags,
         )
 
         if not moe_megakernel_enabled():
+            return False
+        # Tour 2 (incréments 2+3) : les gates de prologue (ROUTING/NORM/AR)
+        # exigent des entrées que CE site d'appel n'a pas (residual, poids de
+        # norm, poids de router, handles IPC) — repli sur la chaîne livrée,
+        # compté et logué (fail loud).  Le raccordement au graphe réel est
+        # l'étape nommée restante (TOUR2-DESIGN §6 ; ETAPE-F §11 motif v2').
+        _routing, _norm, _ar = moe_megakernel_flags()
+        if _norm or _ar:
+            logger.warning_once(
+                "moe-megakernel: NORM/AR demandes mais non cables au site "
+                "d'appel (pas de res/norm_w/handles IPC) — repli sur la "
+                "chain livre"
+            )
+            return False
+        if _routing:
+            logger.warning_once(
+                "moe-megakernel: routage in-kernel demande mais le site "
+                "d'appel n'a pas de poids de router — repli sur la chain "
+                "livre"
+            )
             return False
         reason = moe_megakernel_eligible(
             hidden_states,
