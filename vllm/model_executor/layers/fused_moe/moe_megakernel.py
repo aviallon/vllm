@@ -165,6 +165,21 @@ def _rint_clamp_i8(v):
 FLAG_ELEMS = 256 // 4
 
 
+# INC-A (tour 3, mandat MFMA — TOUR3-FULL-FORWARD-DESIGN.md §3.4) :
+# politique de tuiles qui abaisse TOUS les dots en v_mfma (jamais v_dot4).
+# Mesure tour 1 : BM=1 tombe en v_dot4 (6-19x plus lent) ; le padding BM=16
+# (lignes pad masquées) a déjà divisé par 2 le temps du kernel pair.  Règle :
+# tout tl.dot a BM>=16 ET une dim de contraction >=16.  CI est la
+# contraction de gemm2 (et la tuile N de gemm1) : CI=8 tombait en micro-dots
+# v_dot4 ; CI=32 le remet en MFMA — et AMÉLIORE le contrat chunké (échelles
+# par (rangée, chunk) plus proches du per-token livré).  MK_BN2 borne l'acc2
+# de gemm2 côté sortie : l'acc2 [BM,K] plein de la v1 dépassait le fichier
+# de registres à BM=16 (512/lane = cap = spill).
+MK_BM = 16
+MK_CI = 32
+MK_BN2 = 64
+
+
 @triton.jit
 def _mk_norm_chunk(x_rows, peer_rows, res_rows, norm_w_ptr,
                    offs, valid, rstd,
@@ -371,9 +386,10 @@ def _expert_chunk_work(
     out_acc_ptr, tokens,
     e64, w_s,
     stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
-    offs_i, offs_k, offs_o,
+    offs_i, offs_k,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
     BM: tl.constexpr, BKO: tl.constexpr, CI: tl.constexpr,
+    BN2: tl.constexpr,
     X_IS_INT8: tl.constexpr = False,
     # --- INC 2/3 (tour 2) : source de q = chaîne norm+quant v2 ---
     NORM: tl.constexpr = False,
@@ -395,6 +411,12 @@ def _expert_chunk_work(
       v2, half-even) ; `inv_amax` porte `inv_s`, `sx_rows` porte `scale`
       (échelle de déquant = scale, verbatim spec §6.1).  AR ajoute le
       peer-load dans xf.  `do_dbg_q` publie q (surface de test, contrat).
+
+    INC-A (MFMA) : gemm2 est tuilé en sortie BN2 (contraction CI>=16 =
+    v_mfma, acc2 borné [BM,BN2] — l'acc2 [BM,K] plein spillait à BM=16) ;
+    `e64`/`w_s` peuvent être SCALAIRES (broadcast de la rangée 0 en mode
+    ROUTING à BM=16 : les lignes pad partagent l'expert — sinon le gather
+    des poids deviendrait ×BM et détruirait le trafic poids).
     """
     acc_g = tl.zeros((BM, CI), dtype=tl.float32)
     acc_u = tl.zeros((BM, CI), dtype=tl.float32)
@@ -437,15 +459,24 @@ def _expert_chunk_work(
     sc = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
 
-    w2t = tl.load(w2_ptr + e64 * stride_w2e
-                  + offs_i[:, None]
-                  + offs_o[None, :] * stride_w2k)
-    acc2 = tl.zeros((BM, K), dtype=tl.float32) + tl.dot(q, w2t)
-    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o)
-    contrib = acc2 * (sc * w_s)[:, None] * s2[None, :]
-    tl.atomic_add(out_acc_ptr + tokens.to(tl.int64)[:, None] * K
-                  + offs_o[None, :], contrib, mask=valid[:, None],
-                  sem="relaxed", scope="gpu")
+    # ---------------------------------------------------------------
+    # gemm2 : tuiles de sortie BN2 (INC-A MFMA — contraction CI>=16,
+    # acc2 borné [BM,BN2]), poids routé dans l'épilogue
+    # ---------------------------------------------------------------
+    offs_t = tl.arange(0, BN2)
+    for base in range(0, K, BN2):
+        o = base + offs_t
+        m_o = o < K
+        w2t = tl.load(w2_ptr + e64 * stride_w2e
+                      + offs_i[:, None]
+                      + o[None, :] * stride_w2k)
+        acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+        s2 = tl.load(w2_scale_ptr + e64 * K + o, mask=m_o, other=0.0)
+        contrib = acc2 * (sc * w_s)[:, None] * s2[None, :]
+        tl.atomic_add(out_acc_ptr + tokens.to(tl.int64)[:, None] * K
+                      + o[None, :], contrib,
+                      mask=valid[:, None] & m_o[None, :],
+                      sem="relaxed", scope="gpu")
 
 
 @triton.jit
@@ -488,6 +519,7 @@ def qwen3_moe_megakernel(
     BM: tl.constexpr,
     BKO: tl.constexpr,
     CI: tl.constexpr,
+    BN2: tl.constexpr,
     NAIVE: tl.constexpr,
     ROUTING: tl.constexpr = False,
     RENORM: tl.constexpr = True,
@@ -519,7 +551,6 @@ def qwen3_moe_megakernel(
 
     offs_i = chunk * CI + tl.arange(0, CI)
     offs_k = tl.arange(0, BKO)
-    offs_o = tl.arange(0, K)
 
     if ROUTING:
         # ---- INCRÉMENT 1 : router + topk absorbés (CTA = (token, chunk)) --
@@ -651,6 +682,14 @@ def qwen3_moe_megakernel(
                      mask=valid)
             tl.store(dbg_w_ptr + tokens.to(tl.int64) * top_k + _s, w_s,
                      mask=valid)
+            # INC-A (MFMA) : à BM=16 les lignes pad DOIVENT partager
+            # l'expert de la ligne 0 — 1 seul token valide par CTA (ligne 0,
+            # invariant ROUTING) ; si chaque ligne tirait son expert, le
+            # gather des poids deviendrait ×BM (16 experts distincts par
+            # tuile) et détruirait le trafic poids.  Broadcast SCALAIRE
+            # (somme d'un seul élément = exact) de la sélection ligne 0.
+            e0 = tl.sum(tl.where(tl.arange(0, BM) == 0, e_t, 0))
+            w0 = tl.sum(tl.where(tl.arange(0, BM) == 0, w_s, 0.0))
             # q n'a pas de dépendance à l'expert : publié une seule fois
             # (première itération, chunk 0) — surface de test (contrat).
             do_dbg = (chunk == 0) if _s == 0 else 0
@@ -658,10 +697,10 @@ def qwen3_moe_megakernel(
                 x_rows, valid, inv_amax, sx_rows,
                 w1_ptr, w1_scale_ptr, w2_ptr, w2_scale_ptr,
                 out_acc_ptr, tokens,
-                e_t.to(tl.int64), w_s,
+                e0.to(tl.int64), w0,
                 stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
-                offs_i, offs_k, offs_o,
-                top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
+                offs_i, offs_k,
+                top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, BN2=BN2,
                 X_IS_INT8=False,
                 NORM=NORM, AR=AR,
                 res_rows=res_rows, peer_rows=peer_rows,
@@ -696,8 +735,8 @@ def qwen3_moe_megakernel(
             out_acc_ptr, tokens,
             e64, wt,
             stride_xm, stride_w1e, stride_w1n, stride_w2e, stride_w2k,
-            offs_i, offs_k, offs_o,
-            top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
+            offs_i, offs_k,
+            top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, BN2=BN2,
             X_IS_INT8=True,
         )
 
@@ -1014,7 +1053,9 @@ def fused_moe_megakernel(
         assert naive, "routing in-kernel: regime naive only"
         assert hidden_states.dtype is torch.bfloat16, (
             "routing in-kernel: bf16 x requis (le router livré voit le bf16)")
-        CI = 8
+        # INC-A MFMA : CI>=16 (contraction gemm2) et BM=16 (lignes pad) =
+        # v_mfma au lieu de v_dot4 (6-19x plus lent, mesuré tour 1).
+        CI = MK_CI
         n_chunks = triton.cdiv(I, CI)
         if norm_flag:
             assert res is not None and norm_w is not None and res_out is not None, (
@@ -1104,7 +1145,8 @@ def fused_moe_megakernel(
             w2.stride(0), w2.stride(1),
             res_t, res_out_t, norm_w_t, eps, dbg_scale_t, dbg_q_t,
             slot_ptr, peer_x_ptr, flag_ptr, peer_flag_ptr,
-            top_k=top_k, K=K, I=I, BM=1, BKO=128, CI=CI, NAIVE=True,
+            top_k=top_k, K=K, I=I, BM=MK_BM, BKO=128, CI=CI, BN2=MK_BN2,
+            NAIVE=True,
             ROUTING=True, RENORM=True, E=w1.size(0),
             NORM=norm_flag, AR=ar_flag, FLAG_ELEMS_C=FLAG_ELEMS,
             num_warps=4, num_stages=1,
@@ -1121,7 +1163,9 @@ def fused_moe_megakernel(
         return
 
     if strategy == "atomic":
-        CI = 8
+        # INC-A MFMA : CI>=16 (contraction gemm2 en v_mfma au lieu des
+        # micro-dots v_dot4 de CI=8) + sortie tuilée BN2 (registres bornés).
+        CI = MK_CI
         out_acc = torch.zeros((M, K), device=output.device,
                               dtype=torch.float32)
         grid = (n_blocks, triton.cdiv(I, CI))
@@ -1145,7 +1189,8 @@ def fused_moe_megakernel(
             w1.new_zeros((1,)),                          # dbg_scale
             w1.new_zeros((1,), dtype=torch.int8),         # dbg_q
             0, 0, 0, 0,                                  # slot/peer/flags
-            top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, NAIVE=naive,
+            top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI, BN2=MK_BN2,
+            NAIVE=naive,
             num_warps=4,
         )
         if getattr(envs, "VLLM_MOE_MEGAKERNEL_INT8_OUT", False):

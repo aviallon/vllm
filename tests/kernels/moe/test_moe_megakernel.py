@@ -10,6 +10,8 @@ tâche est jugée par les gates aval) :
 * stratégie `atomic` : idem + échelle par (rangée, chunk) + somme atomique ;
 * repli : toute condition non éligible → `moe_megakernel_eligible` renvoie
   une raison et `_maybe_moe_megakernel` ne modifie rien.
+* INC-A (mandat MFMA) : le codegen de CHAQUE kernel contient v_mfma et
+  AUCUN v_dot4 (test ASM — sans lui, le mandat MFMA n'est pas prouvé).
 """
 from __future__ import annotations
 
@@ -20,6 +22,9 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+    MK_BM,
+    MK_BN2,
+    MK_CI,
     fused_moe_megakernel,
     moe_megakernel_eligible,
     moe_megakernel_enabled,
@@ -766,13 +771,13 @@ def test_increment3_grid_bound_fails_loud():
     envs.VLLM_MOE_MEGAKERNEL_ROUTING = True
     envs.VLLM_MOE_MEGAKERNEL_NORM = True
     envs.VLLM_MOE_MEGAKERNEL_AR = True
-    M, top_k, E, I, K = 8, 8, 256, 256, 512   # 8 × 32 = 256 CTAs > 96
+    M, top_k, E, I, K = 13, 8, 256, 256, 512   # 13 × 8 = 104 CTAs > 96
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     res = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
     w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
     fake_comm = types.SimpleNamespace(
-        rows=256, hidden=K, n_chunks=(I + 7) // 8,
+        rows=256, hidden=K, n_chunks=-(-I // MK_CI),
         data_ptr=0, peer_data_ptr=0, flag_ptr=0, peer_flag_ptr=0)
     with pytest.raises(AssertionError, match="co-résidence"):
         fused_moe_megakernel(
@@ -785,7 +790,7 @@ def test_increment3_grid_bound_fails_loud():
             top_k_override=top_k,
             res=res, norm_w=torch.ones(K, device="cuda"),
             res_out=torch.empty_like(res), ar_comm=fake_comm)
-    assert M * ((I + 7) // 8) > _ar_max_ctas()  # précondition du test
+    assert M * (-(-I // MK_CI)) > _ar_max_ctas()  # précondition du test
     assert _ar_max_ctas() <= 104  # résidence mesurée (borne dure)
 
 
@@ -896,7 +901,7 @@ def _mk_two_rank_worker(rank, world, port, outdir, n_timed, n_burst):
     norm_w = torch.randn(K, device=dev).float() * 0.5 + 1.0
     router_w = torch.randn(E, K, device=dev, dtype=torch.bfloat16) * 0.02
 
-    n_chunks = (I + 7) // 8
+    n_chunks = -(-I // MK_CI)
     comm = MoeMegakernelComm(dist.group.WORLD, M, K, n_chunks)
     out = torch.zeros(M, K, device=dev, dtype=torch.bfloat16)
     res_out = torch.empty(M, K, device=dev, dtype=torch.bfloat16)
@@ -1090,3 +1095,101 @@ class TestIncrement3TwoRank:
             print(f"  rank {r} times: "
                   f"{[round(t, 1) for t in got[r]['times']]}")
         assert got[0]["flags"].numel() == got[1]["flags"].numel()
+
+
+# ---------------------------------------------------------------------------
+# INC-A (tour 3, mandat MFMA — TOUR3-FULL-FORWARD-DESIGN.md §3.4)
+# ---------------------------------------------------------------------------
+_MK_SIG = {
+    "x_ptr": "*bf16", "x_scale_ptr": "*fp32",
+    "w1_ptr": "*i8", "w1_scale_ptr": "*fp32",
+    "w2_ptr": "*i8", "w2_scale_ptr": "*fp32",
+    "topk_w_ptr": "*fp32", "topk_ids_ptr": "*i32",
+    "sorted_token_ids_ptr": "*i32", "expert_ids_ptr": "*i32",
+    "out_acc_ptr": "*fp32", "num_valid": "i32",
+    "router_w_ptr": "*bf16", "dbg_ids_ptr": "*i32", "dbg_w_ptr": "*fp32",
+    "stride_xm": "i32", "stride_w1e": "i32", "stride_w1n": "i32",
+    "stride_w2e": "i32", "stride_w2k": "i32",
+    "res_ptr": "*bf16", "res_out_ptr": "*bf16", "norm_w_ptr": "*fp32",
+    "eps": "fp32", "dbg_scale_ptr": "*fp32", "dbg_q_ptr": "*i8",
+    "slot_ptr": "i64", "peer_x_ptr": "i64",
+    "flag_ptr": "i64", "peer_flag_ptr": "i64",
+}
+
+
+def _compile_asm(fn, sig, constexprs, num_warps, num_stages):
+    """Compile pour gfx90a et retourne l'asm — méthode du smoke
+    `moe_megakernel_smoke.py` (ASTSource + triton_compile ; compile-only,
+    pas de GPU requis).  Piège tour 2 : ASTSource n'applique PAS les défauts
+    des constexprs — tout est explicite."""
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource, compile as triton_compile
+
+    names = list(fn.arg_names)
+    sig = {k: v for k, v in sig.items() if k in names}
+    src = ASTSource(fn=fn, signature=sig, constexprs=constexprs)
+    c = triton_compile(src, target=GPUTarget("hip", "gfx90a", 32),
+                       options={"num_warps": num_warps,
+                                "num_stages": num_stages})
+    return c.asm.get("amdgcn", "") or ""
+
+
+def test_asm_mfma_no_vdot4():
+    """Mandat opérateur (2026-10-27) : les dots des kernels du megakernel
+    sont en v_mfma **K>=16 par instruction** — AUCUN v_dot4.  Sans ce test la
+    revendication MFMA n'est pas prouvée : les dots tombent silencieusement
+    en v_dot4 quand BM<16 ou contraction <16 (mesuré tour 1 : 6-19x plus
+    lent ; smoke campagne : BM=1/CI=8 = 68-544 v_dot4, BM=16/CI=32 = 288-560
+    v_mfma et 0 v_dot4)."""
+    import re
+
+    from vllm.model_executor.layers.fused_moe import moe_megakernel as mk
+
+    base = {"top_k": 8, "K": 2048, "I": 256}
+    cases = []
+
+    # 1. routing + norm + ar (le kernel phare des incréments 1-3), config
+    #    de lancement réelle (launcher : BM=MK_BM, CI=MK_CI, BN2=MK_BN2,
+    #    num_warps=4, num_stages=1).
+    cases.append((
+        "routing+norm+ar", mk.qwen3_moe_megakernel, dict(_MK_SIG),
+        {**base, "BM": MK_BM, "BKO": 128, "CI": MK_CI, "BN2": MK_BN2,
+         "NAIVE": True, "ROUTING": True, "RENORM": True, "E": 256,
+         "NORM": True, "AR": True, "FLAG_ELEMS_C": 64}, 4, 1))
+    # 2. atomic tour 1 (chemin non-routing, x int8) — config du launcher.
+    sig = dict(_MK_SIG)
+    sig["x_ptr"] = "*i8"
+    cases.append((
+        "atomic-tour1", mk.qwen3_moe_megakernel, sig,
+        {**base, "BM": MK_BM, "BKO": 128, "CI": MK_CI, "BN2": MK_BN2,
+         "NAIVE": True, "ROUTING": False, "RENORM": True, "E": 256,
+         "NORM": False, "AR": False, "FLAG_ELEMS_C": 64}, 4, 2))
+    # 3. pair (v1) — config du launcher (BM=16, BN2=64, nw=8, ns=1).
+    sig = dict(_MK_SIG)
+    sig["x_ptr"] = "*i8"
+    sig["c3_ptr"] = "*bf16"
+    sig.pop("out_acc_ptr")
+    sig["stride_c3m"] = "i32"
+    cases.append((
+        "pair-v1", mk.qwen3_moe_pair_fusion_kernel, sig,
+        {**base, "BM": MK_BM, "BKO": 128, "BN2": MK_BN2, "NAIVE": True},
+        8, 1))
+
+    for name, fn, sig, cst, nw, ns in cases:
+        asm = _compile_asm(fn, sig, cst, nw, ns)
+        mnems = sorted(set(re.findall(r"v_mfma_[a-z0-9_]+", asm)))
+        n_dot4 = asm.count("v_dot4")
+        print(f"asm {name}: mfma={mnems} v_dot4 x{n_dot4}")
+        assert mnems, (
+            f"{name}: AUCUN v_mfma dans le codegen — les dots sont tombés "
+            f"en micro-dots (BM<16 ou contraction <16 ?)")
+        assert n_dot4 == 0, (
+            f"{name}: v_dot4 présent {n_dot4}x — mandat MFMA violé")
+        # K>=16 par instruction : le 3e nombre du mnémonique
+        # (v_mfma_i32_16x16x16i8 -> K=16 ; v_mfma_i32_32x32x8i8 -> K=8).
+        for m in mnems:
+            mt = re.search(r"_(\d+)x(\d+)x(\d+)", m)
+            assert mt, f"{name}: mnémonique MFMA illisible: {m}"
+            assert int(mt.group(3)) >= 16, (
+                f"{name}: {m} a K={mt.group(3)} < 16 par instruction — "
+                f"mandat « v_mfma K>=16 » violé")
