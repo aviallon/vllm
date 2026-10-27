@@ -257,5 +257,36 @@ def test_fallback_is_shipped_path(monkeypatch):
     assert called["n"] == 0
 
 
+def test_fallback_with_gate_on_does_not_raise():
+    """Gate ON + inéligible : le repli doit S'EXÉCUTER (y compris sa ligne
+    de log) sans lever.  LEÇON 2026-10-25 : une ligne de log avec `logger`
+    non défini a crash-loopé un pod prod — la ligne de repli n'avait jamais
+    tourné avant expédition.  Ce test exécute exactement cette ligne."""
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 8
+
+    exp = object.__new__(TritonExperts)
+    exp._lora_context = None
+    exp.quant_config = type("Q", (), {"use_int8_w8a8": True})()
+    exp.per_act_token_quant = True
+    exp.block_shape = None
+    exp.quantization_emulation = False
+    exp.activation_config = type("A", (), {"clamp_limit": None})()
+    exp.w1_bias = None
+    exp.w2_bias = None
+
+    M, top_k, E, I, K = 9, 8, 256, 32, 256   # M=9 > seuil -> repli
+    x = torch.zeros(M, K, device="cuda", dtype=torch.int8)
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    ids = torch.zeros(M, top_k, device="cuda", dtype=torch.int32)
+    # ne doit PAS lever (le chemin de repli s'exécute, log compris)
+    assert exp._maybe_moe_megakernel(
+        None, x, w1, w2, None, ids, torch.ones(M, 1, device="cuda"),
+        None, False, None,
+    ) is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "--no-header", "-x"]))

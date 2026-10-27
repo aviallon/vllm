@@ -95,6 +95,8 @@ if TYPE_CHECKING:
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_SCALED_MM_FUSED_QUANT: bool = False
     VLLM_MOE_MEGAKERNEL: bool = False
+    VLLM_MOE_MEGAKERNEL_STRATEGY: str = "pair"
+    VLLM_MOE_MEGAKERNEL_INT8_OUT: bool = False
     VLLM_MOE_MEGAKERNEL_MAX_TOKENS: int = 8
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
@@ -692,6 +694,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # atomique). Default OFF = la chain livree verbatim.
     "VLLM_MOE_MEGAKERNEL": lambda: bool(
         int(os.getenv("VLLM_MOE_MEGAKERNEL", "0") or 0)
+    ),
+    "VLLM_MOE_MEGAKERNEL_STRATEGY": lambda: os.getenv(
+        "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair"
+    ),
+    "VLLM_MOE_MEGAKERNEL_INT8_OUT": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL_INT8_OUT", "0") or 0)
     ),
     "VLLM_MOE_MEGAKERNEL_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "8") or 8
