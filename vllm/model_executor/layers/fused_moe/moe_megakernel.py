@@ -119,10 +119,23 @@ __all__ = [
 # conservateur vs l'occupation mesurée au smoke (à ré-étalonner avec le
 # compteur d'occupation du build inc 2/3 — R2 : instrument nommé).
 def _ar_max_ctas() -> int:
-    return int(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", 96))
+    # Borné par la résidence MESURÉE (smoke : shared 65 536 → 1 WG/CU →
+    # 104 CU sur MI210) : monter la variable d'env au-delà convertirait le
+    # fail-loud en hang (revue GLM m1) — clampé, jamais silencieux.
+    req = int(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", 96))
+    if req > AR_RESIDENT_CTAS_HARD:
+        _log_once(
+            "mk-ar-max-ctas-clamped",
+            "[moe-megakernel] AR_MAX_CTAS=%d > résidence mesurée %d — "
+            "bridé à %d (au-delà : deadlock de scheduling entre rangs)",
+            req, AR_RESIDENT_CTAS_HARD, AR_RESIDENT_CTAS_HARD,
+        )
+        return AR_RESIDENT_CTAS_HARD
+    return req
 
 
 AR_MAX_CTAS = 96
+AR_RESIDENT_CTAS_HARD = 104
 
 
 # ---------------------------------------------------------------------------
@@ -176,36 +189,53 @@ def _mk_norm_chunk(x_rows, peer_rows, res_rows, norm_w_ptr,
 
 
 @triton.jit
-def _mk_ar_rendezvous(x_row, slot_row, row, chunk, flag_p, pflag_p,
+def _mk_ar_rendezvous(x_row_base, slot_base, row, chunk, flag_p, pflag_p,
                       n_chunks: tl.constexpr, flag_elems: tl.constexpr,
                       K: tl.constexpr, BLOCK_H: tl.constexpr):
-    """Phase 0 AR (inc 3) — primitives PROUVÉES (micro-exp triton-3way-cap
-    2026-10-22 : peer-loads exacts ; peer-STORES nus = anomalie 65536/65536
-    — ICI store LOCAL uniquement) :
+    """Phase 0 AR (inc 3) — protocole en deux moitiés :
 
-    1. publish = store LOCAL de ma rangée dans mon slot symétrique
-       (identique pour chaque (t,c) de la rangée — redondance bénigne,
-       valeurs identiques ; coût nommé au rapport) — ou, si l'entrée est
-       déjà matérialisée par le kernel précédent en ordre de stream, ce
-       store est la borne d'ordre du release de toute façon ;
-    2. séquence dérivée PAR SLOT in-kernel (`atomic_add(0, acquire)` puis
-       `atomic_xchg(seq, release)`) — jamais un scalar arg (cuit dans le
-       graphe = replays périmés silencieux) ;
-    3. spin `!= seq` (fail loud : hang > corruption silencieuse) sur le flag
-       PAIR avec un RMW `atomic_add(0, acquire, sys)` — non hoistable.
+    * moitié PUBLICATION (store `triton-3way-cap` 2026-10-22 +
+      `ar_norm_quant.py` phase 0) : séquence dérivée PAR SLOT in-kernel
+      (jamais un scalar arg : cuit dans le graphe = replays périmés
+      silencieux), publish LOCAL dans le tampon de parité (⚠ les stores
+      pairs nus sont une ANOMALIE mesurée — jamais), xchg release/sys de
+      MON flag, spin `!= seq` (fail loud) acquire/sys sur le flag pair
+      avec un RMW (non hoistable).
+    * moitié CONSOMMATION (revue GLM 2026-10-27 B1) : **double-tampon
+      ping-pong** — le publish de l'appel N écrit le tampon `seq & 1` et
+      les peer-loads de l'appel N lisent le tampon `seq & 1` du pair :
+      l'appel N+1 (deux côtés) travaille dans l'AUTRE tampon.  Pas de
+      course de réutilisation entre appels, sans handshake supplémentaire.
+      Complétude : l'appel N+2 du pair (seul à pouvoir réécrire mon tampon
+      de parité N) est bloqué par SON spin `!= seq` de l'appel N+1 tant que
+      mon flag N+1 n'est pas xchgé — or mon appel N+1 n'existe qu'après
+      mon appel N (ordre de flux) : l'avance du pair est plafonnée à <1
+      appel.  (Un ack de fin par slot — variante (a) — s'est révélé
+      INSUFFISANT : la ressource est par RANGÉE, lue par toutes les CTA
+      (t,·) du pair, alors que l'ack est par (rangée, chunk) — attrapé par
+      le test à x varié : res_out bit-exact mais q déchiré en fin de
+      kernel.  C'est le test falsifiable de la revue GLM M1 qui l'a vu.)
+
+    Retourne `seq` (l'appelant en déduit le tampon de parité des
+    peer-loads).
     """
-    for base in range(0, K, BLOCK_H):
-        offs = base + tl.arange(0, BLOCK_H)
-        m = offs < K
-        xv = tl.load(x_row + offs, mask=m, other=0.0)
-        tl.store(slot_row + offs, xv, mask=m)
     f_off = (row * n_chunks + chunk) * flag_elems
     cur = tl.atomic_add(flag_p + f_off, 0, sem="acquire", scope="sys")
     seq = cur + 1
+    # publish LOCAL dans MON tampon de parité
+    slot_row = slot_base + (row * 2 + (seq & 1)) * K
+    for base in range(0, K, BLOCK_H):
+        offs = base + tl.arange(0, BLOCK_H)
+        m = offs < K
+        xv = tl.load(x_row_base + offs, mask=m, other=0.0)
+        tl.store(slot_row + offs, xv, mask=m)
+    # séquence par slot + release
     tl.atomic_xchg(flag_p + f_off, seq, sem="release", scope="sys")
+    # moitié PUBLICATION : le pair a-t-il PUBLIÉ ?
     v = tl.atomic_add(pflag_p + f_off, 0, sem="acquire", scope="sys")
     while v != seq:
         v = tl.atomic_add(pflag_p + f_off, 0, sem="acquire", scope="sys")
+    return seq
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +408,9 @@ def _expert_chunk_work(
             if do_dbg_q:
                 tl.store(
                     dbg_q_ptr + tokens.to(tl.int64)[:, None] * K
-                    + (k * BKO + offs_k)[None, :], xq, mask=valid[:, None])
+                    + (k * BKO + offs_k)[None, :], xq,
+                    mask=(valid[:, None]
+                          & ((k * BKO + offs_k) < K)[None, :]))
         else:
             xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
                          mask=valid[:, None], other=0)
@@ -501,20 +533,25 @@ def qwen3_moe_megakernel(
         valid = tokens < num_valid
         x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
         res_rows = res_ptr + tokens.to(tl.int64) * K
-        peer_rows = peer_p + tokens.to(tl.int64) * K
         offs_e = tl.arange(0, E)
+
+        # peer_rows : tampon de PARITÉ du pair (ping-pong, moitié
+        # consommation) — n'est connu qu'après dérivation de `ar_seq`.
+        peer_rows = peer_p + tokens.to(tl.int64) * (2 * K)
 
         if AR:
             # ---- INC 3 : phase 0 AR — rendezvous par slot (rangée, chunk),
             # table de flags paddée 256 B (design finding : un flag par
-            # rangée ferait xchg la séquence 32× — corruption).  Symétrique
-            # et sans race : xchg de MON flag (t,c), spin sur le flag PAIR.
-            _mk_ar_rendezvous(
+            # rangée ferait xchg la séquence 32× — corruption).  Deux
+            # moitiés : publication (spin d'arrivée) ET consommation
+            # (double-tampon ping-pong — voir `_mk_ar_rendezvous`).
+            ar_seq = _mk_ar_rendezvous(
                 x_ptr + pid.to(tl.int64) * stride_xm,
-                slot_p + pid.to(tl.int64) * K,
+                slot_p,
                 pid, chunk, flag_p, pflag_p,
                 n_chunks=tl.cdiv(I, CI), flag_elems=FLAG_ELEMS_C,
                 K=K, BLOCK_H=256)
+            peer_rows = peer_rows + (ar_seq & 1) * K
 
         if NORM:
             # ---- INC 2 : prologue norm+quant v2 en 3 passes (contrat §3.2
@@ -737,14 +774,6 @@ def moe_megakernel_flags() -> tuple[bool, bool, bool]:
     return routing, norm, ar
 
 
-def moe_megakernel_norm_ar_requested() -> bool:
-    """Vrai si une gate de prologue est demandée — le site d'appel moteur
-    (`TritonExperts.apply`) n'a ni residual, ni poids de norm, ni handles
-    IPC : il replie sur la chaîne livrée (raccordement = étape nommée)."""
-    _r, norm, ar = moe_megakernel_flags()
-    return norm or ar
-
-
 @triton.jit
 def _mk_zero_flags_kernel(ptr, n, BLOCK: tl.constexpr):
     p = tl.cast(ptr.to(tl.int64), tl.pointer_type(tl.int32))
@@ -780,7 +809,10 @@ class MoeMegakernelComm:
         self.rows = rows
         self.hidden = hidden
         self.n_chunks = n_chunks
-        data_bytes = rows * hidden * 2  # bf16 (slot de publish)
+        # double-tampon PING-PONG par rangée (moitié consommation du
+        # handshake — voir `_mk_ar_rendezvous`) : layout [rows, 2, hidden]
+        # bf16 ; l'appel de séquence `seq` utilise le tampon `seq & 1`.
+        data_bytes = rows * 2 * hidden * 2  # bf16 × 2 tampons de parité
         flag_bytes = rows * n_chunks * FLAG_ELEMS * 4
         # registered BEFORE any graph capture; pointers are process-lifetime
         self.data_ptrs = CustomAllreduce.create_shared_buffer(
@@ -802,6 +834,13 @@ class MoeMegakernelComm:
         # (construction symétrique) — jamais d'écriture vers la mémoire
         # PAIRE : les stores pairs nus sont l'anomalie mesurée du probe
         # 2026-10-22 (65536/65536 mismatch).
+        # BARRIÈRE post-init (revue mimo) : sans elle, un rang peut lancer
+        # l'appel 1 pendant que l'autre zero-encore sa table — des octets
+        # périmés == 1 feraient passer le spin de publication avant la
+        # vraie publication (xf = mélange x + garbage).  Le vote collectif
+        # du `get_decision` de ar_norm_quant joue ce rôle côté 3-way.
+        import torch.distributed as dist
+        dist.barrier(group=group)
 
 
 def moe_megakernel_eligible(
@@ -988,6 +1027,12 @@ def fused_moe_megakernel(
             assert res.shape == (M, K) and res_out.shape == (M, K), (
                 "NORM: res/res_out doivent être [M, K]")
             assert norm_w.numel() == K, "NORM: norm_w doit être [K]"
+            # le kernel indexe avec stride K implicite (revue GLM m2) :
+            # un tenseur transposé/slicé lirait silencieusement de faux
+            # offsets — exigé contiguous, comme le livré.
+            assert (res.is_contiguous() and res_out.is_contiguous()
+                    and norm_w.is_contiguous()), (
+                "NORM: res/res_out/norm_w doivent être contigus")
         if ar_flag:
             assert ar_comm is not None, "AR: ar_comm (handles IPC) requis"
             assert ar_comm.hidden == K and ar_comm.n_chunks == n_chunks, (
@@ -996,8 +1041,10 @@ def fused_moe_megakernel(
             assert ar_comm.rows >= M, "AR: comm trop petite pour M"
             # plafond de co-résidence : le spin inter-rangs exige que toute
             # la grille finisse par tourner sur les DEUX rangs (sinon
-            # deadlock de scheduling entre rangs).  Repli = chemin livré,
-            # compté + logué (fail loud côté API : assertion).
+            # deadlock de scheduling entre rangs).  Au-delà : fail loud
+            # côté API (AssertionError) — le FUTUR câblage convertit ce
+            # raise en repli livré par appel (le site moteur replie déjà en
+            # amont, donc injoignable aujourd'hui).
             n_ctas = M * n_chunks
             if n_ctas > _ar_max_ctas():
                 _log_once(
@@ -1027,9 +1074,12 @@ def fused_moe_megakernel(
         norm_w_t = norm_w if norm_w is not None else torch.zeros(
             1, device=dev)
         dbg_scale_t = dbg_scale if dbg_scale is not None else torch.zeros(
-            1, device=dev)
+            M, device=dev)
+        # ⚠ les surfaces dbg sont ÉCRITES par le kernel en mode NORM (revue
+        # mimo B-OOB) : les dummies doivent avoir la VRAIE taille — un
+        # tenseur de 1 élément = écritures hors allocation (corruption GPU).
         dbg_q_t = dbg_q if dbg_q is not None else torch.zeros(
-            1, device=dev, dtype=torch.int8)
+            M, K, device=dev, dtype=torch.int8)
         if ar_comm is not None:
             slot_ptr = ar_comm.data_ptr
             peer_x_ptr = ar_comm.peer_data_ptr

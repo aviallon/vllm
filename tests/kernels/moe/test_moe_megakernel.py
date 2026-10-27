@@ -455,6 +455,7 @@ from vllm.model_executor.layers.fused_moe.moe_megakernel import (
     AR_MAX_CTAS,
     FLAG_ELEMS,
     MoeMegakernelComm,
+    _ar_max_ctas,
     _rint_clamp_i8,
     _round_i8,
     moe_megakernel_flags,
@@ -784,7 +785,8 @@ def test_increment3_grid_bound_fails_loud():
             top_k_override=top_k,
             res=res, norm_w=torch.ones(K, device="cuda"),
             res_out=torch.empty_like(res), ar_comm=fake_comm)
-    assert M * ((I + 7) // 8) > AR_MAX_CTAS  # précondition du test
+    assert M * ((I + 7) // 8) > _ar_max_ctas()  # précondition du test
+    assert _ar_max_ctas() <= 104  # résidence mesurée (borne dure)
 
 
 def test_engine_site_fallback_without_prologue_inputs(monkeypatch):
@@ -795,6 +797,14 @@ def test_engine_site_fallback_without_prologue_inputs(monkeypatch):
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+    # m4 (revue GLM) : la ligne de log de repli est ASSERTÉE, pas seulement
+    # supposée — la leçon 2026-10-25 est qu'une ligne jamais exécutée ne
+    # prouve rien.
+    import vllm.model_executor.layers.fused_moe.experts.triton_moe as tm
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tm.logger, "warning_once",
+        lambda msg, *a: seen.append(msg % a if a else msg))
     exp = object.__new__(TritonExperts)
     exp._lora_context = None
     exp.quant_config = type("Q", (), {"use_int8_w8a8": True})()
@@ -817,15 +827,25 @@ def test_engine_site_fallback_without_prologue_inputs(monkeypatch):
             None, False, None)
 
     # NORM demandé, non câblé au site -> repli + log
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", True)
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_AR", False)
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair")
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", False)
+    # (raising=False : `vllm.envs` résout paresseusement — les gates sont
+    # posées comme attributs de module par ce test)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", True, raising=False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_AR", False, raising=False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair",
+                        raising=False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", False,
+                        raising=False)
     assert call() is False
+    assert any("NORM/AR" in s for s in seen), (
+        f"ligne de repli NORM/AR non exécutée: {seen}")
     # ROUTING demandé (pas de router_w au site) -> repli + log
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", False)
-    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", True)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", False,
+                        raising=False)
+    monkeypatch.setattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", True,
+                        raising=False)
     assert call() is False
+    assert any("routage in-kernel" in s for s in seen), (
+        f"ligne de repli ROUTING non exécutée: {seen}")
     assert moe_megakernel_flags() == (True, False, False)
 
 
@@ -839,9 +859,17 @@ def _copy_flags_kernel(ptr, out_ptr, n, BLOCK: tl.constexpr):
                  mask=o < n)
 
 
-def _mk_two_rank_worker(rank, world, port, outdir, n_calls):
+def _mk_two_rank_worker(rank, world, port, outdir, n_timed, n_burst):
     """Module-level pour spawn (picklable) ; résultats en FICHIERS (pas de
-    mp.Queue — mesuré 2026-10-22 : EOFError sur le resource_sharer)."""
+    mp.Queue — mesuré 2026-10-22 : EOFError sur le resource_sharer).
+
+    Deux phases : (A) `n_timed` appels chronométrés (sync par appel) ;
+    (B) `n_burst` appels ENCHAÎNÉS sans sync, x RE-TIRÉ à chaque appel.
+    La phase B est ce qui peut falsifier la course de réutilisation du slot
+    entre appels (revue GLM 2026-10-27 M1 : avec x constant + syncs, la
+    batterie ne pouvait pas échouer sur B1 — la propriété qui tue en
+    production était précisément celle que le test ne pouvait pas manquer).
+    """
     import torch.distributed as dist
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -867,8 +895,6 @@ def _mk_two_rank_worker(rank, world, port, outdir, n_calls):
     res = torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 0.2
     norm_w = torch.randn(K, device=dev).float() * 0.5 + 1.0
     router_w = torch.randn(E, K, device=dev, dtype=torch.bfloat16) * 0.02
-    torch.manual_seed(100 + rank)  # x : shard PROPRE à chaque rang
-    x = torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 0.5
 
     n_chunks = (I + 7) // 8
     comm = MoeMegakernelComm(dist.group.WORLD, M, K, n_chunks)
@@ -878,47 +904,63 @@ def _mk_two_rank_worker(rank, world, port, outdir, n_calls):
     dbg_scale = torch.zeros(M, device=dev)
     dbg_ids = torch.zeros(M, top_k, device=dev, dtype=torch.int32)
     dbg_w = torch.zeros(M, top_k, device=dev)
-    times = []
-    for _ in range(n_calls):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
+
+    total = n_timed + n_burst
+    times, recs = [], []
+    for k in range(total):
+        # x RE-TIRÉ à chaque appel (shard propre au rang) : une lecture
+        # déchirée du slot entre appels mélange deux x différents et est
+        # alors DÉTECTABLE bit-exact sur res_out.
+        torch.manual_seed(1000 + 100 * rank + k)
+        x = torch.randn(M, K, device=dev, dtype=torch.bfloat16) * 0.5
+        timed = k < n_timed
+        if timed:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
         fused_moe_megakernel(
             out, x, w1, w2, None, None, None, w1s, w2s,
             naive=True, router_w=router_w, top_k_override=top_k,
             res=res, norm_w=norm_w, eps=1e-6, res_out=res_out,
             dbg_scale=dbg_scale, dbg_q=dbg_q,
             dbg_ids=dbg_ids, dbg_w=dbg_w, ar_comm=comm)
-        torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1e6)
+        if timed:
+            torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1e6)
+        # clones ASYNCHRONES sur le flux (aucun sync dans la rafale B)
+        recs.append((x, res_out.clone(), dbg_q.clone(), dbg_scale.clone(),
+                     dbg_ids.clone(), dbg_w.clone(), out.clone()))
+    torch.cuda.synchronize()
 
     n_flags = M * n_chunks * FLAG_ELEMS
     flags = torch.empty(n_flags, device=dev, dtype=torch.int32)
     _copy_flags_kernel[((n_flags + 1023) // 1024,)](
         comm.flag_ptr, flags, n_flags, BLOCK=1024)
     torch.cuda.synchronize()
-    torch.save(
-        {
-            "rank": rank,
-            "out": out.cpu(),
-            "res_out": res_out.cpu(),
-            "res": res.cpu(),
-            "x": x.cpu(),
-            "norm_w": norm_w.cpu(),
-            "dbg_q": dbg_q.cpu(),
-            "dbg_scale": dbg_scale.cpu(),
-            "dbg_ids": dbg_ids.cpu(),
-            "dbg_w": dbg_w.cpu(),
-            "flags": flags.cpu(),
-            "times": times,
-        },
-        f"{outdir}/rank{rank}.pt",
-    )
+    save = {
+        "rank": rank,
+        "res": res.cpu(),
+        "norm_w": norm_w.cpu(),
+        "flags": flags.cpu(),
+        "times": times,
+        "recs": [tuple(t.cpu() for t in r) for r in recs],
+    }
+    if rank == 0:
+        # poids (identiques des deux côtés, seed 7) pour la référence
+        # d'experts côté parent (revue GLM M2 : sous AR, `out` doit avoir
+        # une RÉFÉRENCE, pas seulement l'accord inter-rangs)
+        save["w1"] = w1.cpu()
+        save["w2"] = w2.cpu()
+        save["w1s"] = w1s.cpu()
+        save["w2s"] = w2s.cpu()
+    torch.save(save, f"{outdir}/rank{rank}.pt")
     dist.destroy_process_group()
 
 
 class TestIncrement3TwoRank:
     """INC 3 : AR 2 rangs in-kernel, méthode 2b — exact JUSQU'À la requant
-    finale vs la somme fp32 exacte, accord inter-rangs, flags par slot.
+    finale vs la somme fp32 exacte, accord inter-rangs, flags par slot
+    (publication ET consommation), et réutilisation du slot entre appels
+    falsifiée (x varié + rafale sans sync).
 
     Opt-in (env `MOEMK_2GPU_TEST=1`) : exige une paire XGMI (sur une paire
     PCIe les atomiques entiers cross-device du spin ne sont pas garantis —
@@ -939,13 +981,14 @@ class TestIncrement3TwoRank:
             pytest.skip(f"vllm._custom_ops unavailable: {exc}")
         import torch.multiprocessing as mp
 
-        n_calls = 8  # la séquence est dérivée par slot : n appels -> seq n
+        n_timed, n_burst = 8, 16
+        total = n_timed + n_burst
         ctx = mp.get_context("spawn")
         outdir = os.environ.get("MOEMK_TEST_OUT", "/tmp/moemk-2rank")
         os.makedirs(outdir, exist_ok=True)
         procs = [
             ctx.Process(target=_mk_two_rank_worker,
-                        args=(r, 2, 29531, outdir, n_calls))
+                        args=(r, 2, 29531, outdir, n_timed, n_burst))
             for r in (0, 1)
         ]
         for p in procs:
@@ -962,56 +1005,87 @@ class TestIncrement3TwoRank:
         got = {r: torch.load(f"{outdir}/rank{r}.pt", weights_only=False)
                for r in (0, 1)}
 
-        # --- flags par (rangée, chunk) : SÉQUENCE DÉRIVÉE PAR SLOT ---
-        # un flag par rangée ferait xchg la séquence n_chunks× (corruption) :
-        # chaque slot doit valoir EXACTEMENT n_calls (1 xchg/CTA/appel), et
-        # le padding 256 B doit rester à zéro (aucun débordement).
+        # --- flags par (rangée, chunk) : moitié PUBLICATION du handshake ---
+        # élément 0 = flag de publication (séquence dérivée par slot —
+        # exactement UN xchg par slot par appel : total, ni plus ni moins) ;
+        # éléments 1+ = padding 256 B (vierge).  La moitié CONSOMMATION est
+        # le double-tampon ping-pong (pas de compteur ici) — falsifiée par
+        # la rafale à x varié ci-dessous.
+        # Un flag par rangée ferait xchg la séquence n_chunks× (corruption).
         for rank in (0, 1):
             fl = got[rank]["flags"]
-            n_chunks = fl.numel() // FLAG_ELEMS
             slots = fl.view(-1, FLAG_ELEMS)
-            assert (slots[:, 0] == n_calls).all(), (
-                f"rank {rank}: slots != {n_calls}: {slots[:, 0].tolist()}")
+            assert (slots[:, 0] == total).all(), (
+                f"rank {rank}: flag publication != {total}: "
+                f"{slots[:, 0].tolist()}")
             assert (slots[:, 1:] == 0).all(), (
                 f"rank {rank}: padding de flag non nul")
 
         res0, w0 = got[0]["res"], got[0]["norm_w"]
-        for rank in (0, 1):
-            x_self, x_peer = got[rank]["x"], got[1 - rank]["x"]
-            q_ref, scale_ref, res_ref, yb_ref = reference_norm_chain(
-                x_self, res0, w0, 1e-6, peer=x_peer)
-            # 1. res_out BIT-EXACT (xf = bf16(fp32+fp32) identique)
-            assert torch.equal(got[rank]["res_out"], res_ref), (
-                f"rank {rank}: res_out != contrat")
-            # 2. scale : classe-3 (ordre de réduction de var)
-            assert torch.allclose(got[rank]["dbg_scale"], scale_ref[:, 0],
-                                  rtol=1e-4, atol=1e-8), (
-                f"rank {rank}: scale hors contrat")
-            # 3. méthode 2b : q EXACT jusqu'à la requant finale (±1 LSB)
-            flips = (got[rank]["dbg_q"].int() - q_ref.int()).abs()
-            assert (flips <= 1).all(), (
-                f"rank {rank}: q diverge de >1 LSB: {flips.max()}")
-            print(f"rank {rank}: q +/-1 LSB flips: "
-                  f"{int((flips > 0).sum())}/{flips.numel()}")
-        # (le contrat travail d'expert est couvert par
-        # test_increment2_norm_quant_contract ; ici : la chaîne
-        # AR+norm+quant + accord inter-rangs, ci-dessous)
-        # 5. ACCORD INTER-RANGS : les deux rangs calculent la même somme
-        diff = (got[0]["out"].float() - got[1]["out"].float()).abs().max()
-        scale = got[0]["out"].float().abs().max().clamp_min(1e-6)
-        assert float(diff / scale) < 2e-3, (
-            f"les rangs divergent: {float(diff / scale):.4f}")
-        # 6. dbg_q identique entre rangs (même xf -> même y -> même q)
-        assert torch.equal(got[0]["dbg_q"], got[1]["dbg_q"]), (
-            "les rangs divergent sur q")
-        # 7. timing (rapporté — borne, pas un gate).  Le wall d'un appel
+        # référence d'experts (M2) : poids sauvegardés par le rang 0, sur
+        # GPU pour les ops de quant (même régime que les tests inc 2)
+        w1 = got[0]["w1"].cuda()
+        w2 = got[0]["w2"].cuda()
+        w1s = got[0]["w1s"].cuda()
+        w2s = got[0]["w2s"].cuda()
+
+        flips_total = 0
+        for k in range(total):
+            for rank in (0, 1):
+                x_self = got[rank]["recs"][k][0]
+                x_peer = got[1 - rank]["recs"][k][0]
+                q_ref, scale_ref, res_ref, _ = reference_norm_chain(
+                    x_self, res0, w0, 1e-6, peer=x_peer)
+                (_x, res_out_k, dbg_q_k, dbg_scale_k,
+                 dbg_ids_k, dbg_w_k, out_k) = got[rank]["recs"][k]
+                # 1. res_out BIT-EXACT — un slot déchiré entre appels
+                #    (x_k mélangé à x_{k+1}) casse CETTE égalité
+                assert torch.equal(res_out_k, res_ref), (
+                    f"rank {rank} call {k}: res_out != contrat "
+                    f"(slot déchiré entre appels ?)")
+                # 2. scale : classe-3 (ordre de réduction de var)
+                assert torch.allclose(dbg_scale_k, scale_ref[:, 0],
+                                      rtol=1e-4, atol=1e-8), (
+                    f"rank {rank} call {k}: scale hors contrat")
+                # 3. méthode 2b : q EXACT jusqu'à la requant finale (±1 LSB)
+                flips = (dbg_q_k.int() - q_ref.int()).abs()
+                assert (flips <= 1).all(), (
+                    f"rank {rank} call {k}: q diverge de >1 LSB: {flips.max()}")
+                flips_total += int((flips > 0).sum())
+                # 4. M2 : le travail d'expert a une RÉFÉRENCE sous AR
+                ref_acc = reference_experts_from_q(
+                    q_ref.cuda(), scale_ref.cuda(), w1, w2, w1s, w2s,
+                    dbg_ids_k.cuda(), dbg_w_k.cuda())
+                ref_out = _requant_roundtrip(ref_acc)
+                err = _rel_err(out_k.cuda(), ref_out)
+                assert err < 0.03, (
+                    f"rank {rank} call {k}: expert-work rel_err={err:.4f}")
+            # 5. ACCORD INTER-RANGS par appel
+            out0 = got[0]["recs"][k][6].float()
+            out1 = got[1]["recs"][k][6].float()
+            diff = (out0 - out1).abs().max()
+            scale = out0.abs().max().clamp_min(1e-6)
+            assert float(diff / scale) < 2e-3, (
+                f"call {k}: les rangs divergent: {float(diff / scale):.4f}")
+            assert torch.equal(got[0]["recs"][k][2], got[1]["recs"][k][2]), (
+                f"call {k}: les rangs divergent sur q")
+        print(f"q +/-1 LSB flips (total {total} appels x 2 rangs) : "
+              f"{flips_total}")
+        # plafond de flips (revue mimo : « 0/2048 » est une OBSERVATION, le
+        # gate doit être un plafond — une régression à des centaines de
+        # flips ±1 LSB ne doit pas passer) : ≤ 1 % des éléments.
+        n_elems = total * 2 * got[0]["recs"][0][2].numel()
+        assert flips_total <= n_elems // 100, (
+            f"trop de flips requant: {flips_total}/{n_elems}")
+
+        # 6. timing (rapporté — borne, pas un gate).  Le wall d'un appel
         #    inclut le SKEW d'amorçage entre les processus rangs (le spin
         #    absorbe le skew en temps d'attente) : min sur N appels = le
         #    meilleur couplage observé, médiane = le régime courant.
         tmin = max(min(got[r]["times"]) for r in (0, 1))
         tmed = max(statistics.median(got[r]["times"]) for r in (0, 1))
         print(f"AR in-kernel (M=1 c1) : min {tmin:.1f} µs / méd {tmed:.1f} µs "
-              f"(max des rangs, {n_calls} appels)")
+              f"(max des rangs, {n_timed} appels chronométrés)")
         for r in (0, 1):
             print(f"  rank {r} times: "
                   f"{[round(t, 1) for t in got[r]['times']]}")
