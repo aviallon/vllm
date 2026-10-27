@@ -444,6 +444,7 @@ def test_increment1_fallbacks():
 # nearbyint half-EVEN (PAS le `round` half-away du chemin livré), scale =
 # amax/127 SANS clamp.
 # ===========================================================================
+import statistics
 import time
 import types
 
@@ -497,11 +498,11 @@ def reference_experts_from_q(q, scale, w1, w2, w1_scale, w2_scale,
             e = int(sel_ids[t, slot])
             wt = float(sel_w[t, slot])
             acc = ((q[t].to(torch.float32) @ w1[e].to(torch.float32).T)
-                   * scale[t] * w1_scale[e][None, :])
-            cache1 = acc.to(torch.bfloat16)  # arrondi bf16 du livré
-            q2, s2 = silu_and_mul_per_token_quant_int8(cache1[None])
+                   * scale[t] * w1_scale[e])           # [2I]
+            cache1 = acc.to(torch.bfloat16)[None]      # [1, 2I]
+            q2, s2 = silu_and_mul_per_token_quant_int8(cache1)
             acc2 = ((q2.to(torch.float32) @ w2[e].to(torch.float32).T)
-                    * s2 * w2_scale[e][None, :])
+                    * s2 * w2_scale[e][None, :])       # [1, K]
             out_acc[t] += acc2[0].to(torch.float32) * wt
     return out_acc
 
@@ -938,7 +939,7 @@ class TestIncrement3TwoRank:
             pytest.skip(f"vllm._custom_ops unavailable: {exc}")
         import torch.multiprocessing as mp
 
-        n_calls = 2  # la séquence est dérivée par slot : 2 appels -> seq 2
+        n_calls = 8  # la séquence est dérivée par slot : n appels -> seq n
         ctx = mp.get_context("spawn")
         outdir = os.environ.get("MOEMK_TEST_OUT", "/tmp/moemk-2rank")
         os.makedirs(outdir, exist_ok=True)
@@ -1003,8 +1004,15 @@ class TestIncrement3TwoRank:
         # 6. dbg_q identique entre rangs (même xf -> même y -> même q)
         assert torch.equal(got[0]["dbg_q"], got[1]["dbg_q"]), (
             "les rangs divergent sur q")
-        # 7. timing (rapporté — borne, pas un gate)
-        t = max(min(got[r]["times"]) for r in (0, 1))
-        print(f"AR in-kernel (M=1 c1) : {t:.0f} µs/appel (max des rangs, "
-              f"min de {n_calls} appels)")
+        # 7. timing (rapporté — borne, pas un gate).  Le wall d'un appel
+        #    inclut le SKEW d'amorçage entre les processus rangs (le spin
+        #    absorbe le skew en temps d'attente) : min sur N appels = le
+        #    meilleur couplage observé, médiane = le régime courant.
+        tmin = max(min(got[r]["times"]) for r in (0, 1))
+        tmed = max(statistics.median(got[r]["times"]) for r in (0, 1))
+        print(f"AR in-kernel (M=1 c1) : min {tmin:.1f} µs / méd {tmed:.1f} µs "
+              f"(max des rangs, {n_calls} appels)")
+        for r in (0, 1):
+            print(f"  rank {r} times: "
+                  f"{[round(t, 1) for t in got[r]['times']]}")
         assert got[0]["flags"].numel() == got[1]["flags"].numel()
