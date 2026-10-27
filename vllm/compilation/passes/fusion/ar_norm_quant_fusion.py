@@ -42,6 +42,18 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.kernels.triton import ar_norm_quant as _ar_norm_quant  # noqa: F401 - registers the custom ops
+
+def has_requant_ops() -> bool:
+    """The wiring needs the requant custom ops REGISTERED (review M5): with
+    the gate on but the ops absent the pass would crash in apply instead of
+    taking the designed bf16 fallback."""
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.\
+            triton_scaled_mm import has_triton_scaled_mm_requant_op
+
+        return has_triton_scaled_mm_requant_op()
+    except Exception:  # noqa: BLE001
+        return False
 from vllm.kernels.triton.ar_norm_quant import MAX_ROWS
 from vllm.logger import init_logger
 
@@ -653,7 +665,7 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
             # the same output nodes are tried in registration order.
             classes: list[type] = []
             if want_ar and tp2:
-                if self.requant_wiring:
+                if self.requant_wiring and has_requant_ops():
                     # V2 family FIRST (increment 2c): the requant-epilogue
                     # GEMM feeds the AR int8 leg.  A site whose producing
                     # GEMM is a fused-quant node takes the int8 transport;
@@ -738,6 +750,13 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
 # ScaleDead lesson of the increment-1 family: demanding a dead getitem matches
 # nothing on the real graphs).
 # ---------------------------------------------------------------------------
+def _dequant_requant(
+    q: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    op = torch.ops.vllm.triton_scaled_mm_dequant_requant.default
+    return op(q, s)
+
+
 def _scaled_mm_fused_quant_requant(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -849,16 +868,11 @@ class ArNormQuantInt8InGemmPattern(_TritonNormQuantPatternBase):
             )
             # the producer's bf16 value, reconstructed from the requant pair
             # for any OTHER consumer (DCE'd when the AR is the only one; the
-            # numeric delta there is the named requantisation)
-            q_rows, q_hidden = q_down.shape[0], q_down.shape[1]
-            s_tiles = s_down.shape[1]
-            s_tile = q_hidden // s_tiles
-            idx = torch.arange(
-                q_hidden, device=q_down.device
-            ) // s_tile
-            down_out = (
-                q_down.to(torch.float32) * s_down[:, idx]
-            ).to(torch.bfloat16)
+            # numeric delta there is the named requantisation).  The
+            # reconstruction is an OP (review B1): the scale tile must be
+            # derived at RUNTIME -- a traced constant is wrong whenever the
+            # runtime GEMM tile differs from the fake's guess.
+            down_out = _dequant_requant(q_down, s_down)
             return gemm_out, scale, residual_out, rms, down_out
 
         return _replacement

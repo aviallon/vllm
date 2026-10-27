@@ -42,11 +42,19 @@ def _vol_count_device_tensor(device: torch.device) -> torch.Tensor:
         return _VOL_COUNT
 
 
-def vol_count_enqueue_read() -> torch.Tensor | None:
-    """Queue the counter D2H copy on the CURRENT stream and return the pinned
-    host buffer.  The caller must synchronize the stream before
-    ``vol_count_take``.  Safe during graph capture only if the caller's stream
-    is not being captured (the gate0 flush guarantees this)."""
+def vol_count_ensure(device: torch.device) -> None:
+    """Create the counter buffer OUTSIDE graph capture (review M6): a first
+    allocation inside a capture borrows the graph's private pool, and a later
+    graph release would dangle the atomics of every replay."""
+    _vol_count_device_tensor(device)
+
+
+def vol_count_enqueue_read() -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Queue the counter D2H copy on the CURRENT stream and return
+    ``(host buffer, completion event)``.  The caller must synchronize the
+    EVENT (not just its own earlier work) before ``vol_count_take``: the copy
+    is enqueued after the flush's forward_end event, whose sync orders BEFORE
+    it (review M1, 2026-10-27)."""
     global _VOL_HOST
     t = _VOL_COUNT
     if t is None:
@@ -56,11 +64,17 @@ def vol_count_enqueue_read() -> torch.Tensor | None:
             _VOL_HOST = torch.empty(2, dtype=torch.int32, pin_memory=True)
         host = _VOL_HOST
     host.copy_(t, non_blocking=True)
-    return host
+    ev = torch.cuda.Event()
+    ev.record()
+    return host, ev
 
 
-def vol_count_take(host: torch.Tensor) -> tuple[int, int]:
+def vol_count_take(
+    host: torch.Tensor, ev: "torch.cuda.Event | None" = None
+) -> tuple[int, int]:
     """Deltas since the previous take: (class1_in_kernel, class2_chain)."""
+    if ev is not None:
+        ev.synchronize()
     cur = [int(host[0]), int(host[1])]
     out = (cur[0] - _VOL_PREV[0], cur[1] - _VOL_PREV[1])
     _VOL_PREV[0], _VOL_PREV[1] = cur
@@ -616,6 +630,11 @@ def _triton_scaled_mm_impl(
             "the requant epilogue rounds its reference value to bf16 (what the "
             "shipped chain stores); out_dtype must be torch.bfloat16"
         )
+        assert bias is None or bias.dtype == torch.bfloat16, (
+            "the requant reference value is the bf16 chain's STORED sum; an "
+            "fp32 bias would promote the add and break the named contract "
+            "(review M2, 2026-10-27)"
+        )
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -895,6 +914,11 @@ def _triton_scaled_mm_fused_quant_impl(
             "the requant epilogue rounds its reference value to bf16 (what the "
             "shipped chain stores); out_dtype must be torch.bfloat16"
         )
+        assert bias is None or bias.dtype == torch.bfloat16, (
+            "the requant reference value is the bf16 chain's STORED sum; an "
+            "fp32 bias would promote the add and break the named contract "
+            "(review M2, 2026-10-27)"
+        )
 
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -1162,6 +1186,19 @@ def _triton_scaled_mm_fused_quant_requant_op(
             "VLLM_SCALED_MM_REQUANT_OUT is OFF -- the wiring must not emit "
             "requant nodes with the gate off"
         )
+    # REGIME GATE, same as the shipped op (review B2, 2026-10-27): the fused
+    # prologue regresses ~13% above M<=32 and partial-K bit-exactness is the
+    # campaign's one OPEN question -- bypassing the gate here would silently
+    # change a second variable in the A/B arm and pollute the counter's
+    # class split.  Above the regime: the shipped chain PLUS the requant
+    # epilogue (the only intended delta vs the anchor).
+    if not fused_quant_regime(input.shape[0], input.shape[1]):
+        x_q, x_s, _ = _scaled_int8_quant_chain(input, symmetric=True)
+        out, scale_c = _triton_scaled_mm_impl(
+            x_q, weight, x_s, scale_b, out_dtype, bias,
+            requant_out=True, stats_class=2,
+        )
+        return out, scale_c
     return _triton_scaled_mm_fused_quant_impl(
         input, weight, scale_b, out_dtype, bias, requant_out=True
     )
@@ -1198,8 +1235,44 @@ except Exception:
     _HAS_TRITON_SCALED_MM_REQUANT_OP = False
 
 
+def _dequant_requant_impl(
+    q: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """Reconstruct the producer's bf16 value from its requant pair (review
+    B1, 2026-10-27).  The scale tile is derived at RUNTIME from ``s.shape[1]``
+    -- a trace-time guess (the fake's cdiv(N, 64)) is wrong whenever the
+    runtime GEMM tile differs (BN=128 at 64<M<=128 and above), silently
+    corrupting the reconstruction at exactly the c128 shapes."""
+    rows, hidden = q.shape
+    tiles = s.shape[1]
+    assert hidden % tiles == 0, f"scale tiles {tiles} must divide hidden {hidden}"
+    scale_tile = hidden // tiles
+    assert scale_tile > 0 and (scale_tile & (scale_tile - 1)) == 0, (
+        f"derived scale_tile {scale_tile} must be a power of two (the uniform "
+        f"tile mapping invariant, review M4)"
+    )
+    idx = torch.arange(hidden, device=q.device) // scale_tile
+    return (q.to(torch.float32) * s[:, idx]).to(torch.bfloat16)
+
+
+def _dequant_requant_fake(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(q, dtype=torch.bfloat16)
+
+
 def has_triton_scaled_mm_requant_op() -> bool:
     return _HAS_TRITON_SCALED_MM_REQUANT_OP
+
+
+try:
+    direct_register_custom_op(
+        op_name="triton_scaled_mm_dequant_requant",
+        op_func=_dequant_requant_impl,
+        mutates_args=[],
+        fake_impl=_dequant_requant_fake,
+    )
+    _HAS_DEQUANT_REQUANT_OP = True
+except Exception:  # noqa: BLE001
+    _HAS_DEQUANT_REQUANT_OP = False
 
 
 def triton_scaled_mm_requant(

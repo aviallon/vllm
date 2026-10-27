@@ -229,7 +229,10 @@ def _norm_quant_int8_kernel(
         s_out  = max(s_self, s_peer)        # composed scale, per scale element
         f_i    = s_i / s_out (0 if s_out == 0)   # the two factors per token
         q_i'   = nearbyint(q_i * f_i)       # requant to the common scale
-        acc    = q_self' + q_peer'          # INT32 accumulation (exact)
+        acc    = q_self' + q_peer'          # fp32-integral accumulation
+                                          # (exact: |acc| <= 256 << 2^24 --
+                                          # sums run in fp32 registers,
+                                          # integral-valued, review M3)
         x_f    = acc * s_out                # dequantized IN REGISTERS only
         s      = fp32(x_f) + fp32(residual) # residual add in fp32 (unchanged)
 
@@ -1119,7 +1122,7 @@ def reference_ar_norm_quant_int8_in(
 
     Mirrors the kernel expression for expression:
     s_out = max(s_self, s_peer) per (row, tile); q_i' = nearbyint(q_i * s_i /
-    s_out) (half-to-even); acc = q_self' + q_peer' (int32 exact); x_f =
+    s_out) (half-to-even); acc = q_self' + q_peer' (fp32-integral, exact, review M3); x_f =
     acc * s_out (dequantized in registers); then the norm+quant chain of
     ``reference_norm_quant_int8``.
     """

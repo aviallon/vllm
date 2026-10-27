@@ -71,6 +71,16 @@ class StepTimingCollector:
         self._g0_walls: list[float] = []
         self._g0_host_prev: float | None = None
         self._gate0_every = 32
+        if self._gate0:
+            # M6: allocate the vol counters OUTSIDE graph capture (the
+            # collector is built at worker init, before any capture).
+            try:
+                from vllm.model_executor.layers.quantization.compressed_tensors.\
+                    triton_scaled_mm import vol_count_ensure
+
+                vol_count_ensure(torch.device("cuda"))
+            except Exception:  # noqa: BLE001
+                pass
 
     @contextlib.contextmanager
     def collect(self) -> Iterator[list[StepTimingSample]]:
@@ -154,9 +164,10 @@ class StepTimingCollector:
             from vllm.model_executor.layers.quantization.compressed_tensors.\
                 triton_scaled_mm import vol_count_enqueue_read
 
-            vol_host = vol_count_enqueue_read()
+            vol_read = vol_count_enqueue_read()
         except Exception:  # noqa: BLE001 - a missing counter must not break timing
-            vol_host = None
+            vol_read = None
+        vol_host, vol_ev = vol_read if vol_read else (None, None)
         # Same stream, issue order: once the last is done, so are the rest.
         timed[-1].forward_end.synchronize()
         fwd = [e.forward_start.elapsed_time(e.forward_end) for e in timed]
@@ -180,7 +191,7 @@ class StepTimingCollector:
                 from vllm.model_executor.layers.quantization.compressed_tensors.\
                     triton_scaled_mm import vol_count_take
 
-                c1, c2 = vol_count_take(vol_host)
+                c1, c2 = vol_count_take(vol_host, vol_ev)
                 # class1 = in-kernel fused prologue calls, class2 = shipped
                 # chain calls (standalone quant kernel) -- launches, so calls
                 # per step = delta / n within this flush window.
