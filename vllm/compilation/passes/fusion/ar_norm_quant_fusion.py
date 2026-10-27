@@ -665,8 +665,19 @@ class ArNormQuantFusionPass(VllmFusionPatternMatcherPass):
             # the same output nodes are tried in registration order.
             classes: list[type] = []
             if want_ar and tp2:
+                if self.requant_wiring:
+                    # TWIN family first (option B, arbitrage 2026-10-27):
+                    # the second quantified consumer of the normed value
+                    # reuses the 3-way's (q, scale) -- numerically neutral
+                    # (it would have computed the same quantization) and
+                    # independent of the AR inputs' form.  Registered before
+                    # everything else so a twin site takes the full rewrite.
+                    classes += [
+                        ArNormQuantFusedGemmTwinPattern,
+                        ArNormQuantFusedGemmTwinScaleDeadPattern,
+                    ]
                 if self.requant_wiring and has_requant_ops():
-                    # V2 family FIRST (increment 2c): the requant-epilogue
+                    # V2 family (increment 2c): the requant-epilogue
                     # GEMM feeds the AR int8 leg.  A site whose producing
                     # GEMM is a fused-quant node takes the int8 transport;
                     # every other site falls through to the increment-1
@@ -769,6 +780,150 @@ def _scaled_mm_fused_quant_requant(
 
 
 _AR_NORM_QUANT_IN_OP = torch.ops.vllm.triton_ar_norm_quant_int8_in.default
+
+
+# ---------------------------------------------------------------------------
+# OPTION B (arbitrage orchestrateur 2026-10-27 12:30) -- the TWIN consumers:
+# at some sites the normed value feeds TWO quantified consumers (ETAPE-E 1.2:
+# a second quant of the same y at the GDN sites -- in_proj_qkvz + in_proj_ba --
+# and the shared-expert alias).  Both quantize the SAME value with the SAME
+# scheme, so the twin's quant is REDUNDANT: the 3-way already computes that
+# exact (q, scale) (bit-exact contract -- the quant path is deterministic
+# given the same y_bf16), and the twin can consume it via a bare scaled_mm.
+#
+# This is the reachable mass (a) of ETAPE-E 2 without depending on the form
+# of the AR inputs (which the v2 motif needed and found ZERO of, section 10):
+# the twin's quant work (the in-kernel prologue at M<=32, the standalone
+# chain quant at M>32) disappears.  Numerically NEUTRAL by construction: the
+# twin GEMM receives exactly the quantization it would have computed itself.
+#
+# GATE: same VLLM_SCALED_MM_REQUANT_OUT (the increment-2 wiring gate); with
+# the gate off the twin keeps its own fused-quant node, byte-identical.
+# ---------------------------------------------------------------------------
+class ArNormQuantFusedGemmTwinPattern(ArNormQuantFusedGemmPattern):
+    """fused-GEMM motif + a TWIN consumer of the normed value."""
+
+    def __init__(self, epsilon: float) -> None:
+        super().__init__(epsilon)
+        self.motif = "ArNormQuantFusedGemmTwinPattern"
+
+    @property
+    def pattern(self) -> Any:
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_s: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor,
+        ]:
+            allreduce_output = tensor_model_parallel_all_reduce(input)
+            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                allreduce_output, residual, weight, self.epsilon
+            )
+            gemm_out, x_s = _scaled_mm_fused_quant(
+                rms, w_q, w_s, torch.bfloat16, None
+            )
+            # the TWIN: a second quantified consumer of the SAME rms value
+            twin_out = _scaled_mm_fused_quant(
+                rms, w2, w2_s, torch.bfloat16, None
+            )[0]
+            return gemm_out, x_s, residual_out, rms, twin_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_s: torch.Tensor,
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+            torch.Tensor,
+        ]:
+            rows, hidden = input.shape[0], input.shape[1]
+            result_buf = torch.empty(
+                (rows, hidden), dtype=torch.int8, device=input.device
+            )
+            scale_buf = torch.empty(
+                (rows, 1), dtype=torch.float32, device=input.device
+            )
+            result, residual_out, scale, rms = self._replacement_call(
+                result_buf, input, weight, scale_buf, residual
+            )
+            gemm_out = _scaled_mm(result, w_q, scale, w_s, torch.bfloat16, None)
+            # the twin consumes the SAME (q, scale) -- the quantization it
+            # would have computed itself, bit-exact by contract
+            twin_out = _scaled_mm(result, w2, scale, w2_s, torch.bfloat16, None)
+            return gemm_out, scale, residual_out, rms, twin_out
+
+        return _replacement
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        # residual, input, weight (fp32 gamma), w_q, w_s, w2 (int8), w2_s
+        return [
+            self.empty_bf16(5, 16),
+            self.empty_bf16(5, 16),
+            self.empty_fp32(16),
+            self.empty(16, 8, dtype=torch.int8),
+            self.empty_fp32(8, 1),
+            self.empty(16, 8, dtype=torch.int8),
+            self.empty_fp32(8, 1),
+        ]
+
+
+class ArNormQuantFusedGemmTwinScaleDeadPattern(ArNormQuantFusedGemmTwinPattern):
+    """Twin variant for the form the engine really has: the fused op's x_s
+    output is dead (the ScaleDead lesson)."""
+
+    @property
+    def pattern(self) -> Any:
+        inner = super().pattern
+
+        def _pattern(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _x_s, residual_out, rms, twin_out = inner(
+                residual, input, weight, w_q, w_s, w2, w2_s
+            )
+            return gemm_out, residual_out, rms, twin_out
+
+        return _pattern
+
+    @property
+    def replacement(self) -> Any:
+        inner = super().replacement
+
+        def _replacement(
+            residual: torch.Tensor,
+            input: torch.Tensor,
+            weight: torch.Tensor,
+            w_q: torch.Tensor,
+            w_s: torch.Tensor,
+            w2: torch.Tensor,
+            w2_s: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            gemm_out, _scale, residual_out, rms, twin_out = inner(
+                residual, input, weight, w_q, w_s, w2, w2_s
+            )
+            return gemm_out, residual_out, rms, twin_out
+
+        return _replacement
 
 
 class ArNormQuantInt8InGemmPattern(_TritonNormQuantPatternBase):

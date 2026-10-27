@@ -540,3 +540,64 @@ class TestPatternWiringV2:
         # which is the property under test.
         assert matched >= 1
         assert any("triton_ar_norm_quant_int8_in" in n for n in names)
+
+
+@needs_gpu
+class TestDequantRequantOp:
+    """The reconstruction op must EXECUTE on GPU (the shipping rule: every
+    line entering a prod image runs at least once -- review B1's fix)."""
+
+    def test_dequant_requant_runtime_tile(self):
+        import vllm.model_executor.layers.quantization.compressed_tensors.\
+            triton_scaled_mm as tsm
+
+        rows, hidden = 4, 2048
+        # TWO tile widths, incl. the BN=128 one the old trace-time guess got
+        # wrong: the op must derive the tile from the scales' shape.
+        for tiles in (32, 16):
+            q = torch.randint(-127, 127, (rows, hidden), dtype=torch.int8,
+                              device="cuda")
+            s = (torch.rand(rows, tiles, device="cuda") * 0.02 + 1e-4).to(
+                torch.float32)
+            out = torch.ops.vllm.triton_scaled_mm_dequant_requant(q, s)
+            assert out.dtype == torch.bfloat16 and out.shape == q.shape
+            scale_tile = hidden // tiles
+            idx = torch.arange(hidden, device="cuda") // scale_tile
+            ref = (q.to(torch.float32) * s[:, idx]).to(torch.bfloat16)
+            assert torch.equal(out, ref), (
+                f"reconstruction wrong at tiles={tiles}"
+            )
+
+
+class TestPatternWiringTwin(TestPatternWiringV2):
+    """OPTION B (arbitrage 2026-10-27): the twin consumer of the normed value
+    reuses the 3-way's (q, scale) -- its own quant node must disappear."""
+
+    def test_twin_pattern_traces_and_fuses(self):
+        _ensure_c_stubs()
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+
+        matched, fused = self._trace_and_apply(
+            f.ArNormQuantFusedGemmTwinScaleDeadPattern
+        )
+        assert matched >= 1, "the twin motif matched nothing"
+        names = {str(o) for o in fused if o is not None}
+        # BOTH GEMMs are bare scaled_mm now (no fused-quant anywhere)
+        assert not any(
+            "triton_scaled_mm_fused_quant.default" in n for n in names
+        ), f"a fused-quant node survived (the twin's redundant quant lives): {names}"
+        n_bare = sum(1 for n in names if "triton_scaled_mm.default" in n)
+        assert any("triton_ar_norm_quant_int8" in n for n in names), names
+        # the twin output must still be produced (returned as an output)
+        assert matched >= 1
+
+    def test_twin_base_variant_fuses(self):
+        _ensure_c_stubs()
+        import vllm.compilation.passes.fusion.ar_norm_quant_fusion as f
+
+        matched, fused = self._trace_and_apply(f.ArNormQuantFusedGemmTwinPattern)
+        assert matched >= 1
+        names = {str(o) for o in fused if o is not None}
+        assert not any(
+            "triton_scaled_mm_fused_quant.default" in n for n in names
+        ), names
