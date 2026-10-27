@@ -404,16 +404,55 @@ def test_increment1_routing_vs_shipped(M, top_k, E, I, K):
 
 
 def test_increment1_topk_math_matches():
-    """Le softmax+argmax du prologue reproduit les poids de topk_softmax."""
-    M, top_k, E, K = 8, 8, 64, 256
+    """Le softmax+argmax DU PROLOGUE DU KERNEL reproduit topk_softmax —
+    vérifié sur la sortie publiée du kernel (canary : dbg_ids écrits), pas
+    seulement entre deux références torch (revue mimo M1 : un test qui passe
+    dans les deux cas ne prouve rien).  La comparaison
+    référence-vs-référence est conservée en sous-contrat."""
+    from vllm import envs
+
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "routing"
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "routing"
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+
+    M, top_k, E, I, K = 8, 8, 64, 64, 256
     x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     router_w = torch.randn(E, K, device="cuda", dtype=torch.bfloat16) * 0.02
     w_a, i_a = _torch_routing(x, router_w, top_k)
     w_b, i_b = _torch_softmax_topk(x, router_w, top_k)
-    # ids identiques (pas de tirage au sort dans les données)
+    # sous-contrat : les deux références torch concordent (pas de tirage)
     assert (i_a.to(torch.int64) == i_b).all(), (
         f"topk ids divergent: {i_a} vs {i_b}")
     assert (w_a - w_b).abs().max() < 2e-3, "poids topk divergents"
+
+    # contrat réel : le prologue DU KERNEL doit publier la même sélection.
+    # Poids experts nuls : seul le routage nous intéresse ici.
+    w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+    w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+    out = torch.zeros(M, K, device="cuda", dtype=torch.bfloat16)
+    dbg_ids = torch.full((M, top_k), -1, device="cuda", dtype=torch.int32)
+    dbg_w = torch.full((M, top_k), float("nan"), device="cuda")
+    fused_moe_megakernel(
+        out, x, w1, w2, None, None, None,
+        torch.ones(E, 2 * I, device="cuda"),
+        torch.ones(E, K, device="cuda"),
+        naive=True, router_w=router_w, top_k_override=top_k,
+        dbg_ids=dbg_ids, dbg_w=dbg_w)
+    torch.cuda.synchronize()
+    # canary (fail loud) : le kernel a ÉCRIT la sélection — sinon ce test
+    # passerait aussi en repli silencieux (c'est exactement le trou M1).
+    assert bool((dbg_ids >= 0).all()), (
+        "dbg_ids non écrits — le prologue routing n'a pas tourné")
+    assert bool(torch.isfinite(dbg_w).all()), "dbg_w non écrits"
+    # ids exacts (données sans frontière d'égalité tirée au sort) ; poids
+    # ≈ (renormalize du kernel vs topk_softmax, même écart que le contrat
+    # routing, marge 2 %)
+    assert (dbg_ids.to(torch.int64) == i_b).all(), (
+        f"ids kernel {dbg_ids.tolist()} vs ref {i_b.tolist()}")
+    w_err = float((dbg_w - w_b).abs().max() / w_b.abs().max())
+    assert w_err < 2e-2, f"poids topk kernel err={w_err:.4f}"
 
 
 def test_increment1_fallbacks():
@@ -1193,3 +1232,22 @@ def test_asm_mfma_no_vdot4():
             assert int(mt.group(3)) >= 16, (
                 f"{name}: {m} a K={mt.group(3)} < 16 par instruction — "
                 f"mandat « v_mfma K>=16 » violé")
+
+    # MUTATION (revue mimo M3) : le test doit pouvoir DISCORDER — la
+    # configuration tour-1 BM=1/CI=8 doit être vue en v_dot4 (mesuré au
+    # smoke : 68-544 v_dot4, 0 v_mfma).  Sans cette branche négative, un
+    # test ASM qui passe dans les deux cas ne prouverait rien.
+    sig = dict(_MK_SIG)
+    sig["x_ptr"] = "*i8"
+    asm_bad = _compile_asm(
+        mk.qwen3_moe_megakernel, sig,
+        {**base, "BM": 1, "BKO": 128, "CI": 8, "BN2": MK_BN2,
+         "NAIVE": True, "ROUTING": False, "RENORM": True, "E": 256,
+         "NORM": False, "AR": False, "FLAG_ELEMS_C": 64}, 4, 2)
+    n_mfma_bad = asm_bad.count("v_mfma")
+    n_dot4_bad = asm_bad.count("v_dot4")
+    print(f"asm mutation BM=1/CI=8 (attendu v_dot4) : mfma x{n_mfma_bad} "
+          f"v_dot4 x{n_dot4_bad}")
+    assert n_dot4_bad > 0, (
+        "mutation: BM=1/CI=8 n'émet plus de v_dot4 — le test ASM perd sa "
+        "capacité à discorder (ou le codegen a changé : re-évaluer le mandat)")

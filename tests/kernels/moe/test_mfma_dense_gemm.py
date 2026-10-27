@@ -237,10 +237,11 @@ def test_pad_rows_and_cols_masked():
 # ===========================================================================
 # (d) mandat MFMA au codegen : v_mfma présent, v_dot4 absent
 # ===========================================================================
-def _codegen_asm() -> dict[bool, str]:
+def _codegen_asm(bm: int = 16) -> dict[bool, str]:
     """Capture le codegen — méthode `moe_megakernel_smoke.py` (ASTSource +
     triton_compile, wheel Triton 3.8.0 ; pitfall M5 : signature COMPLÈTE et
-    TOUS les constexprs explicites)."""
+    TOUS les constexprs explicites).  `bm` exposé pour la branche de
+    MUTATION (BM=1 doit être vu en v_dot4)."""
     from triton.backends.compiler import GPUTarget
     from triton.compiler import ASTSource
     from triton.compiler import compile as triton_compile
@@ -271,7 +272,7 @@ def _codegen_asm() -> dict[bool, str]:
             "stride_cn": "i32",
         }
         # constexprs EXPLICITES (ASTSource n'applique pas les défauts)
-        co = {"A_IS_INT8": a_is_int8, "BM": 16, "BN": 64, "BK": 128}
+        co = {"A_IS_INT8": a_is_int8, "BM": bm, "BN": 64, "BK": 128}
         src = ASTSource(fn=qwen3_dense_mfma_gemm_kernel, signature=sig, constexprs=co)
         c = triton_compile(
             src, target=target, options={"num_warps": 4, "num_stages": 2}
@@ -302,6 +303,16 @@ def test_asm_mfma_not_dot4():
             f"— mandat MFMA violé (forme de dot non-MFMA : vérifier BM≥16 "
             f"et BK≥16)"
         )
+    # MUTATION (revue mimo) : le test doit pouvoir DISCORDER — BM=1 (forme
+    # non-MFMA mesurée tour 1 : v_dot4 = 6-19x plus lent) doit être vu en
+    # v_dot4.  Sans cette branche négative, un test ASM qui passe dans les
+    # deux cas ne prouverait rien.
+    asm_bad = _codegen_asm(bm=1)[True]
+    n_dot4_bad = len(re.findall("v_dot4", asm_bad))
+    print(f"asm mutation BM=1 (attendu v_dot4) : {n_dot4_bad} occurrences")
+    assert n_dot4_bad > 0, (
+        "mutation: BM=1 n'émet plus de v_dot4 — le test ASM perd sa "
+        "capacité à discorder (ou le codegen a changé : re-évaluer)")
 
 
 # ===========================================================================
