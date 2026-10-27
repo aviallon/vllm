@@ -473,7 +473,7 @@ def fused_moe_megakernel(
             torch.tensor([num_valid], device=output.device,
                          dtype=torch.int32),
             x.stride(0), w1.stride(0), w1.stride(1),
-            w2.stride(0), w2.stride(1), cache3.stride(0),
+            w2.stride(0), w2.stride(1), cache3.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, BN2=BN2, NAIVE=naive,
         )
         # moe_sum aval = le chemin livré (contrat identique).
