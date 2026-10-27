@@ -94,6 +94,8 @@ if TYPE_CHECKING:
     VLLM_BATCH_INVARIANT: bool = False
     VLLM_TRITON_USE_TD: bool | None = None
     VLLM_SCALED_MM_FUSED_QUANT: bool = False
+    VLLM_MOE_MEGAKERNEL: bool = False
+    VLLM_MOE_MEGAKERNEL_MAX_TOKENS: int = 8
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
     VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS: int = 1
@@ -684,6 +686,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # csrc/quantization/w8a8/int8/scaled_quant.cu, same epilogue order.
     "VLLM_SCALED_MM_FUSED_QUANT": lambda: bool(
         int(os.getenv("VLLM_SCALED_MM_FUSED_QUANT", "0") or 0)
+    ),
+    # Qwen3MoEMegakernel (campagne MoE int8 2026-10-27) : forward pass du
+    # bloc MoE route en UN kernel (intermediaires registres, somme ponderee
+    # atomique). Default OFF = la chain livree verbatim.
+    "VLLM_MOE_MEGAKERNEL": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL", "0") or 0)
+    ),
+    "VLLM_MOE_MEGAKERNEL_MAX_TOKENS": lambda: int(
+        os.getenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "8") or 8
     ),
     # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
     # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the

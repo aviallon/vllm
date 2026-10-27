@@ -301,6 +301,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quantization_emulation=self.quantization_emulation,
             )
 
+        # --- Qwen3MoEMegakernel (campagne MEGAKERNEL MoE INT8 2026-10-27) ---
+        # Gate VLLM_MOE_MEGAKERNEL (defaut OFF). Si eligible : toute la
+        # forward passee du bloc MoE route (gemm1 -> silu -> quant -> gemm2 ->
+        # somme ponderee) dans UN kernel + un finalize, intermediaires en
+        # registres. Sinon repli = la chain livree ci-dessous, verbatim.
+        if self._maybe_moe_megakernel(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            a1q_scale,
+            expert_map,
+            apply_router_weight_on_input,
+            activation,
+        ):
+            return
+
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
         )
@@ -630,6 +649,116 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output, topk_ids, expert_map)
+
+    def _maybe_moe_megakernel(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        activation: MoEActivation,
+    ) -> bool:
+        """Qwen3MoEMegakernel (campagne MoE int8 2026-10-27).
+
+        Retourne True si la forward du bloc MoE a ete executee par le
+        megakernel ; False = repli sur la chain livree (verbatim).
+        """
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            fused_moe_megakernel,
+            moe_megakernel_eligible,
+            moe_megakernel_enabled,
+        )
+
+        if not moe_megakernel_enabled():
+            return False
+        reason = moe_megakernel_eligible(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            per_act_token_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            quantization_emulation=self.quantization_emulation,
+            activation_is_silu=activation == MoEActivation.SILU,
+            clamp_limit_is_none=self.activation_config.clamp_limit is None,
+            has_lora=self._lora_context is not None,
+            has_bias=self.w1_bias is not None or self.w2_bias is not None,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            a1q_scale=a1q_scale,
+        )
+        if reason is not None:
+            logger.warning_once(
+                "moe-megakernel: repli sur la chain livree (%s)", reason
+            )
+            return False
+        # echelles de poids per-channel exigees par le kernel (le contrat
+        # per-channel est celui du chemin int8 per-token livre).
+        if (
+            self.w1_scale is None
+            or self.w1_scale.dim() != 2
+            or self.w1_scale.size(1) != 2 * w2.size(2)
+            or self.w2_scale is None
+            or self.w2_scale.dim() != 2
+            or self.w2_scale.size(1) != w1.size(2)
+        ):
+            logger.warning_once(
+                "moe-megakernel: repli (echelles poids non per-channel)"
+            )
+            return False
+
+        M = hidden_states.size(0)
+        top_k_num = topk_ids.size(1)
+        naive = expert_map is None and M * top_k_num * 4 <= w1.size(0)
+        sorted_token_ids = expert_ids = None
+        if not naive:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                _prepare_expert_assignment,
+            )
+            sorted_token_ids, expert_ids, _ = _prepare_expert_assignment(
+                topk_ids,
+                {"BLOCK_SIZE_M": 16},
+                M,
+                top_k_num,
+                w1.size(0),
+                expert_map,
+            )
+
+        # strategie `pair` : cache3 [M, topk, K] (le moe_sum aval consomme
+        # ce layout — contrat du chemin livre).
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            moe_megakernel_strategy,
+        )
+        cache3 = None
+        if moe_megakernel_strategy() != "atomic":
+            cache3 = torch.empty(
+                (M, top_k_num, w1.size(2)),
+                device=hidden_states.device,
+                dtype=output.dtype,
+            )
+
+        fused_moe_megakernel(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            a1q_scale,
+            self.w1_scale,
+            self.w2_scale,
+            naive=naive,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            cache3=cache3,
+        )
+        return True
 
     def moe_sum(
         self,
