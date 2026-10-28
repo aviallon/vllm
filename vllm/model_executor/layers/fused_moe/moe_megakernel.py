@@ -86,6 +86,7 @@ livrée — le raccordement au graphe réel est l'étape nommée restante).
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -122,7 +123,7 @@ def _ar_max_ctas() -> int:
     # Borné par la résidence MESURÉE (smoke : shared 65 536 → 1 WG/CU →
     # 104 CU sur MI210) : monter la variable d'env au-delà convertirait le
     # fail-loud en hang (revue GLM m1) — clampé, jamais silencieux.
-    req = int(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", 96))
+    req = _env_int("VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", 96)
     if req > AR_RESIDENT_CTAS_HARD:
         _log_once(
             "mk-ar-max-ctas-clamped",
@@ -136,6 +137,41 @@ def _ar_max_ctas() -> int:
 
 AR_MAX_CTAS = 96
 AR_RESIDENT_CTAS_HARD = 104
+
+
+# ---------------------------------------------------------------------------
+# lecture des gates — CANAUX DOUBLES (piège « déclaré mais jamais consommé »)
+# ---------------------------------------------------------------------------
+def _env_flag(name: str) -> bool:
+    """Gate booléenne : ``os.environ`` d'abord, puis l'attribut ``envs``.
+
+    ⚠ Les variables ``VLLM_MOE_MEGAKERNEL*`` ne sont PAS enregistrées dans
+    ``vllm.envs`` : le ``getattr(envs, ...)`` seul les lit donc comme
+    TOUJOURS False — la gate existerait, l'env serait posé, et rien ne
+    s'allumerait JAMAIS.  C'est exactement ce qui a laissé le bras muet au
+    wall A/B du 2026-10-28 (warning moteur « Unknown vLLM environment
+    variable » = preuve que l'attribut n'existe pas).  Le canal
+    ``os.environ`` (opérateur) est prépondérant ; l'attribut ``envs`` reste
+    le canal de test.  Même contrat que ``dense_mfma_enabled()``.
+    """
+    raw = os.environ.get(name)
+    if raw is not None:
+        return raw.strip().lower() in ("1", "true")
+    return bool(getattr(envs, name, False))
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is not None and raw.strip():
+        return raw.strip()
+    return str(getattr(envs, name, default))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is not None and raw.strip():
+        return int(raw.strip())
+    return int(getattr(envs, name, default))
 
 
 # ---------------------------------------------------------------------------
@@ -789,11 +825,11 @@ def _log_once(tag: str, msg: str, *args: Any) -> None:
 
 
 def moe_megakernel_enabled() -> bool:
-    return bool(getattr(envs, "VLLM_MOE_MEGAKERNEL", False))
+    return _env_flag("VLLM_MOE_MEGAKERNEL")
 
 
 def moe_megakernel_strategy() -> str:
-    return str(getattr(envs, "VLLM_MOE_MEGAKERNEL_STRATEGY", "pair"))
+    return _env_str("VLLM_MOE_MEGAKERNEL_STRATEGY", "pair")
 
 
 def moe_megakernel_flags() -> tuple[bool, bool, bool]:
@@ -805,11 +841,11 @@ def moe_megakernel_flags() -> tuple[bool, bool, bool]:
     * AR      : `VLLM_MOE_MEGAKERNEL_AR=1` (inc 3, exige NORM).
     """
     routing = (
-        bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_ROUTING", False))
+        _env_flag("VLLM_MOE_MEGAKERNEL_ROUTING")
         or moe_megakernel_strategy() == "routing"
     )
-    norm = bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_NORM", False))
-    ar = bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_AR", False))
+    norm = _env_flag("VLLM_MOE_MEGAKERNEL_NORM")
+    ar = _env_flag("VLLM_MOE_MEGAKERNEL_AR")
     return routing, norm, ar
 
 
