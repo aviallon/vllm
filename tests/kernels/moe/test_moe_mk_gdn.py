@@ -371,31 +371,36 @@ def test_mutation_silu_state_diverges():
         p["scale"],
     )
 
-    mut_cs0 = p["cs0"].clone()
-    mut_cs1 = p["cs1"].clone()
-    mut_st = p["st"].clone()
-    o1 = torch.zeros_like(p["out"])
-    gdn_decode_fusion(
-        p["x"], p["b"], p["a"], p["a_log"], p["dt_bias"],
-        p["conv_w"], p["conv_bias"], mut_cs0, mut_cs1, 0, p["idx"],
-        mut_st, o1, p["scale"], _mut_store_silu_state=True,
+    # ⚠ Correction revue mimo W3 : comparer le mutant au CHEMIN SAIN
+    # FUSIONNÉ (même kernel, deux pas) — le livré diverge déjà du sain au
+    # dernier ULP (réduction arbre vs séquentiel), donc mutant-vs-livré
+    # était vert que la mutation fasse quelque chose ou non.
+    def two_steps(store_silu: bool):
+        cs0_, cs1_, st_ = p["cs0"].clone(), p["cs1"].clone(), p["st"].clone()
+        o1_ = torch.zeros_like(p["out"])
+        gdn_decode_fusion(
+            p["x"], p["b"], p["a"], p["a_log"], p["dt_bias"],
+            p["conv_w"], p["conv_bias"], cs0_, cs1_, 0, p["idx"],
+            st_, o1_, p["scale"], _mut_store_silu_state=store_silu,
+        )
+        o2_ = torch.zeros_like(p["out"])
+        gdn_decode_fusion(
+            p["x"], p["b"], p["a"], p["a_log"], p["dt_bias"],
+            p["conv_w"], p["conv_bias"], cs0_, cs1_, 1, p["idx"],
+            st_, o2_, p["scale"], _mut_store_silu_state=store_silu,
+        )
+        torch.cuda.synchronize()
+        return o1_, o2_
+
+    sane_o1, sane_o2 = two_steps(False)
+    mut_o1, mut_o2 = two_steps(True)
+    assert torch.equal(mut_o1, sane_o1), (
+        "le pas 1 muté diffère du sain : la mutation ne devrait PAS "
+        "affecter la sortie du pas courant (harnais confus)"
     )
-    o2 = torch.zeros_like(p["out"])
-    gdn_decode_fusion(
-        p["x"], p["b"], p["a"], p["a_log"],
-        p["dt_bias"], p["conv_w"], p["conv_bias"], mut_cs0, mut_cs1, 1,
-        p["idx"], mut_st, o2, p["scale"], _mut_store_silu_state=True,
-    )
-    torch.cuda.synchronize()
-    assert not torch.equal(o2, ref_o2), (
-        "état silué stocké : sortie du pas 2 IDENTIQUE au référentiel — "
-        "la mutation n'est pas observable (harnais aveugle)"
-    )
-    # le pas 1 lui-même doit être identique (la mutation ne vaut que pour
-    # la fenêtre future) — garde de sensibilité du harnais
-    torch.testing.assert_close(
-        o1.float(), ref_o.float(), rtol=5e-3, atol=5e-3,
-        msg="le pas 1 diverge : la mutation ne devrait PAS l'affecter",
+    assert not torch.equal(mut_o2, sane_o2), (
+        "MUT_STORE_SILU_STATE == sain sur le pas 2 — la mutation n'est pas "
+        "observable (harnais aveugle)"
     )
 
 

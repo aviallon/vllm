@@ -104,7 +104,8 @@ def _resident_hard() -> int:
     (fail-stop tardif) au lieu d'un refus avant lancement.  Dérivé du
     device, la garde refuse AVANT (fail loud)."""
     try:
-        sm = torch.cuda.get_device_properties(0).multi_processor_count
+        idx = torch.cuda.current_device()
+        sm = torch.cuda.get_device_properties(idx).multi_processor_count
     except Exception:
         sm = 104
     return min(104, int(sm))
@@ -177,7 +178,13 @@ def mk_phase_barrier(
     phase suivante ne peuvent pas précéder son propre epoch-bump).
     """
     cur_epoch = tl.atomic_add(epoch_ptr + phase, 0, sem="acquire", scope="sys")
-    n = tl.atomic_add(arrive_ptr + phase, 1, sem="release", scope="sys") + 1
+    # acq_rel (et non release) : l'arête acquire sur l'incrémentation
+    # établit formellement le happens-before « stores du producteur ->
+    # loads du consommateur » pour les payloads qui transitent par cette
+    # barrière (revue mimo W4 : en release-seul la visibilité des données
+    # reposait sur la cohérence L2 seule, sûre en pratique sur gfx90a
+    # mais non formelle).
+    n = tl.atomic_add(arrive_ptr + phase, 1, sem="acq_rel", scope="sys") + 1
     if n == n_workers:
         if not MUT_SKIP_RESET:
             tl.atomic_xchg(arrive_ptr + phase, 0, sem="release", scope="sys")

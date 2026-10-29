@@ -18,7 +18,12 @@ est un fait PREFILL, §0.5 du design).  Le gain propre de cette fusion =
 1 lancement/couche (L) + l'aller-retour HBM de ``mixed_qkv`` (O) +
 l'absorption de la passe de stockage d'état (K) — plafond honnête §5.2.
 
-Contrat numérique = composition des deux kernels livrés, EXACTEMENT :
+Contrat numérique = composition des deux kernels livrés, à l'ULP près
+(⚠ revue mimo W1 : « exactement » était SURPROMES — la conv du fusionné
+somme ses taps en réduction d'arbre ``tl.sum`` alors que le livré
+accumule en séquence depuis le biais : écart fp32 de dernier ULP admis,
+mesuré 9 éléments/8,4 M ≤2,4e-3 après 5 pas sur l'état scan ; l'état CONV
+reste bit-exact car il stocke le x brut) :
 
 * conv : ``y[c] = silu(bias[c] + Σ_{j<W} w[c,j] · u_j)`` avec
   ``u = [état[0], état[1], état[2], x_t]`` (fenêtre glissante, x_t en
@@ -374,7 +379,9 @@ def gdn_decode_fallback(
     scale: float,
     activation: str | None = "silu",
 ) -> torch.Tensor:
-    """Repli = chaîne livrée VERBATIM (gate OFF) — aucune réécriture.
+    """Repli = appel DIRECT des deux kernels livrés (gate OFF) — les
+    fonctions du chemin de production sont appelées telles quelles
+    (aucune réécriture du calcul).
 
     ``causal_conv1d_update`` (sur ``x`` en place, contrat livré) puis
     ``fused_recurrent_gated_delta_rule_packed_decode`` (état fp32 en place).
@@ -493,11 +500,20 @@ def gdn_decode_fusion(
         "le double-tampon protège uniquement si lecture et écriture visent "
         "des adresses différentes (sinon : course, comme MUT_SINGLE_BUFFER)"
     )
-    assert x.stride(1) == 1 and out.stride(2) == 1, (
-        f"x/out doivent être contigus en dernière dim : {x.stride()} {out.stride()}"
+    # ⚠ revue mimo W2 : le kernel indexe en layout PACKED (i_n*HV+i_hv,
+    # (i_n*HV+i_hv)*V+o_v, state_idx*HV*V*K) — exiger la contiguïté
+    # COMPLÈTE des tenseurs empaquetés, sinon une tranche décalée passe
+    # les asserts de dernière dim et touche les mauvaises adresses sans
+    # bruit.
+    assert x.is_contiguous() and out.is_contiguous(), (
+        f"x/out doivent être contigus (layout packed du kernel) : "
+        f"{x.stride()} {out.stride()}"
     )
-    assert b.stride(1) == 1 and a.stride(1) == 1, (
-        f"b/a doivent être contigus en HV : {b.stride()} {a.stride()}"
+    assert b.is_contiguous() and a.is_contiguous(), (
+        f"b/a doivent être contigus (layout packed) : {b.stride()} {a.stride()}"
+    )
+    assert ssm_state.is_contiguous(), (
+        f"ssm_state doit être contigu (layout packed) : {ssm_state.stride()}"
     )
     assert a_log.stride(0) == 1 and dt_bias.stride(0) == 1, (
         f"a_log/dt_bias doivent être contigus : {a_log.stride()} {dt_bias.stride()}"

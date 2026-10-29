@@ -109,6 +109,27 @@ def test_persistent_chain_vs_shipped(M, K):
 
 
 @needs_gpu
+def test_short_chain_bitexact():
+    """Gate stricte du contrat de PRIMITIVE (revue mimo W5) : sur une
+    chaîne courte (≤20 couches, domaine où l'exactitude est mesurée) le
+    noyau doit être ÉGAL bit-à-bit au repli.  Une régression vers
+    `1/tl.sqrt` (le piège rsqrt, amplifié en O(1) au-delà de ~20 couches)
+    serait invisible au tolérance 5e-3 des tests longs — ici elle casse
+    dès la couche courte si les primitives divergent aux frontières
+    d'arrondi (probabilité forte sur des poids aléatoires × 10 couches)."""
+    _gate_on()
+    x, res, nw, ws, wsc = make_chain(n_layers=10, M=4, K=512, share_weights=False)
+    ref = mk_persistent_fallback(x, res, nw, ws, wsc, 1e-6)
+    got = mk_persistent_v0(x, res, nw, ws, wsc, 1e-6, n_workers=32)
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref), (
+        "chaîne courte non bit-exacte vs repli — divergence de primitive "
+        "(rsqrt vs 1/sqrt ?) ou réduction, à investiguer avant la chaîne "
+        "longue qui l'amplifie"
+    )
+
+
+@needs_gpu
 def test_chain_actually_chains():
     """Sensibilité du harnais : 1 couche ≠ 2 couches ≠ 3 couches (une
     chaîne qui n'enchaînerait pas serait invisible sinon)."""
@@ -143,20 +164,34 @@ def test_mutation_skip_reset_diverges():
 
 @needs_gpu
 def test_mutation_wrong_layer_diverges():
-    """MUT_WRONG_LAYER (poids de la couche L+1) : divergence — canari
-    declared-input : la table de pointeurs par couche doit être RÉELLEMENT
-    consommée."""
+    """MUT_WRONG_LAYER (poids de la couche L+1) : le mutant doit diverger
+    du NOYAU SAIN (même chemin, mêmes entrées) — canari declared-input :
+    la table de pointeurs par couche doit être RÉELLEMENT consommée.
+
+    ⚠ Correction revue mimo C2 (silent-pass) : l'ancien test comparait le
+    mutant au REPLI TORCH en `torch.equal` — le chemin sain diverge déjà
+    du repli au dernier ULP (réduction arbre vs séquentiel), donc le test
+    était vert que la mutation fasse quelque chose ou non.  Ici : mutant
+    vs SAIN en égalité stricte (le noyau est déterministe et bit-stable
+    run-to-run — test_determinism) ; la garde de sensibilité vérifie que
+    sain vs repli est dans la tolérance de contrat."""
     _gate_on()
     x, res, nw, ws, wsc = make_chain(n_layers=4, M=4, K=256, share_weights=False)
-    ref = mk_persistent_fallback(x, res, nw, ws, wsc, 1e-6)
+    healthy = mk_persistent_v0(x, res, nw, ws, wsc, 1e-6, n_workers=32)
     mut = mk_persistent_v0(
         x, res, nw, ws, wsc, 1e-6, n_workers=32, _mut_wrong_layer=True
     )
     torch.cuda.synchronize()
-    assert not torch.equal(mut, ref), (
-        "MUT_WRONG_LAYER : sortie IDENTIQUE — la table de pointeurs par "
-        "couche n'est pas consommée (poids partagés ? le test exige des "
-        "poids DISTINCTS par couche)"
+    ref = mk_persistent_fallback(x, res, nw, ws, wsc, 1e-6)
+    # sensibilité : le sain doit coller au contrat (sinon tout diverge et
+    # la mutation ne prouve rien)
+    torch.testing.assert_close(
+        healthy.float(), ref.float(), rtol=5e-3, atol=5e-3,
+        msg="le chemin sain dévie du contrat — harnais aveugle",
+    )
+    assert not torch.equal(mut, healthy), (
+        "MUT_WRONG_LAYER == noyau sain — la table de pointeurs par couche "
+        "n'est pas consommée (poids DISTINCTS par couche exigés)"
     )
 
 

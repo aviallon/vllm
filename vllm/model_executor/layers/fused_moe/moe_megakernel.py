@@ -996,7 +996,10 @@ def moe_megakernel_output_int8(
 
 
 def moe_megakernel_int8_out_enabled() -> bool:
-    return bool(getattr(envs, "VLLM_MOE_MEGAKERNEL_INT8_OUT", False))
+    # lecture dual-channel (revue mimo S1) : un getattr(envs,...) nu ici
+    # serait EXACTEMENT le site qui redeviendrait muet si la variable
+    # n'est pas enregistrée — unifier avec _env_flag.
+    return _env_flag("VLLM_MOE_MEGAKERNEL_INT8_OUT")
 
 
 def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
