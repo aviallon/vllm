@@ -136,7 +136,8 @@ def test_mutation_skip_reset_diverges():
     x, res, nw, ws, wsc = make_chain(n_layers=4, M=4, K=256)
     with pytest.raises(AssertionError, match="plafond de spins"):
         mk_persistent_v0(
-            x, res, nw, ws, wsc, 1e-6, n_workers=32, _mut_skip_reset=True
+            x, res, nw, ws, wsc, 1e-6, n_workers=32, spin_limit=20_000,
+            _mut_skip_reset=True,
         )
 
 
@@ -164,13 +165,13 @@ def test_mutation_wrong_layer_diverges():
 # ===========================================================================
 @triton.jit
 def _guard_probe_kernel(
-    arrive_ptr, epoch_ptr, work_ptr, fail_ptr,
+    arrive_ptr, epoch_ptr, fail_ptr,
     n_workers: tl.constexpr, SPIN_LIMIT: tl.constexpr,
 ):
     """Une seule CTA arrive à une barrière pour n_workers>1 : elle doit
     finir par tripper le plafond de spins (fail loud) et revenir."""
     mk_phase_barrier(
-        arrive_ptr, epoch_ptr, work_ptr, fail_ptr, 0,
+        arrive_ptr, epoch_ptr, fail_ptr, 0,
         n_workers=n_workers, SPIN_LIMIT=SPIN_LIMIT,
     )
 
@@ -183,10 +184,9 @@ def test_spin_limit_guard_trips():
     dev = "cuda"
     arrive = torch.zeros(2, dtype=torch.int32, device=dev)
     epoch = torch.zeros(2, dtype=torch.int32, device=dev)
-    work = torch.zeros(2, dtype=torch.int32, device=dev)
     fail = torch.zeros(1, dtype=torch.int32, device=dev)
     _guard_probe_kernel[(1,)](
-        arrive, epoch, work, fail, n_workers=4, SPIN_LIMIT=1000,
+        arrive, epoch, fail, n_workers=4, SPIN_LIMIT=1000,
     )
     torch.cuda.synchronize()
     assert int(fail[0]) == 1, (
@@ -255,8 +255,20 @@ def test_fallback_gate_off_is_shipped_path(monkeypatch):
     got = mk_persistent_v0(x, res, nw, ws, wsc, 1e-6, n_workers=16)
     torch.cuda.synchronize()
     assert calls["n"] == 0, "le kernel persistant a tourné malgré la gate OFF"
-    ref = mk_persistent_fallback(x, res, nw, ws, wsc, 1e-6)
-    assert torch.equal(got, ref), "repli != chaîne livrée (identité)"
+    # identité vs le chemin livré APPELÉ DIRECTEMENT (pas vs
+    # mk_persistent_fallback = la fonction à elle-même : tautologie,
+    # revue deepseek mineur) — même contrat que test_moe_mk_gdn.
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm_fused_quant,
+    )
+    cx, cr = x.clone(), res.clone()
+    for normw_, gw_, gsc_ in zip(nw, ws, wsc):
+        s_ = cx.float() + cr.float()
+        y = (s_ * torch.rsqrt((s_ * s_).mean(-1, keepdim=True) + 1e-6)
+             * normw_.float()).to(torch.bfloat16)
+        cx, _ = triton_scaled_mm_fused_quant(y, gw_, gsc_, torch.bfloat16)
+        cr = s_.to(torch.bfloat16)
+    assert torch.equal(got, cx), "repli != chaîne livrée directe (identité)"
 
 
 @needs_gpu

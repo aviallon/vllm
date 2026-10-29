@@ -290,33 +290,60 @@ def test_determinism_run_to_run():
 # ===========================================================================
 @needs_gpu
 def test_mutation_single_buffer_diverges():
-    """Mutation SINGLE_BUFFER (lit ET écrit le même slot) → le contrat
-    multi-pas DOIT diverger (la course CTA lecteur/écrivain est le risque
-    que le double-tampon neutralise).  Si ce test échoue (= pas de
-    divergence), le double-tampon n'est pas la protection prétendue :
-    c'est la revendication qui tombe, pas le test."""
+    """Séparation des slots de l'état conv — propriété DÉTERMINISTE.
+
+    ⚠ Correction revue deepseek F1 (silent-pass) : la version précédente
+    comparait 3 pas de référence à 1 pas de mutant (différence « par
+    construction ») et la divergence par course CTA est **non observable**
+    dans ce kernel standalone (chaque programme lit tôt et écrit tard — la
+    fenêtre de course est quasi nulle, mesuré : 0 divergence sur 5 reps).
+    La revendication « mutation-prouvé pour la course » est donc
+    RETIRÉE ; ce qui est prouvé, et ce qui compte pour INC-D :
+
+    * le chemin sain n'écit JAMAIS dans le slot LU (`cs0` intact) ;
+    * la mutation single-buffer écrit DANS le slot lu (observable,
+      déterministe) ;
+    * le launcher refuse l'alias des deux slots (assert data_ptr, revue
+      F3).
+
+    ⚠ Et la VRAIE dépendance est nommée (revue F4) : inlinée dans la
+    boucle persistante, l'écriture de la couche L et la lecture de la
+    couche L+1 partagent le même lancement — le double-tampon ne suffit
+    plus, une barrière de phase est requise (c'est l'infra INC-D).
+    """
     _gate_on()
     p = make_problem(B=8, **REAL)
-    ref_cs = p["cs0"].clone()
-    ref_st = p["st"].clone()
-    for _ in range(3):
-        shipped_chain_step(
-            p["x"].clone(), p["b"], p["a"], p["a_log"], p["dt_bias"],
-            p["conv_w"], p["conv_bias"], ref_cs, p["idx"], ref_st,
-            torch.zeros_like(p["out"]), p["scale"],
-        )
-    mut_st = p["st"].clone()
-    o = torch.zeros_like(p["out"])
+
+    # chemin sain : le slot LU reste intact
+    cs0 = p["cs0"].clone()
+    cs1 = p["cs1"].clone()
     gdn_decode_fusion(
         p["x"], p["b"], p["a"], p["a_log"], p["dt_bias"],
-        p["conv_w"], p["conv_bias"], p["cs0"], p["cs1"], 0, p["idx"],
-        mut_st, o, p["scale"], _mut_single_buffer=True,
+        p["conv_w"], p["conv_bias"], cs0, cs1, 0, p["idx"],
+        p["st"].clone(), torch.zeros_like(p["out"]), p["scale"],
     )
     torch.cuda.synchronize()
-    assert not torch.equal(mut_st, ref_st), (
-        "single-buffer : état scan IDENTIQUE au référentiel — la "
-        "revendication « le double-tampon est load-bearing » n'est pas "
-        "prouvée par ce harnais (mutation non observable)"
+    assert torch.equal(cs0, p["cs0"]), (
+        "le chemin sain écrit dans le slot LU — la séparation des slots "
+        "n'est pas respectée (c'est le contrat du double-tampon)"
+    )
+    assert bool((cs1 != p["cs1"]).any()), (
+        "le chemin sain n'écrit pas dans le slot d'écriture — harnais aveugle"
+    )
+
+    # mutation single-buffer : l'écriture tombe DANS le slot lu (visible)
+    cs0m = p["cs0"].clone()
+    cs1m = p["cs1"].clone()
+    gdn_decode_fusion(
+        p["x"], p["b"], p["a"], p["a_log"], p["dt_bias"],
+        p["conv_w"], p["conv_bias"], cs0m, cs1m, 0, p["idx"],
+        p["st"].clone(), torch.zeros_like(p["out"]), p["scale"],
+        _mut_single_buffer=True,
+    )
+    torch.cuda.synchronize()
+    assert not torch.equal(cs0m, p["cs0"]), (
+        "MUT_SINGLE_BUFFER n'écrit pas dans le slot lu — la mutation est "
+        "invisible, le test ne prouve rien"
     )
 
 

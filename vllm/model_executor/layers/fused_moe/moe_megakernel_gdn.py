@@ -484,6 +484,15 @@ def gdn_decode_fusion(
             f"{tuple(cs.shape)}"
         )
         assert cs.stride(2) == 1, f"{name} doit être contigu en slot : {cs.stride()}"
+    # Revue deepseek F3 : toute la protection intra-lancement repose sur
+    # cs_old en lecture seule pendant que l'autre slot est écrit — si les
+    # deux slots ALIASENT, la protection disparaît silencieusement (exact.
+    # MUT_SINGLE_BUFFER sans le signal).  Précondition load-bearing.
+    assert conv_state_0.data_ptr() != conv_state_1.data_ptr(), (
+        "conv_state_0 et conv_state_1 doivent être des tampons DISTINCTS — "
+        "le double-tampon protège uniquement si lecture et écriture visent "
+        "des adresses différentes (sinon : course, comme MUT_SINGLE_BUFFER)"
+    )
     assert x.stride(1) == 1 and out.stride(2) == 1, (
         f"x/out doivent être contigus en dernière dim : {x.stride()} {out.stride()}"
     )

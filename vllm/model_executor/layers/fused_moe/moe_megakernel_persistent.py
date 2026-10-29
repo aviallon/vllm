@@ -85,12 +85,32 @@ __all__ = [
 # Co-résidence mesurée (smoke tour 2 : shared 65 Ko → 1 WG/CU → 104 CU) —
 # au-delà, une CTA peut rester bloquée derrière des CTAs qui spinent :
 # deadlock de scheduling.  Même discipline que AR_MAX_CTAS.
-MK_P_RESIDENT_HARD = 104
 # Plafond de spins : au-delà, fail loud (drapeau lu côté hôte) — jamais une
 # boucle infinie silencieuse (doctrine : hang > corruption, mais un hang de
 # TEST serait indéfini — le plafond le rend observable et borné).  Le
 # chemin normal ne spinne jamais (µs) ; le plafond ne sert qu'aux pannes.
-MK_P_SPIN_LIMIT = 5_000_000
+# ⚠ Borné en ITERATIONS, pas en secondes (revue deepseek F5) : calibré bas
+# (~0,1-0,3 s de spin contentieux) pour qu'un test de mutation reste borné
+# en temps ; injectable (`spin_limit`) pour les tests.
+MK_P_SPIN_LIMIT = 500_000
+
+
+def _resident_hard() -> int:
+    """Co-résidence effective : min(104 mesuré tour 2, CU du device).
+
+    ⚠ Revue deepseek F6 : le 104 vient du smoke d'un AUTRE noyau (shared
+    65 Ko) ; sur un device à moins de CU, la garde codée en dur passerait
+    alors que des CTAs ne sont pas co-résidentes → spin jusqu'au plafond
+    (fail-stop tardif) au lieu d'un refus avant lancement.  Dérivé du
+    device, la garde refuse AVANT (fail loud)."""
+    try:
+        sm = torch.cuda.get_device_properties(0).multi_processor_count
+    except Exception:
+        sm = 104
+    return min(104, int(sm))
+
+
+MK_P_RESIDENT_HARD = 104  # plafond absolu (mesure tour 2)
 
 P_BM = 16  # BM MFMA (mandat §3.4 : BM≥16, lignes pad masquées)
 P_BN = 64
@@ -128,8 +148,6 @@ def mk_persistent_enabled() -> bool:
 def mk_phase_barrier(
     arrive_ptr,  # [N_PHASES] i32 — compteurs d'arrivée (reset par phase)
     epoch_ptr,  # [N_PHASES] i32 — epochs (le dernier avance)
-    work_ptr,  # [n_layers, N_PHASES] i32 — curseurs de file (jamais reset :
-              # un slot neuf PAR (couche, phase) : rien à reset, rien à rater)
     fail_ptr,  # [1] i32 — drapeau fail loud (spin limit)
     phase: tl.constexpr,  # index de phase (constante par spécialisation)
     n_workers: tl.constexpr,
@@ -263,7 +281,7 @@ def qwen3_mk_persistent_v0_kernel(
             tl.store(res_out + r * K + offs, s_.to(tl.bfloat16), mask=offs < K)
             item = tl.atomic_add(wslot, 1, sem="relaxed", scope="sys")
         mk_phase_barrier(
-            arrive_ptr, epoch_ptr, work_ptr, fail_ptr, PHASE_ADD_NORM,
+            arrive_ptr, epoch_ptr, fail_ptr, PHASE_ADD_NORM,
             n_workers=N_WORKERS, SPIN_LIMIT=SPIN_LIMIT,
             MUT_SKIP_RESET=MUT_SKIP_RESET,
         )
@@ -320,7 +338,7 @@ def qwen3_mk_persistent_v0_kernel(
             )
             item = tl.atomic_add(wslot_b, 1, sem="relaxed", scope="sys")
         mk_phase_barrier(
-            arrive_ptr, epoch_ptr, work_ptr, fail_ptr, PHASE_GEMM,
+            arrive_ptr, epoch_ptr, fail_ptr, PHASE_GEMM,
             n_workers=N_WORKERS, SPIN_LIMIT=SPIN_LIMIT,
             MUT_SKIP_RESET=MUT_SKIP_RESET,
         )
@@ -373,6 +391,7 @@ def mk_persistent_v0(
     w_scales: list[torch.Tensor],
     eps: float = 1e-6,
     n_workers: int = 64,
+    spin_limit: int = MK_P_SPIN_LIMIT,
     out: torch.Tensor | None = None,
     # hooks de mutation (tests uniquement)
     _mut_skip_reset: bool = False,
@@ -405,7 +424,11 @@ def mk_persistent_v0(
         f"chaîne carrée v0 : N={N} doit être == K={K} (écart NOMMÉ, "
         f"docstring module)"
     )
-    assert K % 16 == 0, f"K={K} doit être multiple de 16 (contrat MFMA)"
+    assert K % 16 == 0 and (K & (K - 1)) == 0, (
+        f"K={K} doit être une puissance de 2 multiple de 16 : le corps "
+        f"norm utilise tl.arange(0, K) (exige pow2) et le dot MFMA exige "
+        f"K%16==0"
+    )
     for L in range(n_layers):
         assert norm_ws[L].shape == (K,), (
             f"norm_ws[{L}] doit être [{K}] : {tuple(norm_ws[L].shape)}"
@@ -418,10 +441,12 @@ def mk_persistent_v0(
         assert w_scales[L].numel() == N and w_scales[L].is_floating_point(), (
             f"w_scales[{L}] doit être fp [{N}] : {tuple(w_scales[L].shape)}"
         )
-    assert 1 <= n_workers <= MK_P_RESIDENT_HARD, (
-        f"n_workers={n_workers} hors [1, {MK_P_RESIDENT_HARD}] — au-delà de "
-        f"la co-résidence mesurée, deadlock de scheduling entre CTAs qui "
-        f"spinent (garde AR_MAX_CTAS, design O3)."
+    resident = _resident_hard()
+    assert 1 <= n_workers <= resident, (
+        f"n_workers={n_workers} hors [1, {resident}] — au-delà de la "
+        f"co-résidence (min(104 mesuré, CU du device)), deadlock de "
+        f"scheduling entre CTAs qui spinent (garde AR_MAX_CTAS, design "
+        f"O3).  Repli : réduire n_workers."
     )
     for name, t in (
         ("x", x), ("res", res),
@@ -486,7 +511,7 @@ def mk_persistent_v0(
         n_items_norm, n_items_gemm,
         M, N, n_layers, eps,
         K=K, BM=P_BM, BN=P_BN, BK=P_BK,
-        N_WORKERS=n_workers, SPIN_LIMIT=MK_P_SPIN_LIMIT,
+        N_WORKERS=n_workers, SPIN_LIMIT=int(spin_limit),
         num_warps=P_NUM_WARPS, num_stages=P_NUM_STAGES,
         MUT_SKIP_RESET=bool(_mut_skip_reset),
         MUT_WRONG_LAYER=bool(_mut_wrong_layer),
