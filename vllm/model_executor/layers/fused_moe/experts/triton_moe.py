@@ -723,15 +723,13 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
             return False
         # echelles de poids per-channel exigees par le kernel (le contrat
-        # per-channel est celui du chemin int8 per-token livre).
-        if (
-            self.w1_scale is None
-            or self.w1_scale.dim() != 2
-            or self.w1_scale.size(1) != 2 * w2.size(2)
-            or self.w2_scale is None
-            or self.w2_scale.dim() != 2
-            or self.w2_scale.size(1) != w1.size(2)
-        ):
+        # per-channel est celui du chemin int8 per-token livre).  Layout
+        # accepté : [E, N] OU [E, N, 1] (quark int8 MoE stocke le 2e) —
+        # `moe_megakernel_scales_ok` normalise puis vérifie (fail loud).
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            moe_megakernel_scales_ok,
+        )
+        if not moe_megakernel_scales_ok(w1, w2, self.w1_scale, self.w2_scale):
             logger.warning_once(
                 "moe-megakernel: repli (echelles poids non per-channel)"
             )

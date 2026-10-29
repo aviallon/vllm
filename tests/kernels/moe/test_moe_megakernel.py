@@ -254,6 +254,159 @@ def test_grouped_mode():
     assert _rel_err(out, ref) < 0.03
 
 
+@pytest.mark.parametrize("strategy", ["pair", "atomic"])
+@pytest.mark.parametrize("M", [32, 128])
+def test_grouped_contract_real_shapes(M, strategy):
+    """Extension c32/c128 (mandat 2026-10-29) : régime grouped aux shapes
+    locaux RÉELS TP=2 (E=256, I=256, K=2048, topk=8) — M=32 et M=128 tokens.
+
+    C'est la zone d'éligibilité étendue (le plafond `MAX_TOKENS` était 8) :
+    le launcher grouped (blocs de 16 paires d'un même expert) doit router
+    (dispatch externe) / gemm / sommer à ces M avec le contrat livré.
+    """
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = strategy
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "128"
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = strategy
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 128
+
+    top_k, E, I, K = 8, 256, 256, 2048   # shapes locaux réels TP=2
+    x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
+    naive = M * top_k * 4 <= E
+    assert not naive, "c32/c128 = régime grouped — l'objet de ce test"
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        _prepare_expert_assignment,
+    )
+    sorted_ids, expert_ids, _ = _prepare_expert_assignment(
+        ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+    ref = reference_chain(x, w1, w2, w1s, w2s, ids, wts, naive=False)
+
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    cache3 = None
+    if strategy == "pair":
+        cache3 = torch.empty(M, top_k, K, device=x.device,
+                             dtype=torch.bfloat16)
+    fused_moe_megakernel(
+        out, x, w1, w2, wts, ids, None, w1s, w2s,
+        naive=False, sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+        cache3=cache3)
+    torch.cuda.synchronize()
+    err = _rel_err(out, ref)
+    assert err < 0.03, f"M={M} strategy={strategy} rel_err={err:.4f}"
+    assert ref.abs().max() > 0
+
+
+def test_eligibility_max_tokens_env(monkeypatch):
+    """Le plafond M est lisible depuis l'ENV (chemin moteur réel : l'attribut
+    `envs` n'est JAMAIS assigné, le getter lit `os.getenv`) : la campagne
+    c32/c128 l'élève à 128 PAR L'ENV, sans rebuild.
+
+    Ce test est le canari du branchement des runs c32/c128 : si la variable
+    n'était pas enregistrée dans `environment_variables`, `getattr(envs, …)`
+    la lirait comme toujours 8 et le bras resterait inéligible SILENCIEUSEMENT
+    (leçon de la gate muette, 2026-10-28).  `monkeypatch.delattr` simule
+    exactement l'état du processus moteur (aucune assignation d'attribut).
+    """
+    M, top_k, E, I, K = 128, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, _ = make_problem(M, top_k, E, I, K)
+
+    def elig():
+        return moe_megakernel_eligible(
+            hidden_states=x, w1=w1, w2=w2, topk_ids=ids,
+            use_int8_w8a8=True, per_act_token_quant=True,
+            block_shape=None, quantization_emulation=False,
+            activation_is_silu=True, clamp_limit_is_none=True,
+            has_lora=False, has_bias=False, expert_map=None,
+            apply_router_weight_on_input=False,
+            a1q_scale=torch.ones(M, 1, device=x.device),
+        )
+
+    from vllm import envs
+    envs.disable_envs_cache()   # sinon la valeur est figée après init
+    envs.VLLM_MOE_MEGAKERNEL = True
+    # retire l'ombre d'éventuels tests précédents (assignation d'attribut) :
+    # le processus moteur, lui, n'assigne jamais — il lit via le getter.
+    monkeypatch.delattr(envs, "VLLM_MOE_MEGAKERNEL_MAX_TOKENS",
+                        raising=False)
+    # plafond historique 8 (défaut getter) : M=128 refusé
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "8"
+    assert elig() is not None
+    # extension campagne : env 128 -> M=128 éligible (getter os.environ)
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "128"
+    assert elig() is None
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "8"
+
+
+def test_scale_layout_3d_contract():
+    """Layout réel du checkpoint quark int8 MoE : échelles per-channel en
+    3-D [E, N, 1] (« 2D -> 3D for the int8 MoE kernel », quark_moe.py).
+
+    ⚠ Leçon 2026-10-29 (gate muette n°2) : le bras entier repliait
+    silencieusement sur ce décalage — les tests utilisaient des échelles
+    2-D synthétiques et le checkpoint réel n'avait JAMAIS été exercé.  Ce
+    test exige la SORTIE IDENTIQUE aux deux layouts (la normalisation est
+    un changement de vue, pas de valeur).
+    """
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "atomic"
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "atomic"
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = 64
+
+    M, top_k, E, I, K = 8, 8, 256, 256, 2048   # shapes réels TP=2
+    x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
+    naive = M * top_k * 4 <= E
+    sorted_ids = expert_ids = None
+    if not naive:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            _prepare_expert_assignment,
+        )
+        sorted_ids, expert_ids, _ = _prepare_expert_assignment(
+            ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+
+    outs = []
+    for scales3d in (False, True):
+        w1s_i = w1s.unsqueeze(-1).contiguous() if scales3d else w1s
+        w2s_i = w2s.unsqueeze(-1).contiguous() if scales3d else w2s
+        assert (w1s_i.dim() == 3) == scales3d
+        out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s_i, w2s_i,
+            naive=naive, sorted_token_ids=sorted_ids, expert_ids=expert_ids)
+        torch.cuda.synchronize()
+        outs.append(out)
+    # normalisation = vue, pas valeur : sorties BIT-identiques
+    diff = (outs[0].float() - outs[1].float()).abs().max()
+    assert float(diff) == 0.0, f"3-D layout diverge de 2-D : {diff}"
+    assert outs[0].abs().max() > 0
+
+
+def test_scales_ok_predicate():
+    """Le prédicat du site moteur accepte [E, N] et [E, N, 1], refuse le
+    reste (fail loud) — y compris les 3-D non unitaires."""
+    from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+        moe_megakernel_scales_ok,
+        normalize_w_scale,
+    )
+    M, top_k, E, I, K = 2, 8, 32, 32, 256
+    x, w1, w2, w1s, w2s, ids, _ = make_problem(M, top_k, E, I, K)
+    assert moe_megakernel_scales_ok(w1, w2, w1s, w2s)            # 2-D
+    assert moe_megakernel_scales_ok(w1, w2, w1s.unsqueeze(-1),
+                                    w2s.unsqueeze(-1))            # 3-D [.,.,1]
+    assert not moe_megakernel_scales_ok(w1, w2, None, w2s)        # None
+    assert not moe_megakernel_scales_ok(w1, w2, w1s, None)
+    bad3d = w1s.unsqueeze(-1).expand(E, 2 * I, 7).contiguous()   # non unitaire
+    assert not moe_megakernel_scales_ok(w1, w2, bad3d, w2s)
+    assert not moe_megakernel_scales_ok(w1, w2, w1s[:, :2], w2s)  # taille
+    assert not moe_megakernel_scales_ok(w1, w2, w1s, w2s[:, :2])
+    # normalize_w_scale : vue contiguë conservée (le kernel indexe [E, N])
+    n = normalize_w_scale(w1s.unsqueeze(-1).contiguous())
+    assert n.shape == w1s.shape and n.is_contiguous()
+
+
 def test_fallback_is_shipped_path(monkeypatch):
     """Gate OFF : TritonExperts.apply ne doit PAS toucher le megakernel."""
     from vllm import envs

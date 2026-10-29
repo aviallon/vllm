@@ -106,6 +106,8 @@ __all__ = [
     "moe_megakernel_strategy",
     "moe_megakernel_flags",
     "moe_megakernel_eligible",
+    "moe_megakernel_scales_ok",
+    "normalize_w_scale",
     "MoeMegakernelComm",
     "FLAG_ELEMS",
     "AR_MAX_CTAS",
@@ -1010,6 +1012,48 @@ def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return per_token_quant_int8(x)
 
 
+def normalize_w_scale(t: torch.Tensor | None) -> torch.Tensor | None:
+    """Contrat d'entrée des échelles poids : [E, N] OU [E, N, 1].
+
+    Le loader quark int8 MoE passe les échelles per-channel en 3-D
+    [E, N, 1] (`quark_moe.py` : « Per-channel scales: 2D [E, N] -> 3D
+    [E, N, 1] for the int8 MoE kernel ») — le kernel megakernel indexe un
+    [E, N] contigu.  Squeeze de la dernière dimension unitaire (vue
+    contiguë conservée).  Toute autre forme est laissée telle quelle —
+    `moe_megakernel_scales_ok` la refuse ensuite (fail loud).
+
+    ⚠ Leçon 2026-10-29 (gate muette n°2) : le site moteur repliait
+    SILENCIEUSEMENT sur ce décalage de forme (« repli (echelles poids non
+    per-channel) ») pendant que les tests passaient (échelles 2-D
+    synthétiques) — la forme réelle du checkpoint n'avait jamais été
+    exercée.  Le contrat accepte désormais les DEUX layouts, et un test de
+    contrat les couvre tous les deux.
+    """
+    if t is not None and t.dim() == 3 and t.size(2) == 1:
+        return t.squeeze(-1)
+    return t
+
+
+def moe_megakernel_scales_ok(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+) -> bool:
+    """Échelles poids per-channel exploitables par le kernel (après
+    `normalize_w_scale`) : w1_scale [E, 2I], w2_scale [E, K]."""
+    w1_scale = normalize_w_scale(w1_scale)
+    w2_scale = normalize_w_scale(w2_scale)
+    return not (
+        w1_scale is None
+        or w1_scale.dim() != 2
+        or w1_scale.size(1) != 2 * w2.size(2)
+        or w2_scale is None
+        or w2_scale.dim() != 2
+        or w2_scale.size(1) != w1.size(2)
+    )
+
+
 def fused_moe_megakernel(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -1046,6 +1090,10 @@ def fused_moe_megakernel(
     Sortie : `output` [M, K] bf16 (contrat `moe_sum` livré).
     """
     M = hidden_states.size(0)
+    # normalisation du layout des échelles (quark passe [E, N, 1]) — le
+    # kernel indexe [E, N] contigu ; voir normalize_w_scale.
+    w1_scale = normalize_w_scale(w1_scale)
+    w2_scale = normalize_w_scale(w2_scale)
     if topk_ids is not None:
         top_k = topk_ids.size(1)
     elif topk_weights is not None:
