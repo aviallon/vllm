@@ -63,6 +63,13 @@ cohérence par tâche jugent, doctrine 2026-10-24) :
 3. stratégie ``atomic`` : somme des contributions par **atomique fp32**
    (ordre non déterministe au dernier ULP entre runs — gate de déterminisme).
 
+Écarts d'ASSOCIATION flottante (classe 1 ULP, nommés — revue mimo W1) :
+l'ordre des multiplications diffère du livré sans changer les valeurs
+significatives : gemm1 compose `(acc·s1g)·sx` là où le livré fait
+`((acc·xs)·w1_scale)` ; gemm2 compose `(acc2·(s_row·wt))·s2` contre
+`((acc2·s2)·w2s)·wt` ; les sommes partielles int8 par chunk s'accumulent
+en fp32 dans un autre ordre.  Classe 1 ULP, non jugable à 3 %.
+
 Identiques : quant de x (expressions de `_per_token_quant_int8`), échelles
 per-channel, poids routé fp32 avant cast, sortie bf16 [M, K].
 
@@ -893,15 +900,27 @@ def qwen3_moe_mk_tree_pass1_kernel(
     BM: tl.constexpr,
     BKO: tl.constexpr,
     CI: tl.constexpr,
-    N_CHUNKS: tl.constexpr,
     NAIVE: tl.constexpr,
 ):
     """1 CTA = (bloc de paires, chunk intermédiaire) — gemm1 chunké puis
-    silu fp32 ; sortie = la rangée de paire post-silu écrite une seule fois
-    (store nu, aucun atomic).  Aucune échelle de quant ici : la quant est
-    per-token dans pass2 (contrat livré)."""
+    silu fp32 ; sortie = la tranche [chunk·CI,(chunk+1)·CI) de la rangée de
+    paire post-silu, écrite UNE fois par son CTA propriétaire (store nu,
+    aucun atomic ; n_chunks CTAs par rangée, colonnes disjointes — pas de
+    course, mais pas d'exclusivité de rangée non plus).  Aucune échelle de
+    quant ici : la quant est per-token dans pass2 (contrat livré)."""
     pid = tl.program_id(0)
     chunk = tl.program_id(1)
+
+    # C1 (revue deepseek 2026-10-29) : les blocs de PADDING du régime
+    # grouped (moe_align remplit expert_ids de -1 au-delà des blocs utiles)
+    # sortent AVANT tout chargement — comme le kernel livré (`npp` early
+    # exit).  Sans cette garde : calcul complet + chargements poids SANS
+    # masque hors bornes (e64=-1) + trafic garbage (~37 % de la grille à
+    # M=32 — mesuré dans le surcoût de site) ; le livré, lui, les saute.
+    e = tl.load(expert_ids_ptr + pid)
+    if e < 0:
+        return
+    e64 = e.to(tl.int64)
 
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
@@ -911,8 +930,6 @@ def qwen3_moe_mk_tree_pass1_kernel(
     valid = pairs < num_valid
     pairs_i64 = pairs.to(tl.int64)
     tokens = pairs // top_k
-    e = tl.load(expert_ids_ptr + pid)
-    e64 = e.to(tl.int64)
 
     x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
     sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
@@ -922,15 +939,20 @@ def qwen3_moe_mk_tree_pass1_kernel(
     acc_g = tl.zeros((BM, CI), dtype=tl.float32)
     acc_u = tl.zeros((BM, CI), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BKO)):
-        xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
-                     mask=valid[:, None], other=0)
+        # mimo C1 : masque sur les colonnes K — pour K non multiple de BKO
+        # la dernière itération lirait x du token suivant et w1 de l'expert
+        # suivant (corruption silencieuse, gate K%128 trop permissive).
+        kk = k * BKO + offs_k
+        m_k = kk < K
+        xk = tl.load(x_rows[:, None] + kk[None, :],
+                     mask=valid[:, None] & m_k[None, :], other=0)
         wg = tl.load(w1_ptr + e64 * stride_w1e
                      + offs_i[None, :] * stride_w1n
-                     + (k * BKO + offs_k)[:, None])
+                     + kk[:, None], mask=m_k[:, None], other=0)
         acc_g += tl.dot(xk, wg)
         wu = tl.load(w1_ptr + e64 * stride_w1e
                      + (I + offs_i)[None, :] * stride_w1n
-                     + (k * BKO + offs_k)[:, None])
+                     + kk[:, None], mask=m_k[:, None], other=0)
         acc_u += tl.dot(xk, wu)
 
     s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
@@ -974,7 +996,18 @@ def qwen3_moe_mk_tree_pass2_kernel(
     est celui du kernel livré (BN2=64, contraction I entière) — mesuré :
     les dots chunkés (contraction CI) tombent à ~40 % du pic."""
     pid = tl.program_id(0)
-    tile0 = tl.program_id(1)
+    # groupe de tuiles : le décalage est programme_id(1) * LOCAL_TILES
+    # (PIÈGE vécu 2026-10-29 : sans le facteur, les groupes se recouvrent
+    # et les tuiles hautes ne sont jamais écrites — garbage en sortie,
+    # attrapé par test_tree_poisoned_workspaces_no_gaps).
+    tile0 = tl.program_id(1) * LOCAL_TILES
+
+    # C1 (revues deepseek/mimo) : blocs de padding grouped (expert_ids = -1) →
+    # sortie AVANT tout chargement (voir pass1).
+    e = tl.load(expert_ids_ptr + pid)
+    if e < 0:
+        return
+    e64 = e.to(tl.int64)
 
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
@@ -983,10 +1016,7 @@ def qwen3_moe_mk_tree_pass2_kernel(
         pairs = tl.load(sorted_token_ids_ptr + offs_pair)
     valid = pairs < num_valid
     pairs_i64 = pairs.to(tl.int64)
-    tokens = pairs // top_k
     wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
-    e = tl.load(expert_ids_ptr + pid)
-    e64 = e.to(tl.int64)
 
     # --- quant per-token (contrat `_per_token_quant_int8`, amax sur I) ---
     offs_i_full = tl.arange(0, I)
@@ -1001,9 +1031,11 @@ def qwen3_moe_mk_tree_pass2_kernel(
         o = (tile0 + tt) * BN2 + offs_t
         m_o = o < K
         s2 = tl.load(w2_scale_ptr + e64 * K + o, mask=m_o, other=0.0)
+        # mimo S3 : masque sur la tuile de sortie (K non multiple de BN2)
         w2t = tl.load(w2_ptr + e64 * stride_w2e
                       + offs_i_full[:, None]
-                      + o[None, :] * stride_w2k)
+                      + o[None, :] * stride_w2k,
+                      mask=m_o[None, :], other=0)
         acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
         contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
         tl.store(ws_ptr + pairs_i64[:, None] * K + o[None, :], contrib,
@@ -1031,7 +1063,8 @@ def moe_megakernel_reduce_kernel(
     m = offs < K
     acc = tl.zeros((BLOCK,), dtype=tl.float32)
     for s in range(0, top_k):
-        p = (t * top_k + s) * K
+        # i64 : M·topk·K > 2^30 sortirait de l'int32 (doctrine du module)
+        p = (t.to(tl.int64) * top_k + s) * K
         v = tl.load(ws_ptr + p + offs, mask=m, other=0.0)
         acc += v
     if OUT_FP32:
@@ -1075,11 +1108,39 @@ def moe_megakernel_record_call(outcome: str, M: int,
     _CALL_STATS[key] = _CALL_STATS.get(key, 0) + 1
     _CALL_TOTAL += 1
     if _CALL_TOTAL == 1 or _CALL_TOTAL % 200 == 0:
-        top = sorted(_CALL_STATS.items(), key=lambda kv: -kv[1])[:14]
+        # deux lignes : les issues `bras:` ne doivent JAMAIS pouvoir être
+        # évincées par une pluie de clés `repli:M=…` (revue deepseek W6) ;
+        # + histogramme M borné (le falsifiant « distribution de M »).
+        bras = sorted((kv for kv in _CALL_STATS.items()
+                       if kv[0][0].startswith("bras:")),
+                      key=lambda kv: -kv[1])
+        repli = sorted((kv for kv in _CALL_STATS.items()
+                        if not kv[0][0].startswith("bras:")),
+                       key=lambda kv: -kv[1])
+        # histogramme M borné (quantiles pondérés, sans expansion)
+        pairs_ms = sorted((k[1], v) for k, v in _CALL_STATS.items())
+        total = sum(v for _, v in pairs_ms)
+        if total:
+            acc, p50, lo = 0, pairs_ms[-1][0], pairs_ms[0][0]
+            for m, v in pairs_ms:
+                acc += v
+                if acc >= total // 2:
+                    p50 = m
+                    break
+            hist = f"M min={lo} p50={p50} max={pairs_ms[-1][0]}"
+        else:
+            hist = "M -"
         logger.info(
-            "[moe-megakernel] appels-site #%d : %s",
+            "[moe-megakernel] appels-site #%d (%s) bras: %s",
+            _CALL_TOTAL, hist,
+            ", ".join(f"{k[0]}|M={k[1]}|{k[2]}={v}" for k, v in bras)
+            or "AUCUN",
+        )
+        logger.info(
+            "[moe-megakernel] appels-site #%d replis: %s",
             _CALL_TOTAL,
-            ", ".join(f"{k[0]}|M={k[1]}|{k[2]}={v}" for k, v in top),
+            ", ".join(f"{k[0]}|M={k[1]}|{k[2]}={v}" for k, v in repli[:14])
+            or "aucun",
         )
 
 
@@ -1208,9 +1269,19 @@ def moe_megakernel_eligible(
     apply_router_weight_on_input: bool,
     a1q_scale: torch.Tensor | None,
 ) -> str | None:
-    """None si éligible, sinon la raison du repli (comptée/loguée)."""
+    """None si éligible, sinon la raison du repli (comptée/loguée).
+
+    Revue deepseek W5 : TOUT ce que le launcher exige (stratégie connue,
+    I puissance de 2 pour `tree`, sortie bf16 contiguë) doit être une
+    raison de repli ICI — un assert dans la forward tuerait le moteur au
+    lieu de replier.  Les asserts du launcher restent en défense en
+    profondeur.
+    """
     if not moe_megakernel_enabled():
         return "gate off"
+    if moe_megakernel_strategy() not in ("pair", "atomic", "tree",
+                                          "routing"):
+        return f"strategie inconnue {moe_megakernel_strategy()!r}"
     if not (use_int8_w8a8 and per_act_token_quant):
         return "not int8 per-token w8a8"
     if block_shape is not None or quantization_emulation:
@@ -1229,14 +1300,23 @@ def moe_megakernel_eligible(
         return "int8 hidden without a1q_scale"
     K = w1.size(2)
     I = w2.size(2)
+    # gates de shape (revue mimo C1/W8) : congruentes avec les TUILES
+    # réelles, pas avec celles d'une époque antérieure.  Les kernels tree
+    # masquent leurs chargements par K (tout K est sûr), mais pair/atomic
+    # non : on garde les congruences qui les protègent, et tree exige I
+    # puissance de 2 (tl.arange(0, I) pleine-I).
     if K % 128 != 0:
         return f"K {K} not multiple of BKO"
-    if I % 8 != 0:
-        return f"I {I} not multiple of CI"
-    if hidden_states.size(0) > getattr(
-        envs, "VLLM_MOE_MEGAKERNEL_MAX_TOKENS", 8
+    if I % MK_CI != 0:
+        return f"I {I} not multiple of CI={MK_CI}"
+    if moe_megakernel_strategy() == "tree" and I & (I - 1):
+        return f"tree: I {I} not a power of 2 (tuile pleine-I)"
+    if hidden_states.size(0) > _env_int(
+        "VLLM_MOE_MEGAKERNEL_MAX_TOKENS", 8
     ):
-        return f"M={hidden_states.size(0)} above threshold"
+        # code de raison STABLE (mimo W5) — M est déjà dans la clé du
+        # compteur ; une raison interpolée fragmente le dictionnaire.
+        return "M-above-threshold"
     return None
 
 
@@ -1395,7 +1475,7 @@ def fused_moe_megakernel(
         n_blocks = M * top_k
     else:
         assert sorted_token_ids is not None and expert_ids is not None
-        n_blocks = triton.cdiv(sorted_token_ids.size(0), 16)
+        n_blocks = triton.cdiv(sorted_token_ids.size(0), MK_BM)
     BM = 16  # lignes pad (MFMA) — naive ET grouped, comme le kernel livré
     BKO = 128
 
@@ -1594,22 +1674,25 @@ def fused_moe_megakernel(
             x, x_scale, w1, w1_scale, mid_ws, s1, e1, num_valid,
             x.stride(0), w1.stride(0), w1.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=MK_TREE_BKO, CI=CI,
-            N_CHUNKS=n_chunks, NAIVE=naive,
+            NAIVE=naive,
             num_warps=2, num_stages=1,
         )
         n_tiles = triton.cdiv(K, 64)
-        # régime de lancement mesuré (moemk_decomp_bench, MI210) :
-        #  petits M (naive)  : grille (blocs, tuiles), LOCAL_TILES=1 —
-        #    quant redondante par tuile mais parallélisme ×n_tiles (M=8 :
-        #    parité avec le livré) ;
-        #  grands M (grouped) : grille (blocs,), LOCAL_TILES=n_tiles — le
-        #    quant est fait UNE fois par bloc (M=32 : 274.6 vs 387.7 µs).
+        # régime de lancement mesuré (exp_localtiles APRÈS correction du
+        # facteur tile0 — la courbe « LT=16 = 90 µs » d'avant correction
+        # était un artefact : les groupes se recoupaient et sautaient la
+        # moitié des tuiles).  MI210, shapes réels :
+        #  petits M (naive)  : grille (blocs, tuiles), LOCAL_TILES=1 ;
+        #  grands M (grouped) : LOCAL_TILES=n_tiles, grille (blocs,) —
+        #    pass2 M=32 : 105 µs (optimal) vs 123 (LT=4) vs 180 (LT=1) ;
+        #    M=128 : 243 (LT=32) vs 222 (LT=8) — +9 % sur pass2, retenu
+        #    pour la simplicité (pas de heuristique M).
         if naive:
             grid2 = (n_blocks, n_tiles)
             local_tiles = 1
         else:
-            grid2 = (n_blocks,)
             local_tiles = n_tiles
+            grid2 = (n_blocks,)
         qwen3_moe_mk_tree_pass2_kernel[grid2](
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),

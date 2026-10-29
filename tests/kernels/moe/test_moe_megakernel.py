@@ -156,8 +156,15 @@ def test_contract_vs_shipped(strategy, M, top_k, E, I, K):
 @pytest.mark.parametrize("strategy", ["pair", "atomic", "tree"])
 def test_determinism_run_to_run(strategy):
     """L'atomique fp32 est non-associative : deux runs ne doivent pas
-    diverger au-delà du dernier ULP bf16 (gate de déterminisme)."""
+    diverger au-delà du dernier ULP bf16 (gate de déterminisme).
+
+    ⚠ mimo C2 : les DEUX canaux doivent être posés — avec l'attribut `envs`
+    seul, `os.environ` (prioritaire) gardait la stratégie d'un test
+    précédent et les 3 paramétrisations exécutaient le MÊME bras (gate
+    structurellement muette)."""
     os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = strategy
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "64"
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_STRATEGY = strategy
@@ -230,6 +237,9 @@ def test_fallback_reasons():
 
 def test_grouped_mode():
     """Mode grouped (M·topk·4 > E) : tri par expert préservé."""
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "pair"
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "64"
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "pair"
@@ -1459,7 +1469,8 @@ def _tree_problem(M, top_k, E, I, K, scale_3d=True):
 
 
 def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
-                   expert_ids, *, pass2_fn=None, reduce_fn=None):
+                   expert_ids, *, pass1_fn=None, pass2_fn=None,
+                   reduce_fn=None):
     """Les 3 passes `tree` avec kernels remplaçables (harnais de mutation).
     Reproduit EXACTEMENT le launcher — `test_tree_pipeline_matches_launcher`
     le prouve bit-exact ; sans cette preuve les mutants ne diraient rien."""
@@ -1481,17 +1492,19 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     mid_ws = torch.empty((num_pairs, I), device=x.device,
                          dtype=torch.float32)
     ws = torch.empty((num_pairs, K), device=x.device, dtype=torch.bfloat16)
-    qwen3_moe_mk_tree_pass1_kernel[(n_blocks, n_chunks)](
+    p1 = pass1_fn or qwen3_moe_mk_tree_pass1_kernel
+    p1[(n_blocks, n_chunks)](
         xq, xs, w1, w1s2, mid_ws, s1, e1, num_pairs,
         xq.stride(0), w1.stride(0), w1.stride(1),
         top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
-        N_CHUNKS=n_chunks, NAIVE=naive, num_warps=2, num_stages=1)
+        NAIVE=naive, num_warps=2, num_stages=1)
     p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
     n_tiles = triton.cdiv(K, 64)
     if naive:
         grid2, local_tiles = (n_blocks, n_tiles), 1
     else:
-        grid2, local_tiles = (n_blocks,), n_tiles
+        local_tiles = n_tiles
+        grid2 = (n_blocks,)
     p2[grid2](
         mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
         w2.stride(0), w2.stride(1),
@@ -1508,6 +1521,60 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
 
 # --- mutants isolés (copies du kernel sain + UNE mutation nommée) ----------
 @triton.jit
+def _mut_pass1_drop_half_cols(
+    x_ptr, x_scale_ptr, w1_ptr, w1_scale_ptr, mid_ws_ptr,
+    sorted_token_ids_ptr, expert_ids_ptr, num_valid,
+    stride_xm, stride_w1e, stride_w1n,
+    top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
+    BM: tl.constexpr, BKO: tl.constexpr, CI: tl.constexpr,
+    NAIVE: tl.constexpr,
+):
+    """MUTANT : la moitié haute des colonnes de CHAQUE chunk est annulée
+    dans le store de pass1 — si la sortie ne bouge pas, le store de pass1
+    n'est pas consommé (pass1 sans mutant = la passe non couverte, revue
+    deepseek W2)."""
+    pid = tl.program_id(0)
+    chunk = tl.program_id(1)
+    e = tl.load(expert_ids_ptr + pid)
+    if e < 0:
+        return
+    e64 = e.to(tl.int64)
+    offs_pair = pid * BM + tl.arange(0, BM)
+    if NAIVE:
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+    else:
+        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+    valid = pairs < num_valid
+    pairs_i64 = pairs.to(tl.int64)
+    tokens = pairs // top_k
+    x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
+    sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
+    offs_i = chunk * CI + tl.arange(0, CI)
+    offs_k = tl.arange(0, BKO)
+    acc_g = tl.zeros((BM, CI), dtype=tl.float32)
+    acc_u = tl.zeros((BM, CI), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BKO)):
+        xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
+                     mask=valid[:, None], other=0)
+        wg = tl.load(w1_ptr + e64 * stride_w1e
+                     + offs_i[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        acc_g += tl.dot(xk, wg)
+        wu = tl.load(w1_ptr + e64 * stride_w1e
+                     + (I + offs_i)[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        acc_u += tl.dot(xk, wu)
+    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
+    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + offs_i)
+    acc_g = acc_g * s1g * sx[:, None]
+    acc_u = acc_u * s1u * sx[:, None]
+    mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
+    mid = tl.where((offs_i % CI)[None, :] >= CI // 2, 0.0, mid)   # MUTATION
+    tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
+             mask=valid[:, None])
+
+
+@triton.jit
 def _mut_pass2_drop_half_i(
     mid_ws_ptr, w2_ptr, w2_scale_ptr, topk_w_ptr, ws_ptr,
     sorted_token_ids_ptr, expert_ids_ptr, num_valid,
@@ -1519,7 +1586,7 @@ def _mut_pass2_drop_half_i(
     """MUTANT : la moitié haute de l'intermédiaire (I/2:I) est annulée avant
     le quant — si la sortie ne bouge pas, le dot ne consomme pas tout I."""
     pid = tl.program_id(0)
-    tile0 = tl.program_id(1)
+    tile0 = tl.program_id(1) * LOCAL_TILES
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
         pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
@@ -1561,10 +1628,13 @@ def _mut_pass2_scale_squared(
     BM: tl.constexpr, BN2: tl.constexpr, LOCAL_TILES: tl.constexpr,
     NAIVE: tl.constexpr,
 ):
-    """MUTANT : l'échelle per-token est appliquée DEUX fois (s_row²) — si la
-    sortie ne bouge pas, l'échelle de quant n'est pas consommée."""
+    """MUTANT : l'échelle per-token est MULTIPLIÉE PAR UN FACTEUR CONSTANT
+    (2·s_row) — drift ≈ 1 par construction (revue deepseek W3 : le mutant
+    s_row² a une sensibilité qui dépend des données : s_row → 0 rend la
+    mutation invisible).  Si la sortie ne bouge pas, l'échelle n'est pas
+    consommée."""
     pid = tl.program_id(0)
-    tile0 = tl.program_id(1)
+    tile0 = tl.program_id(1) * LOCAL_TILES
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
         pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
@@ -1591,7 +1661,7 @@ def _mut_pass2_scale_squared(
                       + offs_i_full[:, None]
                       + o[None, :] * stride_w2k)
         acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
-        contrib = acc2 * (s_row * s_row * wt)[:, None] * s2[None, :]  # MUT
+        contrib = acc2 * (2.0 * s_row * wt)[:, None] * s2[None, :]  # MUT
         tl.store(ws_ptr + pairs_i64[:, None] * K + o[None, :], contrib,
                  mask=valid[:, None] & m_o[None, :])
 
@@ -1632,11 +1702,15 @@ def _tree_grouped_ids(M, top_k, E, I, K):
     return x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids, expert_ids
 
 
-def test_tree_pipeline_matches_launcher():
+@pytest.mark.parametrize("M", [8, 32])
+def test_tree_pipeline_matches_launcher(M):
     """Le harnais de mutation reproduit le launcher au BIT près — sinon les
-    mutants ne prouveraient rien (garde anti-harnais-faux)."""
+    mutants ne prouveraient rien (garde anti-harnais-faux).  Paramétré
+    naive ET grouped : les deux branches de lancement (LOCAL_TILES=1 en
+    grille 2-D, LOCAL_TILES=n_tiles en grille 1-D) doivent y passer (revue
+    deepseek W1)."""
     _tree_set_gates()
-    M, top_k, E, I, K = 8, 8, 256, 256, 2048
+    top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
     out_launch = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -1713,7 +1787,8 @@ def test_tree_determinism_bit_exact(M):
 
 
 @pytest.mark.parametrize("mut_name", [
-    "pass2_drop_half_i", "pass2_scale_squared", "reduce_drop_last_slot"])
+    "pass1_drop_half_cols", "pass2_drop_half_i", "pass2_scale_x2",
+    "reduce_drop_last_slot"])
 def test_tree_mutations_falsifiable(mut_name):
     """Mutations isolées : chaque passe/entrée doit être CONSOMMÉE.  Le
     mutant est une copie du kernel sain avec UNE mutation ; le noyau sain du
@@ -1731,8 +1806,9 @@ def test_tree_mutations_falsifiable(mut_name):
     assert err_h < 0.03, f"noyau sain hors contrat: rel_err={err_h:.4f}"
 
     mut_fns = {
+        "pass1_drop_half_cols": dict(pass1_fn=_mut_pass1_drop_half_cols),
         "pass2_drop_half_i": dict(pass2_fn=_mut_pass2_drop_half_i),
-        "pass2_scale_squared": dict(pass2_fn=_mut_pass2_scale_squared),
+        "pass2_scale_x2": dict(pass2_fn=_mut_pass2_scale_squared),
         "reduce_drop_last_slot": dict(reduce_fn=_mut_reduce_drop_last_slot),
     }
     mutant = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
@@ -1761,7 +1837,7 @@ def test_tree_isa_no_atomics():
             "num_valid": "i32", "stride_xm": "i32", "stride_w1e": "i32",
             "stride_w1n": "i32",
         }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM, "BKO": MK_TREE_BKO,
-            "CI": MK_TREE_CI, "N_CHUNKS": 4, "NAIVE": True}, 2, 1),
+            "CI": MK_TREE_CI, "NAIVE": True}, 2, 1),
         ("tree-pass2", mk.qwen3_moe_mk_tree_pass2_kernel, {
             "mid_ws_ptr": "*fp32", "w2_ptr": "*i8",
             "w2_scale_ptr": "*fp32", "topk_w_ptr": "*fp32",
@@ -1777,7 +1853,7 @@ def test_tree_isa_no_atomics():
     ]
     for name, fn, sig, cst, nw, ns in cases:
         asm = _compile_asm(fn, sig, cst, nw, ns)
-        atoms = _re.findall(r"\b[a-z_]*atomic[a-z0-9_]*", asm)
+        atoms = _re.findall(r"(?m)^\s*[a-z_.]*atomic[a-z0-9_]*", asm)
         print(f"asm {name}: atomics={len(atoms)} "
               f"({sorted(set(atoms))[:6]}) mfma x{asm.count('v_mfma')}")
         assert not atoms, (
@@ -1799,7 +1875,7 @@ def test_tree_isa_no_atomics():
          "CI": MK_CI, "BN2": MK_BN2, "NAIVE": True, "ROUTING": False,
          "RENORM": True, "E": 256, "NORM": False, "AR": False,
          "FLAG_ELEMS_C": 64}, 4, 2)
-    atoms_a = _re.findall(r"\b[a-z_]*atomic[a-z0-9_]*", asm_a)
+    atoms_a = _re.findall(r"(?m)^\s*[a-z_.]*atomic[a-z0-9_]*", asm_a)
     print(f"asm atomic-controle: atomics x{len(atoms_a)} "
           f"({sorted(set(atoms_a))[:6]})")
     assert atoms_a, (
@@ -1870,3 +1946,57 @@ def test_tree_int8_out_path_consumed(caplog):
     finally:
         os.environ["VLLM_MOE_MEGAKERNEL_INT8_OUT"] = "0"
         envs.VLLM_MOE_MEGAKERNEL_INT8_OUT = False
+
+
+def test_tree_poisoned_workspaces_no_gaps(monkeypatch):
+    """C2 (revue deepseek) : `mid_ws`/`ws` sont des `torch.empty` — un TROU
+    dans la couverture (une rangée de paire jamais écrite par pass1/pass2)
+    lirait du garbage, souvent du zéro recyclé par l'allocateur, et le
+    contrat à 3 % passerait en silence.  On empoisonne les workspaces avec
+    des NaN AU MOMENT DE L'ALLOCATION : si la sortie est bit-identique à
+    une run propre et sans NaN, alors chaque élément consommé a bien été
+    écrit (seule preuve POSITIVE de l'invariant, pas une argumentation)."""
+    _tree_set_gates()
+    import vllm.model_executor.layers.fused_moe.moe_megakernel as mkmod
+
+    M, top_k, E, I, K = 32, 8, 256, 256, 2048   # grouped (zone du trou C1)
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+
+    def run():
+        out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
+        torch.cuda.synchronize()
+        return out
+
+    out_clean = run()
+
+    num_pairs = M * top_k
+    real_empty = torch.empty
+    seen: dict[int, bool] = {}
+
+    def poisoned_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if (t.dim() == 2 and t.size(0) == num_pairs
+                and t.size(1) in (I, K)):
+            t.fill_(float("nan"))
+            seen[t.size(1)] = True
+        return t
+
+    with monkeypatch.context() as m:
+        m.setattr(mkmod.torch, "empty", poisoned_empty)
+        out_poisoned = run()
+
+    # anti-test-vide : le poison DOIT avoir frappé les DEUX workspaces
+    assert seen.get(I) and seen.get(K), (
+        f"le poison n'a jamais frappé les workspaces (vu={seen}) — "
+        "le test ne prouve rien")
+    assert not out_poisoned.isnan().any(), (
+        "NaN en sortie : une rangée consommée n'a jamais été écrite "
+        "(trou de couverture dans pass1/pass2)")
+    assert torch.equal(out_clean, out_poisoned), (
+        "sortie différente avec workspaces empoisonnés : du garbage non "
+        "écrit s'infiltre dans le résultat")
