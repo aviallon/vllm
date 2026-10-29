@@ -1471,13 +1471,15 @@ def _tree_problem(M, top_k, E, I, K, scale_3d=True):
 
 def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
                    expert_ids, *, pass1_fn=None, pass2_fn=None,
-                   reduce_fn=None, mid_bf16=False, local_tiles=None):
+                   reduce_fn=None, mid_bf16=False, local_tiles=None,
+                   pass2_cfg=None):
     """Les 3 passes `tree` avec kernels remplaçables (harnais de mutation).
     Reproduit EXACTEMENT le launcher — `test_tree_pipeline_matches_launcher`
     le prouve bit-exact ; sans cette preuve les mutants ne diraient rien.
     `mid_bf16` = canal MID_BF16 (stockage bf16 de l'intermédiaire) ;
-    `local_tiles` (None = celui du launcher) force un régime de tuiles —
-    la couverture de TOUTES les tuiles est jugée par le poison NaN.
+    `pass2_cfg` (None = tree_pass2_config du launcher) force un régime de
+    lancement ; `local_tiles` force le groupement de tuiles — la couverture
+    de TOUTES les tuiles est jugée par le poison NaN.
     """
     from vllm.model_executor.layers.quantization.utils.int8_utils import (
         per_token_quant_int8,
@@ -1505,7 +1507,8 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
         top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
         NAIVE=naive, MID_BF16=mid_bf16, num_warps=2, num_stages=1)
     p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
-    n_tiles = triton.cdiv(K, 64)
+    bn2, _lt_cfg, nw2, ns2 = pass2_cfg or mkmod.tree_pass2_config(M, naive)
+    n_tiles = triton.cdiv(K, bn2)
     if naive:
         assert local_tiles is None, (
             "local_tiles forcé non applicable en naive (grille 2-D, LT=1)")
@@ -1522,9 +1525,9 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     p2[grid2](
         mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
         w2.stride(0), w2.stride(1),
-        top_k=top_k, K=K, I=I, BM=BM, BN2=64,
+        top_k=top_k, K=K, I=I, BM=BM, BN2=bn2,
         LOCAL_TILES=lt, NAIVE=naive, MID_BF16=mid_bf16,
-        num_warps=2, num_stages=1)
+        num_warps=nw2, num_stages=ns2)
     rd = reduce_fn or moe_megakernel_reduce_kernel
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
     rd[(M, triton.cdiv(K, 64))](ws, out, top_k=top_k, K=K, BLOCK=64,
@@ -1724,7 +1727,7 @@ def _tree_grouped_ids(M, top_k, E, I, K):
     return x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids, expert_ids
 
 
-@pytest.mark.parametrize("M", [8, 32])
+@pytest.mark.parametrize("M", [8, 32, 128])
 @pytest.mark.parametrize("mid_bf16", [False, True])
 def test_tree_pipeline_matches_launcher(M, mid_bf16, monkeypatch):
     """Le harnais de mutation reproduit le launcher au BIT près — sinon les
@@ -1790,7 +1793,7 @@ def test_tree_contract_real_shapes_and_3d_scales(M):
         "changé des valeurs (ou le kernel indexe faux)")
 
 
-@pytest.mark.parametrize("M", [8, 32])
+@pytest.mark.parametrize("M", [8, 32, 128])
 def test_tree_determinism_bit_exact(M):
     """`tree` a un ordre de sommation FIXE : deux runs sont bit-identiques
     (strict — pas de tolérance ULP).  C'est un contrat NOMMÉ de `tree` que
@@ -1843,6 +1846,24 @@ def test_tree_mid_bf16_contract(M):
         f"M={M} : canal bf16 non déterministe bit-à-bit")
 
 
+def test_tree_launch_regime_selection():
+    """Passe de tuiles : la fonction de régime partagée launcher/tests est
+    EXHAUSTIVE (tout (M, naive) tombe sur une config nommée) et ses seuils
+    sont CONSOMMÉS (39 vs 40, naïf, grand M) — sinon le régime nouveau de
+    M≥40 pourrait ne jamais s'exécuter (gate muette de config)."""
+    assert mkmod.tree_pass2_config(1, True) == (64, 1, 2, 1)
+    assert mkmod.tree_pass2_config(8, True) == (64, 1, 2, 1)
+    assert mkmod.tree_pass2_config(32, False) == (64, None, 2, 1)
+    assert mkmod.tree_pass2_config(39, False) == (64, None, 2, 1)
+    assert mkmod.tree_pass2_config(40, False) == (128, None, 4, 3)
+    assert mkmod.tree_pass2_config(128, False) == (128, None, 4, 3)
+    named = {(64, 1, 2, 1), (64, None, 2, 1), (128, None, 4, 3)}
+    for M in range(1, 257):
+        for naive in (True, False):
+            assert mkmod.tree_pass2_config(M, naive) in named, (
+                f"config non nommée pour M={M} naive={naive}")
+
+
 @pytest.mark.parametrize("local_tiles", [None, 16, 8, 4, 2, 1])
 def test_tree_tile_coverage_poison(local_tiles):
     """Leçon `tile0` (2026-10-29 : le facteur LOCAL_TILES manquant faisait
@@ -1892,6 +1913,55 @@ def test_tree_tile_coverage_poison(local_tiles):
         f"LOCAL_TILES={local_tiles} : sortie différente avec workspaces "
         "empoisonnés — du garbage non écrit s'infiltre (tuile recouverte "
         "plusieurs fois avec écritures concurrentes ?)")
+
+
+@pytest.mark.parametrize("M,bn2,local_tiles", [
+    (128, 128, None), (128, 128, 8), (128, 128, 2)])
+def test_tree_tile_coverage_poison_big_m(M, bn2, local_tiles):
+    """Couverture de tuiles du RÉGIME NOUVEAU (BN2=128, M≥40) — leçon
+    `tile0` : le poison NaN exige que chaque tuile de sortie soit écrite
+    exactement une fois, y compris avec le groupement de tuiles du régime
+    à grand M."""
+    _tree_set_gates()
+    top_k, E, I, K = 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+    cfg = (bn2, None, 2, 1)
+
+    def run():
+        return _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                              local_tiles=local_tiles, pass2_cfg=cfg)
+
+    out_clean = run()
+    assert out_clean.abs().max() > 0
+
+    num_pairs = M * top_k
+    real_empty = torch.empty
+    seen: dict[int, bool] = {}
+
+    def poisoned_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if (t.dim() == 2 and t.size(0) == num_pairs
+                and t.size(1) in (I, K)):
+            t.fill_(float("nan"))
+            seen[t.size(1)] = True
+        return t
+
+    import vllm.model_executor.layers.fused_moe.moe_megakernel as mkmod
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(mkmod.torch, "empty", poisoned_empty)
+        out_poisoned = run()
+
+    assert seen.get(I) and seen.get(K), (
+        f"le poison n'a jamais frappé les workspaces (vu={seen}) — "
+        "le test ne prouve rien")
+    assert not out_poisoned.isnan().any(), (
+        f"NaN en sortie (M={M} BN2={bn2} LT={local_tiles}) : une tuile de "
+        "sortie n'a jamais été écrite")
+    assert torch.equal(out_clean, out_poisoned), (
+        f"M={M} BN2={bn2} LT={local_tiles} : sortie différente avec "
+        "workspaces empoisonnés — garbage non écrit ou tuile recouverte")
 
 
 @pytest.mark.parametrize("mut_name", [
@@ -1955,6 +2025,14 @@ def test_tree_isa_no_atomics():
             "stride_w2e": "i32", "stride_w2k": "i32",
         }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM,
             "BN2": 64, "LOCAL_TILES": 32, "NAIVE": True}, 2, 1),
+        ("tree-pass2-bn2", mk.qwen3_moe_mk_tree_pass2_kernel, {
+            "mid_ws_ptr": "*fp32", "w2_ptr": "*i8",
+            "w2_scale_ptr": "*fp32", "topk_w_ptr": "*fp32",
+            "ws_ptr": "*bf16", "sorted_token_ids_ptr": "*i32",
+            "expert_ids_ptr": "*i32", "num_valid": "i32",
+            "stride_w2e": "i32", "stride_w2k": "i32",
+        }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM,
+            "BN2": 128, "LOCAL_TILES": 16, "NAIVE": True}, 4, 3),
         ("tree-reduce", mk.moe_megakernel_reduce_kernel, {
             "ws_ptr": "*bf16", "out_ptr": "*bf16",
         }, {"top_k": 8, "K": 2048, "BLOCK": 64, "OUT_FP32": False},
@@ -1964,7 +2042,7 @@ def test_tree_isa_no_atomics():
         # MID_BF16 : les DEUX canaux passent la gate codegen (les branches
         # if/else du store pass1 / load pass2 sont compilées séparément).
         variants = [cst]
-        if name in ("tree-pass1", "tree-pass2"):
+        if name.startswith(("tree-pass1", "tree-pass2")):
             variants = [dict(cst, MID_BF16=v) for v in (False, True)]
         for cst_v in variants:
             sig_v = sig
@@ -1982,7 +2060,7 @@ def test_tree_isa_no_atomics():
                 f"{tag}: instructions atomic dans le codegen "
                 f"{sorted(set(atoms))}"
                 " — l'accumulateur atomique n'est pas éliminé")
-            if name in ("tree-pass1", "tree-pass2"):
+            if name.startswith(("tree-pass1", "tree-pass2")):
                 assert asm.count("v_mfma") > 0, (
                     f"{tag}: aucun v_mfma — les dots sont tombés en "
                     "micro-dots")

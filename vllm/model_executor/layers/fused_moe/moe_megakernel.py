@@ -256,8 +256,37 @@ MK_TREE_BKO = 256
 MK_TREE_CI = 64
 # Stockage bf16 de l'intermédiaire post-silu (passe tuiles, 2026-10-29) :
 # moitié moins de trafic sur mid_ws, même contrat de quant per-token.
-# Mesuré par moemk_tilepass_bench (sweep MID_BF16) avant bascule du défaut.
+# MESURÉ NEUTRE en vitesse (tilepass sweep F) et légèrement lossy —
+# resté OFF ; le knob est testé (deux canaux) pour toute reprise.
 MK_TREE_MID_BF16 = False
+# Seuil de régime pass2 groupé (passe de tuiles 2026-10-29) :
+# PLAFONDS-TUILES.md §2/§4 — au-delà, BN2=128 + warps 4 + stages 3
+# (mesuré : M=128 424->383 µs, M=48 331->312 ; sous le seuil la config
+# historique BN2=64/warps 2/stages 1 est optimale : M=32 246 vs 255).
+MK_TREE_GROUPED_BIGM = 40
+
+
+def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
+    """Régime de lancement de pass2 (passe de tuiles, mesures
+    `moemk_tilepass_bench`/`moemk_tilepass_probe2`, log de preuve
+    evidence/tilepass-*.log).  Retourne (BN2, LOCAL_TILES, num_warps,
+    num_stages) ; LOCAL_TILES=None => n_tiles entier (grille 1-D blocs),
+    1 => grille 2-D (blocs, tuiles) du régime naive.  FONCTION PARTAGÉE
+    launcher/tests — l'égalité bit-exacte harnais↔launcher est prouvée par
+    `test_tree_pipeline_matches_launcher` (garde anti-harnais-faux).
+
+    Régimes (un seul changement par régime, mono-variable) :
+      * naive (M·topk·4 ≤ E)      : 64, 1, 2, 1  — INCHANGÉ (c1/c8) ;
+      * grouped M < BIGM (c32)    : 64, None, 2, 1 — INCHANGÉ (mesuré
+        optimal : BN2=128 perd ~10 µs à M=32) ;
+      * grouped M ≥ BIGM (c128)   : 128, None, 4, 3 — NOUVEAU (−41 µs
+        @M=128, −18 @M=48 ; ns=3 passe le budget LDS de pass2).
+    """
+    if naive:
+        return 64, 1, 2, 1
+    if M < MK_TREE_GROUPED_BIGM:
+        return 64, None, 2, 1
+    return 128, None, 4, 3
 
 
 @triton.jit
@@ -1700,28 +1729,24 @@ def fused_moe_megakernel(
             NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
             num_warps=2, num_stages=1,
         )
-        n_tiles = triton.cdiv(K, 64)
-        # régime de lancement mesuré (exp_localtiles APRÈS correction du
-        # facteur tile0 — la courbe « LT=16 = 90 µs » d'avant correction
-        # était un artefact : les groupes se recoupaient et sautaient la
-        # moitié des tuiles).  MI210, shapes réels :
-        #  petits M (naive)  : grille (blocs, tuiles), LOCAL_TILES=1 ;
-        #  grands M (grouped) : LOCAL_TILES=n_tiles, grille (blocs,) —
-        #    pass2 M=32 : 105 µs (optimal) vs 123 (LT=4) vs 180 (LT=1) ;
-        #    M=128 : 243 (LT=32) vs 222 (LT=8) — +9 % sur pass2, retenu
-        #    pour la simplicité (pas de heuristique M).
+        n_tiles_cfg, local_tiles, nw2, ns2 = tree_pass2_config(M, naive)
+        n_tiles = triton.cdiv(K, n_tiles_cfg)
+        # régime de lancement = tree_pass2_config (passe de tuiles
+        # 2026-10-29, PLAFONDS-TUILES §4) : naïf = grille 2-D LT=1 ;
+        # groupé = grille 1-D (blocs) LT=n_tiles (le quant est fait une
+        # fois par bloc — mesuré optimal à TOUS les M, sweep B : le levier
+        # « LT=8 à M=128 » est réfuté, cf. PLAFONDS-TUILES §1).
         if naive:
             grid2 = (n_blocks, n_tiles)
-            local_tiles = 1
         else:
             local_tiles = n_tiles
             grid2 = (n_blocks,)
         qwen3_moe_mk_tree_pass2_kernel[grid2](
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),
-            top_k=top_k, K=K, I=I, BM=BM, BN2=64,
+            top_k=top_k, K=K, I=I, BM=BM, BN2=n_tiles_cfg,
             LOCAL_TILES=local_tiles, NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
-            num_warps=2, num_stages=1,
+            num_warps=nw2, num_stages=ns2,
         )
         if moe_megakernel_int8_out_enabled():
             # variante interface v2' : le reduce écrit fp32, puis requant
