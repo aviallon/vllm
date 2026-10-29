@@ -1436,6 +1436,7 @@ from vllm.model_executor.layers.fused_moe.moe_megakernel import (
     qwen3_moe_mk_tree_pass1_kernel,
     qwen3_moe_mk_tree_pass2_kernel,
 )
+from vllm.model_executor.layers.fused_moe import moe_megakernel as mkmod
 
 
 def _tree_set_gates(strategy="tree", max_tokens="128"):
@@ -1470,10 +1471,14 @@ def _tree_problem(M, top_k, E, I, K, scale_3d=True):
 
 def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
                    expert_ids, *, pass1_fn=None, pass2_fn=None,
-                   reduce_fn=None):
+                   reduce_fn=None, mid_bf16=False, local_tiles=None):
     """Les 3 passes `tree` avec kernels remplaçables (harnais de mutation).
     Reproduit EXACTEMENT le launcher — `test_tree_pipeline_matches_launcher`
-    le prouve bit-exact ; sans cette preuve les mutants ne diraient rien."""
+    le prouve bit-exact ; sans cette preuve les mutants ne diraient rien.
+    `mid_bf16` = canal MID_BF16 (stockage bf16 de l'intermédiaire) ;
+    `local_tiles` (None = celui du launcher) force un régime de tuiles —
+    la couverture de TOUTES les tuiles est jugée par le poison NaN.
+    """
     from vllm.model_executor.layers.quantization.utils.int8_utils import (
         per_token_quant_int8,
     )
@@ -1490,26 +1495,35 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     e1 = expert_ids if expert_ids is not None else ids
     n_blocks = num_pairs if naive else triton.cdiv(sorted_ids.size(0), 16)
     mid_ws = torch.empty((num_pairs, I), device=x.device,
-                         dtype=torch.float32)
+                         dtype=(torch.bfloat16 if mid_bf16
+                                else torch.float32))
     ws = torch.empty((num_pairs, K), device=x.device, dtype=torch.bfloat16)
     p1 = pass1_fn or qwen3_moe_mk_tree_pass1_kernel
     p1[(n_blocks, n_chunks)](
         xq, xs, w1, w1s2, mid_ws, s1, e1, num_pairs,
         xq.stride(0), w1.stride(0), w1.stride(1),
         top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
-        NAIVE=naive, num_warps=2, num_stages=1)
+        NAIVE=naive, MID_BF16=mid_bf16, num_warps=2, num_stages=1)
     p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
     n_tiles = triton.cdiv(K, 64)
     if naive:
-        grid2, local_tiles = (n_blocks, n_tiles), 1
-    else:
-        local_tiles = n_tiles
+        assert local_tiles is None, (
+            "local_tiles forcé non applicable en naive (grille 2-D, LT=1)")
+        grid2, lt = (n_blocks, n_tiles), 1
+    elif local_tiles is None:
+        lt = n_tiles
         grid2 = (n_blocks,)
+    else:
+        # régime forcé (couverture de tuiles) : groupes de `local_tiles`
+        assert n_tiles % local_tiles == 0, (
+            f"local_tiles={local_tiles} doit diviser n_tiles={n_tiles}")
+        lt = local_tiles
+        grid2 = (n_blocks, triton.cdiv(n_tiles, lt))
     p2[grid2](
         mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
         w2.stride(0), w2.stride(1),
         top_k=top_k, K=K, I=I, BM=BM, BN2=64,
-        LOCAL_TILES=local_tiles, NAIVE=naive,
+        LOCAL_TILES=lt, NAIVE=naive, MID_BF16=mid_bf16,
         num_warps=2, num_stages=1)
     rd = reduce_fn or moe_megakernel_reduce_kernel
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -1527,7 +1541,7 @@ def _mut_pass1_drop_half_cols(
     stride_xm, stride_w1e, stride_w1n,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
     BM: tl.constexpr, BKO: tl.constexpr, CI: tl.constexpr,
-    NAIVE: tl.constexpr,
+    NAIVE: tl.constexpr, MID_BF16: tl.constexpr,
 ):
     """MUTANT : la moitié haute des colonnes de CHAQUE chunk est annulée
     dans le store de pass1 — si la sortie ne bouge pas, le store de pass1
@@ -1570,8 +1584,12 @@ def _mut_pass1_drop_half_cols(
     acc_u = acc_u * s1u * sx[:, None]
     mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
     mid = tl.where((offs_i % CI)[None, :] >= CI // 2, 0.0, mid)   # MUTATION
-    tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
-             mask=valid[:, None])
+    if MID_BF16:
+        tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :],
+                 mid.to(tl.bfloat16), mask=valid[:, None])
+    else:
+        tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
+                 mask=valid[:, None])
 
 
 @triton.jit
@@ -1581,7 +1599,7 @@ def _mut_pass2_drop_half_i(
     stride_w2e, stride_w2k,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
     BM: tl.constexpr, BN2: tl.constexpr, LOCAL_TILES: tl.constexpr,
-    NAIVE: tl.constexpr,
+    NAIVE: tl.constexpr, MID_BF16: tl.constexpr,
 ):
     """MUTANT : la moitié haute de l'intermédiaire (I/2:I) est annulée avant
     le quant — si la sortie ne bouge pas, le dot ne consomme pas tout I."""
@@ -1601,6 +1619,8 @@ def _mut_pass2_drop_half_i(
     offs_i_full = tl.arange(0, I)
     mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
                   mask=valid[:, None], other=0.0)
+    if MID_BF16:
+        mid = mid.to(tl.float32)
     mid = tl.where(offs_i_full[None, :] >= I // 2, 0.0, mid)   # MUTATION
     amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
     s_row = amax / 127.0
@@ -1626,7 +1646,7 @@ def _mut_pass2_scale_squared(
     stride_w2e, stride_w2k,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
     BM: tl.constexpr, BN2: tl.constexpr, LOCAL_TILES: tl.constexpr,
-    NAIVE: tl.constexpr,
+    NAIVE: tl.constexpr, MID_BF16: tl.constexpr,
 ):
     """MUTANT : l'échelle per-token est MULTIPLIÉE PAR UN FACTEUR CONSTANT
     (2·s_row) — drift ≈ 1 par construction (revue deepseek W3 : le mutant
@@ -1649,6 +1669,8 @@ def _mut_pass2_scale_squared(
     offs_i_full = tl.arange(0, I)
     mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
                   mask=valid[:, None], other=0.0)
+    if MID_BF16:
+        mid = mid.to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
     s_row = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
@@ -1703,12 +1725,16 @@ def _tree_grouped_ids(M, top_k, E, I, K):
 
 
 @pytest.mark.parametrize("M", [8, 32])
-def test_tree_pipeline_matches_launcher(M):
+@pytest.mark.parametrize("mid_bf16", [False, True])
+def test_tree_pipeline_matches_launcher(M, mid_bf16, monkeypatch):
     """Le harnais de mutation reproduit le launcher au BIT près — sinon les
     mutants ne prouveraient rien (garde anti-harnais-faux).  Paramétré
     naive ET grouped : les deux branches de lancement (LOCAL_TILES=1 en
     grille 2-D, LOCAL_TILES=n_tiles en grille 1-D) doivent y passer (revue
-    deepseek W1)."""
+    deepseek W1) — et les DEUX canaux MID_BF16 (passe tuiles 2026-10-29).
+    Le launcher est basculé sur le canal testé via la constante module
+    (monkeypatch) : si le launcher ignore la constante, ce test casse."""
+    monkeypatch.setattr(mkmod, "MK_TREE_MID_BF16", mid_bf16)
     _tree_set_gates()
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
@@ -1718,7 +1744,8 @@ def test_tree_pipeline_matches_launcher(M):
         out_launch, x, w1, w2, wts, ids, None, w1s, w2s,
         naive=naive, sorted_token_ids=sd, expert_ids=ed)
     torch.cuda.synchronize()
-    out_pipe = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed)
+    out_pipe = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                              mid_bf16=mid_bf16)
     assert torch.equal(out_launch, out_pipe), (
         "le harnais de mutation diverge du launcher — les mutants sont hors "
         "jeu tant que ce n'est pas égal au bit près")
@@ -1786,6 +1813,87 @@ def test_tree_determinism_bit_exact(M):
         "n'est pas fixe (ou il reste un atomic quelque part)")
 
 
+@pytest.mark.parametrize("M", [8, 32, 128])
+def test_tree_mid_bf16_contract(M):
+    """Passe tuiles 2026-10-29 — canal MID_BF16 (mid_ws bf16) :
+    (1) contrat < 3 % vs la référence livrée, COMME le canal fp32 ;
+    (2) les DEUX canaux produisent des bits DIFFÉRENTS (canari de
+    consommation du knob — sinon il est mort et le test ne prouve rien) ;
+    (3) le canal bf16 est bit-exact run-to-run (ordre fixe conservé).
+    M=8 = naive, M=32/128 = grouped."""
+    _tree_set_gates()
+    top_k, E, I, K = 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    ref = reference_chain(x, w1, w2, normalize_w_scale(w1s),
+                          normalize_w_scale(w2s), ids, wts, naive)
+    out32 = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                           mid_bf16=False)
+    out16 = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                           mid_bf16=True)
+    err32, err16 = _rel_err(out32, ref), _rel_err(out16, ref)
+    assert err32 < 0.03, f"M={M} canal fp32 hors contrat: {err32:.4f}"
+    assert err16 < 0.03, f"M={M} canal bf16 hors contrat: {err16:.4f}"
+    assert not torch.equal(out32, out16), (
+        f"M={M} : MID_BF16 ne change AUCUN bit — le knob est mort "
+        "(ou les deux canaux exécutent le même code) : canari muet")
+    out16b = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                            mid_bf16=True)
+    assert torch.equal(out16, out16b), (
+        f"M={M} : canal bf16 non déterministe bit-à-bit")
+
+
+@pytest.mark.parametrize("local_tiles", [None, 16, 8, 4, 2, 1])
+def test_tree_tile_coverage_poison(local_tiles):
+    """Leçon `tile0` (2026-10-29 : le facteur LOCAL_TILES manquant faisait
+    sauter la moitié des tuiles — garbage en sortie, gain fantôme au bench)
+    : pour CHAQUE régime de groupement de tuiles, empoisonner les workspaces
+    en NaN et exiger une sortie bit-identique à la run propre.  Un groupe de
+    tuiles jamais écrit = NaN en sortie ; un groupe recouvert = divergence.
+    C'est la preuve positive que la grille (blocs, n_tiles/LOCAL_TILES)
+    couvre chaque tuile de sortie EXACTEMENT une fois."""
+    _tree_set_gates()
+    M, top_k, E, I, K = 32, 8, 256, 256, 2048   # grouped (n_tiles=32)
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+
+    def run():
+        return _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                              local_tiles=local_tiles)
+
+    out_clean = run()
+    assert out_clean.abs().max() > 0
+
+    num_pairs = M * top_k
+    real_empty = torch.empty
+    seen: dict[int, bool] = {}
+
+    def poisoned_empty(*args, **kwargs):
+        t = real_empty(*args, **kwargs)
+        if (t.dim() == 2 and t.size(0) == num_pairs
+                and t.size(1) in (I, K)):
+            t.fill_(float("nan"))
+            seen[t.size(1)] = True
+        return t
+
+    import vllm.model_executor.layers.fused_moe.moe_megakernel as mkmod
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(mkmod.torch, "empty", poisoned_empty)
+        out_poisoned = run()
+
+    assert seen.get(I) and seen.get(K), (
+        f"le poison n'a jamais frappé les workspaces (vu={seen}) — "
+        "le test ne prouve rien")
+    assert not out_poisoned.isnan().any(), (
+        f"NaN en sortie (LOCAL_TILES={local_tiles}) : une tuile de sortie "
+        "n'a jamais été écrite (trou de couverture de la grille de tuiles)")
+    assert torch.equal(out_clean, out_poisoned), (
+        f"LOCAL_TILES={local_tiles} : sortie différente avec workspaces "
+        "empoisonnés — du garbage non écrit s'infiltre (tuile recouverte "
+        "plusieurs fois avec écritures concurrentes ?)")
+
+
 @pytest.mark.parametrize("mut_name", [
     "pass1_drop_half_cols", "pass2_drop_half_i", "pass2_scale_x2",
     "reduce_drop_last_slot"])
@@ -1836,7 +1944,8 @@ def test_tree_isa_no_atomics():
             "sorted_token_ids_ptr": "*i32", "expert_ids_ptr": "*i32",
             "num_valid": "i32", "stride_xm": "i32", "stride_w1e": "i32",
             "stride_w1n": "i32",
-        }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM, "BKO": MK_TREE_BKO,
+        }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM,
+            "BKO": MK_TREE_BKO,
             "CI": MK_TREE_CI, "NAIVE": True}, 2, 1),
         ("tree-pass2", mk.qwen3_moe_mk_tree_pass2_kernel, {
             "mid_ws_ptr": "*fp32", "w2_ptr": "*i8",
@@ -1852,18 +1961,33 @@ def test_tree_isa_no_atomics():
             4, 1),
     ]
     for name, fn, sig, cst, nw, ns in cases:
-        asm = _compile_asm(fn, sig, cst, nw, ns)
-        atoms = _re.findall(r"(?m)^\s*[a-z_.]*atomic[a-z0-9_]*", asm)
-        print(f"asm {name}: atomics={len(atoms)} "
-              f"({sorted(set(atoms))[:6]}) mfma x{asm.count('v_mfma')}")
-        assert not atoms, (
-            f"{name}: instructions atomic dans le codegen {sorted(set(atoms))}"
-            " — l'accumulateur atomique n'est pas éliminé")
+        # MID_BF16 : les DEUX canaux passent la gate codegen (les branches
+        # if/else du store pass1 / load pass2 sont compilées séparément).
+        variants = [cst]
         if name in ("tree-pass1", "tree-pass2"):
-            assert asm.count("v_mfma") > 0, (
-                f"{name}: aucun v_mfma — les dots sont tombés en micro-dots")
-            assert asm.count("v_dot4") == 0, (
-                f"{name}: v_dot4 présent — mandat MFMA violé")
+            variants = [dict(cst, MID_BF16=v) for v in (False, True)]
+        for cst_v in variants:
+            sig_v = sig
+            if cst_v.get("MID_BF16"):
+                # le pointeur mid_ws est bf16 dans ce canal (déclaration
+                # ASTSource explicite — sinon mismatch de type au compile).
+                sig_v = dict(sig, mid_ws_ptr="*bf16")
+            asm = _compile_asm(fn, sig_v, cst_v, nw, ns)
+            atoms = _re.findall(r"(?m)^\s*[a-z_.]*atomic[a-z0-9_]*", asm)
+            tag = name + (f"[MID_BF16={cst_v.get('MID_BF16')}]"
+                          if "MID_BF16" in cst_v else "")
+            print(f"asm {tag}: atomics={len(atoms)} "
+                  f"({sorted(set(atoms))[:6]}) mfma x{asm.count('v_mfma')}")
+            assert not atoms, (
+                f"{tag}: instructions atomic dans le codegen "
+                f"{sorted(set(atoms))}"
+                " — l'accumulateur atomique n'est pas éliminé")
+            if name in ("tree-pass1", "tree-pass2"):
+                assert asm.count("v_mfma") > 0, (
+                    f"{tag}: aucun v_mfma — les dots sont tombés en "
+                    "micro-dots")
+                assert asm.count("v_dot4") == 0, (
+                    f"{tag}: v_dot4 présent — mandat MFMA violé")
 
     # CONTRÔLE NÉGATIF : le kernel `atomic` doit contenir des atomics —
     # sinon la gate ci-dessus ne peut pas discorder (test-vide).

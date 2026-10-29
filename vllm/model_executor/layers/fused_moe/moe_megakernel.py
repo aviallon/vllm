@@ -254,6 +254,10 @@ MK_BN2 = 64
 # livré (le dot pleine-I de pass2 en a besoin pour son budget de registres).
 MK_TREE_BKO = 256
 MK_TREE_CI = 64
+# Stockage bf16 de l'intermédiaire post-silu (passe tuiles, 2026-10-29) :
+# moitié moins de trafic sur mid_ws, même contrat de quant per-token.
+# Mesuré par moemk_tilepass_bench (sweep MID_BF16) avant bascule du défaut.
+MK_TREE_MID_BF16 = False
 
 
 @triton.jit
@@ -887,7 +891,8 @@ def qwen3_moe_mk_tree_pass1_kernel(
     x_scale_ptr,      # [M] fp32 per-token
     w1_ptr,           # [E, 2I, K] int8, K contiguous
     w1_scale_ptr,     # [E, 2I] fp32 per-channel (contigu)
-    mid_ws_ptr,       # SORTIE [num_pairs, I] fp32 (post-silu, échelles composées)
+    mid_ws_ptr,       # SORTIE [num_pairs, I] post-silu (fp32, ou bf16 si
+                      # MID_BF16 — échelles composées, quant dans pass2)
     sorted_token_ids_ptr,  # [EM] int32 (grouped) ; ignoré en NAIVE
     expert_ids_ptr,        # [n_blocs] int32 ; ignoré en NAIVE
     num_valid,
@@ -901,6 +906,7 @@ def qwen3_moe_mk_tree_pass1_kernel(
     BKO: tl.constexpr,
     CI: tl.constexpr,
     NAIVE: tl.constexpr,
+    MID_BF16: tl.constexpr,
 ):
     """1 CTA = (bloc de paires, chunk intermédiaire) — gemm1 chunké puis
     silu fp32 ; sortie = la tranche [chunk·CI,(chunk+1)·CI) de la rangée de
@@ -961,13 +967,22 @@ def qwen3_moe_mk_tree_pass1_kernel(
     acc_u = acc_u * s1u * sx[:, None]
 
     mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
-    tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
-             mask=valid[:, None])
+    # MID_BF16 (passe tuiles 2026-10-29) : stockage bf16 de l'intermédiaire
+    # post-silu — moitié moins de trafic HBM sur mid_ws, et le point
+    # d'arrondi bf16 rejoint la classe du livré (cache1 bf16).  Le quant
+    # reste PER-TOKEN sur I entier dans pass2 (contrat livré verbatim) :
+    # pass2 recharge et convertit en fp32 avant amax/_round_i8.
+    if MID_BF16:
+        tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :],
+                 mid.to(tl.bfloat16), mask=valid[:, None])
+    else:
+        tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
+                 mask=valid[:, None])
 
 
 @triton.jit
 def qwen3_moe_mk_tree_pass2_kernel(
-    mid_ws_ptr,       # [num_pairs, I] fp32 (post-silu)
+    mid_ws_ptr,       # [num_pairs, I] post-silu (fp32, ou bf16 si MID_BF16)
     w2_ptr,           # [E, K, I] int8, I contiguous
     w2_scale_ptr,     # [E, K] fp32 per-channel (contigu)
     topk_w_ptr,       # [M, top_k] fp32 (poids routés — épilogue)
@@ -984,6 +999,7 @@ def qwen3_moe_mk_tree_pass2_kernel(
     BN2: tl.constexpr,
     LOCAL_TILES: tl.constexpr,
     NAIVE: tl.constexpr,
+    MID_BF16: tl.constexpr,
 ):
     """1 CTA = 1 bloc de paires ; `LOCAL_TILES` tuiles de sortie traitées par
     CTA (régime mesuré : LOCAL_TILES=1 + grille (blocs, tuiles) gagne aux
@@ -1022,6 +1038,10 @@ def qwen3_moe_mk_tree_pass2_kernel(
     offs_i_full = tl.arange(0, I)
     mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
                   mask=valid[:, None], other=0.0)
+    if MID_BF16:
+        # le stockage est bf16 (arrondi post-silu, classe du cache1 livré) ;
+        # l'arithmétique du quant reste fp32 (comme silu_q livré).
+        mid = mid.to(tl.float32)
     amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
     s_row = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
@@ -1660,12 +1680,15 @@ def fused_moe_megakernel(
             "tree: sortie bf16 contiguë requise (contrat moe_sum livré)")
         assert I & (I - 1) == 0, (
             f"tree: I={I} doit être une puissance de 2 (tuile pleine-I)")
-        # mid_ws = intermédiaire post-silu fp32 [M·topk, I] (L2-hot, lu par
-        # les tuiles K) ; ws = rangées de paires bf16 (= le cache3 livré,
-        # mais PLEINEMENT écrit par pass2 — aucun memset, invariant : le tri
-        # grouped couvre chaque paire exactement une fois).
+        # mid_ws = intermédiaire post-silu [M·topk, I] (L2-hot, lu par
+        # les tuiles K) — fp32, ou bf16 si MK_TREE_MID_BF16 (même contrat
+        # de quant per-token, arrondi bf16 post-silu) ; ws = rangées de
+        # paires bf16 (= le cache3 livré, mais PLEINEMENT écrit par pass2 —
+        # aucun memset, invariant : le tri grouped couvre chaque paire
+        # exactement une fois).
         mid_ws = torch.empty((num_pairs, I), device=output.device,
-                             dtype=torch.float32)
+                             dtype=(torch.bfloat16 if MK_TREE_MID_BF16
+                                    else torch.float32))
         ws = torch.empty((num_pairs, K), device=output.device,
                          dtype=torch.bfloat16)
         s1 = sorted_token_ids if sorted_token_ids is not None else topk_ids
@@ -1674,7 +1697,7 @@ def fused_moe_megakernel(
             x, x_scale, w1, w1_scale, mid_ws, s1, e1, num_valid,
             x.stride(0), w1.stride(0), w1.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BKO=MK_TREE_BKO, CI=CI,
-            NAIVE=naive,
+            NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
             num_warps=2, num_stages=1,
         )
         n_tiles = triton.cdiv(K, 64)
@@ -1697,7 +1720,7 @@ def fused_moe_megakernel(
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),
             top_k=top_k, K=K, I=I, BM=BM, BN2=64,
-            LOCAL_TILES=local_tiles, NAIVE=naive,
+            LOCAL_TILES=local_tiles, NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
             num_warps=2, num_stages=1,
         )
         if moe_megakernel_int8_out_enabled():
