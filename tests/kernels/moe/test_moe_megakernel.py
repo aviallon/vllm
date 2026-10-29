@@ -1479,7 +1479,8 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     `mid_bf16` = canal MID_BF16 (stockage bf16 de l'intermédiaire) ;
     `pass2_cfg` (None = tree_pass2_config du launcher) force un régime de
     lancement ; `local_tiles` force le groupement de tuiles — la couverture
-    de TOUTES les tuiles est jugée par le poison NaN.
+    (« au moins une fois » : tout trou de couverture = NaN) est jugée par
+    le poison NaN.
     """
     from vllm.model_executor.layers.quantization.utils.int8_utils import (
         per_token_quant_int8,
@@ -1969,7 +1970,8 @@ def test_tree_tile_coverage_poison_big_m(M, bn2, local_tiles):
 
 
 def test_tree_bn2_bit_invariance():
-    """FAIT MESURÉ (2026-10-30, probe3 annexe) : BN2 ne change AUCUN bit —
+    """FAIT MESURÉ (2026-10-30, vérification inline puis ce test) : BN2
+    ne change AUCUN bit —
     le dot contracte I dans l'ordre fixe des MFMA quel que soit le tuilage
     N.  Ce test DOCUMENTE le fait (il rend explicite le raisonnement du
     canari de consommation : puisque les bits sont invariants, c'est la
@@ -1993,7 +1995,7 @@ def test_tree_bn2_bit_invariance():
 
 
 @pytest.mark.parametrize("M,expect_bn2,expect_ns", [
-    (32, "BN2=64", "ns=2"), (128, "BN2=128", "ns=3")])
+    (32, "BN2=64", "ns=1"), (128, "BN2=128", "ns=3")])
 def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
                                        monkeypatch):
     """M1 (revue deepseek) — preuve de CONSOMMATION du régime : la ligne
@@ -2013,6 +2015,10 @@ def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
         return real(M_, naive_)
 
     monkeypatch.setattr(mkmod, "tree_pass2_config", spy)
+    # _log_once est dédupliqué PAR PROCESSUS : un test antérieur qui aurait
+    # déjà lancé le même régime rendrait la ligne muette ici — on isole le
+    # cache de dédup (le canari doit pouvoir observer la ligne).
+    monkeypatch.setattr(mkmod, "_LOGGED", set())
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
@@ -2239,8 +2245,11 @@ def test_tree_poisoned_workspaces_no_gaps(monkeypatch):
     lirait du garbage, souvent du zéro recyclé par l'allocateur, et le
     contrat à 3 % passerait en silence.  On empoisonne les workspaces avec
     des NaN AU MOMENT DE L'ALLOCATION : si la sortie est bit-identique à
-    une run propre et sans NaN, alors chaque élément consommé a bien été
-    écrit (seule preuve POSITIVE de l'invariant, pas une argumentation)."""
+    une run propre et sans NaN, alors chaque élément CONSOMMÉ a bien été
+    écrit (couverture « au moins une fois » — un trou = NaN ; les stores
+    d'une tuile sont purs et identiques, un éventuel recouvrement est
+    donc sans effet).  Seule preuve POSITIVE de l'invariant, pas une
+    argumentation."""
     _tree_set_gates()
     import vllm.model_executor.layers.fused_moe.moe_megakernel as mkmod
 
