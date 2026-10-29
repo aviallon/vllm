@@ -275,12 +275,20 @@ def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
     launcher/tests — l'égalité bit-exacte harnais↔launcher est prouvée par
     `test_tree_pipeline_matches_launcher` (garde anti-harnais-faux).
 
-    Régimes (un seul changement par régime, mono-variable) :
+    Régimes (un seul bloc de config par régime ; le régime M≥40 est un
+    TRIPLET (BN2, nw, ns) — le point isolé (64,4,3) mesure ~5 µs de part
+    BN2, le reste est ns 2→3 ; probe3 P1) :
       * naive (M·topk·4 ≤ E)      : 64, 1, 2, 1  — INCHANGÉ (c1/c8) ;
       * grouped M < BIGM (c32)    : 64, None, 2, 1 — INCHANGÉ (mesuré
         optimal : BN2=128 perd ~10 µs à M=32) ;
       * grouped M ≥ BIGM (c128)   : 128, None, 4, 3 — NOUVEAU (−41 µs
-        @M=128, −18 @M=48 ; ns=3 passe le budget LDS de pass2).
+        @M=128, −18 @M=48 ; « ns=3 compile pour pass2 et échoue en LDS
+        pour pass1 » = observation mesurée, pas un mécanisme vérifié).
+    ⚠ Le champ LOCAL_TILES n'a que deux valeurs : 1 (grille 2-D naive) et
+    None (= n_tiles entier, grille 1-D) — et il est CONSOMMÉ par les DEUX
+    consommateurs (launcher + harnais de tests le résolvent en n_tiles) :
+    un futur renvoi explicite (ex. 8) serait donc réellement appliqué
+    (revue deepseek m6 — le champ n'est pas mort).
     """
     if naive:
         return 64, 1, 2, 1
@@ -1735,12 +1743,25 @@ def fused_moe_megakernel(
         # 2026-10-29, PLAFONDS-TUILES §4) : naïf = grille 2-D LT=1 ;
         # groupé = grille 1-D (blocs) LT=n_tiles (le quant est fait une
         # fois par bloc — mesuré optimal à TOUS les M, sweep B : le levier
-        # « LT=8 à M=128 » est réfuté, cf. PLAFONDS-TUILES §1).
+        # « LT=8 à M=128 » est réfuté, cf. PLAFONDS-TUILES §1).  Le champ
+        # local_tiles est CONSOMMÉ (None = n_tiles entier) — pas un
+        # paramètre mort (revue deepseek m6).
         if naive:
             grid2 = (n_blocks, n_tiles)
         else:
-            local_tiles = n_tiles
-            grid2 = (n_blocks,)
+            local_tiles = n_tiles if local_tiles is None else local_tiles
+            grid2 = (n_blocks,) if local_tiles == n_tiles else (
+                n_blocks, triton.cdiv(n_tiles, local_tiles))
+        # PREUVE DE BRANCHEMENT du régime (revue deepseek M1) : une ligne
+        # par régime exécuté, avec la config RÉELLEMENT lancée — le wall
+        # la lit ; un canari de test vérifie qu'elle porte la config
+        # consommée (test_tree_launch_regime_log_canary).
+        _log_once(
+            f"mk-tree-regime-{n_tiles_cfg}-{local_tiles}-{nw2}-{ns2}",
+            "[moe-megakernel] tree regime M=%d naive=%s BN2=%d "
+            "LOCAL_TILES=%s nw=%d ns=%d",
+            M, naive, n_tiles_cfg, local_tiles, nw2, ns2,
+        )
         qwen3_moe_mk_tree_pass2_kernel[grid2](
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),

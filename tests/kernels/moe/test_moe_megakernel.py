@@ -1512,10 +1512,14 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     if naive:
         assert local_tiles is None, (
             "local_tiles forcé non applicable en naive (grille 2-D, LT=1)")
+        assert _lt_cfg == 1, f"LOCAL_TILES naive inattendu: {_lt_cfg}"
         grid2, lt = (n_blocks, n_tiles), 1
     elif local_tiles is None:
-        lt = n_tiles
-        grid2 = (n_blocks,)
+        # le champ LOCAL_TILES de la config est CONSOMMÉ (revue deepseek
+        # m6) — None = n_tiles entier ; un renvoi explicite serait appliqué.
+        lt = n_tiles if _lt_cfg is None else _lt_cfg
+        grid2 = ((n_blocks,) if lt == n_tiles
+                 else (n_blocks, triton.cdiv(n_tiles, lt)))
     else:
         # régime forcé (couverture de tuiles) : groupes de `local_tiles`
         assert n_tiles % local_tiles == 0, (
@@ -1964,16 +1968,91 @@ def test_tree_tile_coverage_poison_big_m(M, bn2, local_tiles):
         "workspaces empoisonnés — garbage non écrit ou tuile recouverte")
 
 
-@pytest.mark.parametrize("mut_name", [
-    "pass1_drop_half_cols", "pass2_drop_half_i", "pass2_scale_x2",
-    "reduce_drop_last_slot"])
-def test_tree_mutations_falsifiable(mut_name):
+def test_tree_bn2_bit_invariance():
+    """FAIT MESURÉ (2026-10-30, probe3 annexe) : BN2 ne change AUCUN bit —
+    le dot contracte I dans l'ordre fixe des MFMA quel que soit le tuilage
+    N.  Ce test DOCUMENTE le fait (il rend explicite le raisonnement du
+    canari de consommation : puisque les bits sont invariants, c'est la
+    ligne de log qui prouve le régime, pas la comparaison de sorties) et
+    attrape toute évolution future du kernel qui rendrait BN2 visible —
+    auquel cas le launcher-match redeviendrait lui aussi un vrai canari.
+    Comparaison : pipeline BN2=64/w2/s1 vs BN2=128/w4/s3 à M=128."""
+    _tree_set_gates()
+    M, top_k, E, I, K = 128, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+    out64 = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                           pass2_cfg=(64, None, 2, 1))
+    out128 = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                            pass2_cfg=(128, None, 4, 3))
+    assert torch.equal(out64, out128), (
+        "BN2 modifie les bits — l'invariance mesurée du 2026-10-30 ne tient "
+        "plus : re-vérifier le raisonnement du canari de consommation et le "
+        "contrat launcher-match")
+
+
+@pytest.mark.parametrize("M,expect_bn2,expect_ns", [
+    (32, "BN2=64", "ns=2"), (128, "BN2=128", "ns=3")])
+def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
+                                       monkeypatch):
+    """M1 (revue deepseek) — preuve de CONSOMMATION du régime : la ligne
+    de log `tree regime` doit porter la config RÉELLEMENT lancée.  Deux
+    canari distincts : (1) le log (consommation runtime — le wall le lit) ;
+    (2) l'APPEL de tree_pass2_config par le launcher (si quelqu'un
+    re-hardcode la config dans le launcher, l'espion ne voit rien et le
+    test casse — garde anti-réversion silencieuse)."""
+    import logging
+
+    _tree_set_gates()
+    calls: list[tuple[int, bool]] = []
+    real = mkmod.tree_pass2_config
+
+    def spy(M_, naive_):
+        calls.append((M_, naive_))
+        return real(M_, naive_)
+
+    monkeypatch.setattr(mkmod, "tree_pass2_config", spy)
+    top_k, E, I, K = 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    with caplog.at_level(logging.INFO, logger=(
+            "vllm.model_executor.layers.fused_moe.moe_megakernel")):
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
+    torch.cuda.synchronize()
+    assert (M, naive) in calls, (
+        "le launcher n'a JAMAIS appelé tree_pass2_config — la config est "
+        "re-hardcodée (ou la fonction contournée) : le régime du wall n'est "
+        "plus prouvé")
+    regime_lines = [r.getMessage()
+                    for r in caplog.records if "tree regime" in r.getMessage()]
+    assert regime_lines, (
+        "aucune ligne `tree regime` émise — la preuve de branchement du "
+        "régime est muette")
+    assert any(expect_bn2 in ln for ln in regime_lines), (
+        f"la ligne de régime ne porte pas {expect_bn2}: {regime_lines}")
+    assert any(expect_ns in ln for ln in regime_lines), (
+        f"la ligne de régime ne porte pas {expect_ns}: {regime_lines}")
+
+
+@pytest.mark.parametrize("mut_name,M", [
+    ("pass1_drop_half_cols", 32), ("pass2_drop_half_i", 32),
+    ("pass2_scale_x2", 32), ("reduce_drop_last_slot", 32),
+    # le régime livré à grand M (BN2=128/nw=4/ns=3) doit prouver lui aussi
+    # que chaque passe/entrée est CONSOMMÉE (revue deepseek m9).
+    ("pass1_drop_half_cols", 128), ("pass2_drop_half_i", 128),
+    ("pass2_scale_x2", 128), ("reduce_drop_last_slot", 128)])
+def test_tree_mutations_falsifiable(mut_name, M):
     """Mutations isolées : chaque passe/entrée doit être CONSOMMÉE.  Le
     mutant est une copie du kernel sain avec UNE mutation ; le noyau sain du
     MÊME harnais donne la référence.  Si le mutant ne diverge pas, la passe
-    visée est décorative et le test l'annonce (silent-pass fermé)."""
+    visée est décorative et le test l'annonce (silent-pass fermé).  M=32 =
+    régime grouped historique, M=128 = régime tuiles livré."""
     _tree_set_gates()
-    M, top_k, E, I, K = 32, 8, 256, 256, 2048
+    top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
     ref = reference_chain(x, w1, w2, normalize_w_scale(w1s),
@@ -2043,7 +2122,10 @@ def test_tree_isa_no_atomics():
         # if/else du store pass1 / load pass2 sont compilées séparément).
         variants = [cst]
         if name.startswith(("tree-pass1", "tree-pass2")):
-            variants = [dict(cst, MID_BF16=v) for v in (False, True)]
+            # MID_BF16 ET NAIVE : les branches if/else + le régime livré
+            # (grouped, NAIVE=False) passent la gate codegen (revue m8).
+            variants = [dict(cst, MID_BF16=v, NAIVE=n)
+                        for v in (False, True) for n in (True, False)]
         for cst_v in variants:
             sig_v = sig
             if cst_v.get("MID_BF16"):
@@ -2052,7 +2134,8 @@ def test_tree_isa_no_atomics():
                 sig_v = dict(sig, mid_ws_ptr="*bf16")
             asm = _compile_asm(fn, sig_v, cst_v, nw, ns)
             atoms = _re.findall(r"(?m)^\s*[a-z_.]*atomic[a-z0-9_]*", asm)
-            tag = name + (f"[MID_BF16={cst_v.get('MID_BF16')}]"
+            tag = name + (f"[MID_BF16={cst_v.get('MID_BF16')},"
+                          f"NAIVE={cst_v.get('NAIVE')}]"
                           if "MID_BF16" in cst_v else "")
             print(f"asm {tag}: atomics={len(atoms)} "
                   f"({sorted(set(atoms))[:6]}) mfma x{asm.count('v_mfma')}")
