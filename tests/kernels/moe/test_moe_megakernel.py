@@ -106,7 +106,7 @@ def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a - b).abs().max() / denom)
 
 
-@pytest.mark.parametrize("strategy", ["pair", "atomic"])
+@pytest.mark.parametrize("strategy", ["pair", "atomic", "tree"])
 @pytest.mark.parametrize("M,top_k,E,I,K", [
     (1, 8, 256, 256, 2048),    # c1 réel TP=2
     (4, 8, 64, 64, 512),       # synthétique couverture
@@ -153,7 +153,7 @@ def test_contract_vs_shipped(strategy, M, top_k, E, I, K):
     assert ref.abs().max() > 0
 
 
-@pytest.mark.parametrize("strategy", ["pair", "atomic"])
+@pytest.mark.parametrize("strategy", ["pair", "atomic", "tree"])
 def test_determinism_run_to_run(strategy):
     """L'atomique fp32 est non-associative : deux runs ne doivent pas
     diverger au-delà du dernier ULP bf16 (gate de déterminisme)."""
@@ -254,7 +254,7 @@ def test_grouped_mode():
     assert _rel_err(out, ref) < 0.03
 
 
-@pytest.mark.parametrize("strategy", ["pair", "atomic"])
+@pytest.mark.parametrize("strategy", ["pair", "atomic", "tree"])
 @pytest.mark.parametrize("M", [32, 128])
 def test_grouped_contract_real_shapes(M, strategy):
     """Extension c32/c128 (mandat 2026-10-29) : régime grouped aux shapes
@@ -1404,3 +1404,417 @@ def test_asm_mfma_no_vdot4():
     assert n_dot4_bad > 0, (
         "mutation: BM=1/CI=8 n'émet plus de v_dot4 — le test ASM perd sa "
         "capacité à discorder (ou le codegen a changé : re-évaluer le mandat)")
+
+
+# ===========================================================================
+# stratégie `tree` (v3 — ANTIATOM-DESIGN.md) : zéro atomic.
+# Contrat aux shapes RÉELLES avec les échelles au LAYOUT RÉEL du checkpoint
+# quark [E, N, 1] 3-D (leçon de la gate muette n°2, commit 06d240d67e) ;
+# déterminisme bit-exact ; mutations FALSIFIABLES isolées (chaque passe
+# prouvée consommée) ; gate codegen « aucun atomic dans le codegen tree »
+# avec contrôle NÉGATIF (le kernel `atomic` doit EN contenir — sinon le test
+# ne peut pas discorder).
+# ===========================================================================
+from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+    MK_TREE_BKO,
+    MK_TREE_CI,
+    moe_megakernel_call_stats,
+    moe_megakernel_record_call,
+    moe_megakernel_reset_call_stats,
+    moe_megakernel_reduce_kernel,
+    normalize_w_scale,
+    qwen3_moe_mk_tree_pass1_kernel,
+    qwen3_moe_mk_tree_pass2_kernel,
+)
+
+
+def _tree_set_gates(strategy="tree", max_tokens="128"):
+    # auto-portant : ÉCRASE les deux canaux (os.environ d'abord — il gagne)
+    # y compris les gates de prologue qui fuient depuis les tests INC 1-3
+    # (ROUTING/NORM/AR laissées à 1 par un test précédent = le site entre en
+    # mode routing et demande router_w — pollution d'ordre de suite).
+    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = strategy
+    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = max_tokens
+    for name in ("VLLM_MOE_MEGAKERNEL_ROUTING", "VLLM_MOE_MEGAKERNEL_NORM",
+                 "VLLM_MOE_MEGAKERNEL_AR"):
+        os.environ[name] = "0"
+    from vllm import envs
+    envs.VLLM_MOE_MEGAKERNEL = True
+    envs.VLLM_MOE_MEGAKERNEL_STRATEGY = strategy
+    envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = int(max_tokens)
+    envs.VLLM_MOE_MEGAKERNEL_ROUTING = False
+    envs.VLLM_MOE_MEGAKERNEL_NORM = False
+    envs.VLLM_MOE_MEGAKERNEL_AR = False
+
+
+def _tree_problem(M, top_k, E, I, K, scale_3d=True):
+    """Échelles poids au layout RÉEL quark [E, N, 1] (scale_3d=True) — la
+    forme que le loader produit réellement ; sinon [E, N] 2-D (contrôle)."""
+    x, w1, w2, w1s, w2s, ids, wts = make_problem(M, top_k, E, I, K)
+    if scale_3d:
+        w1s = w1s.unsqueeze(-1).contiguous()
+        w2s = w2s.unsqueeze(-1).contiguous()
+    return x, w1, w2, w1s, w2s, ids, wts
+
+
+def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
+                   expert_ids, *, pass2_fn=None, reduce_fn=None):
+    """Les 3 passes `tree` avec kernels remplaçables (harnais de mutation).
+    Reproduit EXACTEMENT le launcher — `test_tree_pipeline_matches_launcher`
+    le prouve bit-exact ; sans cette preuve les mutants ne diraient rien."""
+    from vllm.model_executor.layers.quantization.utils.int8_utils import (
+        per_token_quant_int8,
+    )
+    M, K = x.shape
+    top_k = ids.size(1)
+    I = w2.size(2)
+    CI, BM, BKO = min(MK_TREE_CI, I), MK_BM, MK_TREE_BKO
+    n_chunks = triton.cdiv(I, CI)
+    num_pairs = M * top_k
+    w1s2 = normalize_w_scale(w1s)
+    w2s2 = normalize_w_scale(w2s)
+    xq, xs = per_token_quant_int8(x)
+    s1 = sorted_ids if sorted_ids is not None else ids
+    e1 = expert_ids if expert_ids is not None else ids
+    n_blocks = num_pairs if naive else triton.cdiv(sorted_ids.size(0), 16)
+    mid_ws = torch.empty((num_pairs, I), device=x.device,
+                         dtype=torch.float32)
+    ws = torch.empty((num_pairs, K), device=x.device, dtype=torch.bfloat16)
+    qwen3_moe_mk_tree_pass1_kernel[(n_blocks, n_chunks)](
+        xq, xs, w1, w1s2, mid_ws, s1, e1, num_pairs,
+        xq.stride(0), w1.stride(0), w1.stride(1),
+        top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
+        N_CHUNKS=n_chunks, NAIVE=naive, num_warps=2, num_stages=1)
+    p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
+    p2[(n_blocks, triton.cdiv(K, 64))](
+        mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
+        w2.stride(0), w2.stride(1),
+        top_k=top_k, K=K, I=I, BM=BM, BN2=64, NAIVE=naive,
+        num_warps=2, num_stages=1)
+    rd = reduce_fn or moe_megakernel_reduce_kernel
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    rd[(M, triton.cdiv(K, 64))](ws, out, top_k=top_k, K=K, BLOCK=64,
+                                OUT_FP32=False, num_warps=4)
+    torch.cuda.synchronize()
+    return out
+
+
+# --- mutants isolés (copies du kernel sain + UNE mutation nommée) ----------
+@triton.jit
+def _mut_pass2_drop_half_i(
+    mid_ws_ptr, w2_ptr, w2_scale_ptr, topk_w_ptr, ws_ptr,
+    sorted_token_ids_ptr, expert_ids_ptr, num_valid,
+    stride_w2e, stride_w2k,
+    top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
+    BM: tl.constexpr, BN2: tl.constexpr, NAIVE: tl.constexpr,
+):
+    """MUTANT : la moitié haute de l'intermédiaire (I/2:I) est annulée avant
+    le quant — si la sortie ne bouge pas, le dot ne consomme pas tout I."""
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs_pair = pid * BM + tl.arange(0, BM)
+    if NAIVE:
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+    else:
+        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+    valid = pairs < num_valid
+    pairs_i64 = pairs.to(tl.int64)
+    tokens = pairs // top_k
+    wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
+    e = tl.load(expert_ids_ptr + pid)
+    e64 = e.to(tl.int64)
+    offs_i_full = tl.arange(0, I)
+    mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
+                  mask=valid[:, None], other=0.0)
+    mid = tl.where(offs_i_full[None, :] >= I // 2, 0.0, mid)   # MUTATION
+    amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
+    s_row = amax / 127.0
+    q = _round_i8(mid * (127.0 / amax)[:, None])
+    offs_o = tile * BN2 + tl.arange(0, BN2)
+    m_o = offs_o < K
+    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
+    w2t = tl.load(w2_ptr + e64 * stride_w2e
+                  + offs_i_full[:, None]
+                  + offs_o[None, :] * stride_w2k)
+    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+    contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
+    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
+             mask=valid[:, None] & m_o[None, :])
+
+
+@triton.jit
+def _mut_pass2_scale_squared(
+    mid_ws_ptr, w2_ptr, w2_scale_ptr, topk_w_ptr, ws_ptr,
+    sorted_token_ids_ptr, expert_ids_ptr, num_valid,
+    stride_w2e, stride_w2k,
+    top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
+    BM: tl.constexpr, BN2: tl.constexpr, NAIVE: tl.constexpr,
+):
+    """MUTANT : l'échelle per-token est appliquée DEUX fois (s_row²) — si la
+    sortie ne bouge pas, l'échelle de quant n'est pas consommée."""
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs_pair = pid * BM + tl.arange(0, BM)
+    if NAIVE:
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+    else:
+        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+    valid = pairs < num_valid
+    pairs_i64 = pairs.to(tl.int64)
+    tokens = pairs // top_k
+    wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
+    e = tl.load(expert_ids_ptr + pid)
+    e64 = e.to(tl.int64)
+    offs_i_full = tl.arange(0, I)
+    mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
+                  mask=valid[:, None], other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
+    s_row = amax / 127.0
+    q = _round_i8(mid * (127.0 / amax)[:, None])
+    offs_o = tile * BN2 + tl.arange(0, BN2)
+    m_o = offs_o < K
+    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
+    w2t = tl.load(w2_ptr + e64 * stride_w2e
+                  + offs_i_full[:, None]
+                  + offs_o[None, :] * stride_w2k)
+    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+    contrib = acc2 * (s_row * s_row * wt)[:, None] * s2[None, :]  # MUTATION
+    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
+             mask=valid[:, None] & m_o[None, :])
+
+
+@triton.jit
+def _mut_reduce_drop_last_slot(
+    ws_ptr, out_ptr,
+    top_k: tl.constexpr, K: tl.constexpr,
+    BLOCK: tl.constexpr, OUT_FP32: tl.constexpr,
+):
+    """MUTANT : la dernière paire du topk n'est pas sommée — si la sortie ne
+    bouge pas, la boucle topk du reduce n'est pas consommée."""
+    t = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    m = offs < K
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(0, top_k - 1):
+        p = (t * top_k + s) * K
+        v = tl.load(ws_ptr + p + offs, mask=m, other=0.0)
+        acc += v
+    if OUT_FP32:
+        tl.store(out_ptr + t * K + offs, acc, mask=m)
+    else:
+        tl.store(out_ptr + t * K + offs, acc.to(tl.bfloat16), mask=m)
+
+
+def _tree_grouped_ids(M, top_k, E, I, K):
+    x, w1, w2, w1s, w2s, ids, wts = _tree_problem(M, top_k, E, I, K, True)
+    naive = M * top_k * 4 <= E
+    sorted_ids = expert_ids = None
+    if not naive:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            _prepare_expert_assignment,
+        )
+        sorted_ids, expert_ids, _ = _prepare_expert_assignment(
+            ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+    return x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids, expert_ids
+
+
+def test_tree_pipeline_matches_launcher():
+    """Le harnais de mutation reproduit le launcher au BIT près — sinon les
+    mutants ne prouveraient rien (garde anti-harnais-faux)."""
+    _tree_set_gates()
+    M, top_k, E, I, K = 8, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    out_launch = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    fused_moe_megakernel(
+        out_launch, x, w1, w2, wts, ids, None, w1s, w2s,
+        naive=naive, sorted_token_ids=sd, expert_ids=ed)
+    torch.cuda.synchronize()
+    out_pipe = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed)
+    assert torch.equal(out_launch, out_pipe), (
+        "le harnais de mutation diverge du launcher — les mutants sont hors "
+        "jeu tant que ce n'est pas égal au bit près")
+
+
+@pytest.mark.parametrize("M", [8, 32, 128])
+def test_tree_contract_real_shapes_and_3d_scales(M):
+    """Contrat `tree` aux shapes RÉELS TP=2 (E=256, I=256, K=2048, topk=8)
+    avec les échelles poids au LAYOUT RÉEL du checkpoint quark **[E, N, 1]
+    3-D** — la forme qui a rendu le bras muet en 2026-10-29.  Deux
+    assertions : (1) contrat < 3 % vs la référence sémantique livrée ;
+    (2) sortie BIT-IDENTIQUE 2-D vs 3-D (normalize_w_scale = vue, pas
+    valeurs).  M=8 = régime naive, M=32/128 = grouped."""
+    _tree_set_gates()
+    top_k, E, I, K = 8, 256, 256, 2048
+    x, w1, w2, w1s3, w2s3, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    if M == 8:
+        assert naive
+    else:
+        assert not naive
+    ref = reference_chain(x, w1, w2, normalize_w_scale(w1s3),
+                          normalize_w_scale(w2s3), ids, wts, naive)
+
+    out3 = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    fused_moe_megakernel(
+        out3, x, w1, w2, wts, ids, None, w1s3, w2s3,
+        naive=naive, sorted_token_ids=sd, expert_ids=ed)
+    torch.cuda.synchronize()
+    err = _rel_err(out3, ref)
+    assert err < 0.03, f"M={M} tree rel_err={err:.4f}"
+    assert ref.abs().max() > 0
+
+    out2 = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    fused_moe_megakernel(
+        out2, x, w1, w2, wts, ids, None,
+        normalize_w_scale(w1s3), normalize_w_scale(w2s3),
+        naive=naive, sorted_token_ids=sd, expert_ids=ed)
+    torch.cuda.synchronize()
+    assert torch.equal(out2, out3), (
+        f"M={M} : 2-D vs 3-D non bit-identique — normalize_w_scale a "
+        "changé des valeurs (ou le kernel indexe faux)")
+
+
+@pytest.mark.parametrize("M", [8, 32])
+def test_tree_determinism_bit_exact(M):
+    """`tree` a un ordre de sommation FIXE : deux runs sont bit-identiques
+    (strict — pas de tolérance ULP).  C'est un contrat NOMMÉ de `tree` que
+    `atomic` ne peut pas tenir (somme flottante non-associative par
+    atomiques)."""
+    _tree_set_gates()
+    top_k, E, I, K = 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    outs = []
+    for _ in range(2):
+        out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
+        torch.cuda.synchronize()
+        outs.append(out)
+    assert torch.equal(outs[0], outs[1]), (
+        f"M={M} : tree non déterministe bit-à-bit — l'ordre de réduction "
+        "n'est pas fixe (ou il reste un atomic quelque part)")
+
+
+@pytest.mark.parametrize("mut_name", [
+    "pass2_drop_half_i", "pass2_scale_squared", "reduce_drop_last_slot"])
+def test_tree_mutations_falsifiable(mut_name):
+    """Mutations isolées : chaque passe/entrée doit être CONSOMMÉE.  Le
+    mutant est une copie du kernel sain avec UNE mutation ; le noyau sain du
+    MÊME harnais donne la référence.  Si le mutant ne diverge pas, la passe
+    visée est décorative et le test l'annonce (silent-pass fermé)."""
+    _tree_set_gates()
+    M, top_k, E, I, K = 32, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    ref = reference_chain(x, w1, w2, normalize_w_scale(w1s),
+                          normalize_w_scale(w2s), ids, wts, naive)
+
+    healthy = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed)
+    err_h = _rel_err(healthy, ref)
+    assert err_h < 0.03, f"noyau sain hors contrat: rel_err={err_h:.4f}"
+
+    mut_fns = {
+        "pass2_drop_half_i": dict(pass2_fn=_mut_pass2_drop_half_i),
+        "pass2_scale_squared": dict(pass2_fn=_mut_pass2_scale_squared),
+        "reduce_drop_last_slot": dict(reduce_fn=_mut_reduce_drop_last_slot),
+    }
+    mutant = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                            **mut_fns[mut_name])
+    drift = _rel_err(mutant, healthy)
+    assert drift > 0.02, (
+        f"mutation {mut_name} INVISIBLE (drift={drift:.5f}) — la passe/entrée "
+        "visée n'est pas consommée : le test est muet, la gate est décorative")
+
+
+def test_tree_isa_no_atomics():
+    """Gate CODEGEN (F10, M32-M128-EXTENSION §8.4 : « le lowering exact de
+    tl.atomic_add n'était pas vérifié ») : les 3 kernels `tree` n'émettent
+    AUCUNE instruction atomic (aucun addressing mode) — l'accumulateur
+    atomique est structurellement IMPOSSIBLE dans `tree`.  Contrôle NÉGATIF
+    : le kernel `atomic` en émet (sinon ce test ne peut pas discorder)."""
+    import re as _re
+
+    from vllm.model_executor.layers.fused_moe import moe_megakernel as mk
+
+    cases = [
+        ("tree-pass1", mk.qwen3_moe_mk_tree_pass1_kernel, {
+            "x_ptr": "*i8", "x_scale_ptr": "*fp32", "w1_ptr": "*i8",
+            "w1_scale_ptr": "*fp32", "mid_ws_ptr": "*fp32",
+            "sorted_token_ids_ptr": "*i32", "expert_ids_ptr": "*i32",
+            "num_valid": "i32", "stride_xm": "i32", "stride_w1e": "i32",
+            "stride_w1n": "i32",
+        }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM, "BKO": MK_TREE_BKO,
+            "CI": MK_TREE_CI, "N_CHUNKS": 4, "NAIVE": True}, 2, 1),
+        ("tree-pass2", mk.qwen3_moe_mk_tree_pass2_kernel, {
+            "mid_ws_ptr": "*fp32", "w2_ptr": "*i8",
+            "w2_scale_ptr": "*fp32", "topk_w_ptr": "*fp32",
+            "ws_ptr": "*bf16", "sorted_token_ids_ptr": "*i32",
+            "expert_ids_ptr": "*i32", "num_valid": "i32",
+            "stride_w2e": "i32", "stride_w2k": "i32",
+        }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM,
+            "BN2": 64, "NAIVE": True}, 2, 1),
+        ("tree-reduce", mk.moe_megakernel_reduce_kernel, {
+            "ws_ptr": "*bf16", "out_ptr": "*bf16",
+        }, {"top_k": 8, "K": 2048, "BLOCK": 64, "OUT_FP32": False},
+            4, 1),
+    ]
+    for name, fn, sig, cst, nw, ns in cases:
+        asm = _compile_asm(fn, sig, cst, nw, ns)
+        atoms = _re.findall(r"\b[a-z_]*atomic[a-z0-9_]*", asm)
+        print(f"asm {name}: atomics={len(atoms)} "
+              f"({sorted(set(atoms))[:6]}) mfma x{asm.count('v_mfma')}")
+        assert not atoms, (
+            f"{name}: instructions atomic dans le codegen {sorted(set(atoms))}"
+            " — l'accumulateur atomique n'est pas éliminé")
+        if name in ("tree-pass1", "tree-pass2"):
+            assert asm.count("v_mfma") > 0, (
+                f"{name}: aucun v_mfma — les dots sont tombés en micro-dots")
+            assert asm.count("v_dot4") == 0, (
+                f"{name}: v_dot4 présent — mandat MFMA violé")
+
+    # CONTRÔLE NÉGATIF : le kernel `atomic` doit contenir des atomics —
+    # sinon la gate ci-dessus ne peut pas discorder (test-vide).
+    sig = dict(_MK_SIG)
+    sig["x_ptr"] = "*i8"
+    asm_a = _compile_asm(
+        mk.qwen3_moe_megakernel, sig,
+        {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM, "BKO": 128,
+         "CI": MK_CI, "BN2": MK_BN2, "NAIVE": True, "ROUTING": False,
+         "RENORM": True, "E": 256, "NORM": False, "AR": False,
+         "FLAG_ELEMS_C": 64}, 4, 2)
+    atoms_a = _re.findall(r"\b[a-z_]*atomic[a-z0-9_]*", asm_a)
+    print(f"asm atomic-controle: atomics x{len(atoms_a)} "
+          f"({sorted(set(atoms_a))[:6]})")
+    assert atoms_a, (
+        "contrôle négatif: le kernel `atomic` n'émet AUCUN atomic — le "
+        "codegen a changé (ou le test ne voit pas le bon kernel) : la gate "
+        "« no atomics » est alors vacuante")
+
+
+def test_call_counter_records_distribution(caplog):
+    """Le compteur d'appels (travail nommé F1/W1) journalise la DISTRIBUTION
+    (issue, M, régime) et émet sa ligne de résumé dès le 1er appel — le
+    falsifiant qui remplace `warning_once` (muet après le 1er message)."""
+    import logging
+
+    moe_megakernel_reset_call_stats()
+    before = moe_megakernel_call_stats()
+    with caplog.at_level(logging.INFO, logger=(
+            "vllm.model_executor.layers.fused_moe.moe_megakernel")):
+        moe_megakernel_record_call("repli:gate-test", 1, None)
+        moe_megakernel_record_call("bras:tree", 32, False)
+        moe_megakernel_record_call("bras:tree", 32, False)
+        moe_megakernel_record_call("repli:M=32 above threshold", 32, None)
+    after = moe_megakernel_call_stats()
+    assert after[("bras:tree", 32, "grouped")] == (
+        before.get(("bras:tree", 32, "grouped"), 0) + 2)
+    assert after[("repli:M=32 above threshold", 32, "-")] == (
+        before.get(("repli:M=32 above threshold", 32, "-"), 0) + 1)
+    # la ligne de résumé doit être ÉMISE (preuve de consommation du canal)
+    assert any("appels-site" in r.message for r in caplog.records), (
+        "aucune ligne appels-site loguée — le canal de preuve est muet")

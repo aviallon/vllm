@@ -676,6 +676,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             moe_megakernel_eligible,
             moe_megakernel_enabled,
             moe_megakernel_flags,
+            moe_megakernel_record_call,
         )
 
         if not moe_megakernel_enabled():
@@ -692,6 +693,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 "d'appel (pas de res/norm_w/handles IPC) — repli sur la "
                 "chain livre"
             )
+            moe_megakernel_record_call(
+                "repli:norm/ar-non-cables", hidden_states.size(0), None)
             return False
         if _routing:
             logger.warning_once(
@@ -699,6 +702,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 "d'appel n'a pas de poids de router — repli sur la chain "
                 "livre"
             )
+            moe_megakernel_record_call(
+                "repli:routing-non-cable", hidden_states.size(0), None)
             return False
         reason = moe_megakernel_eligible(
             hidden_states,
@@ -721,6 +726,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             logger.warning_once(
                 "moe-megakernel: repli sur la chain livree (%s)", reason
             )
+            moe_megakernel_record_call(
+                f"repli:{reason}", hidden_states.size(0), None)
             return False
         # echelles de poids per-channel exigees par le kernel (le contrat
         # per-channel est celui du chemin int8 per-token livre).  Layout
@@ -733,6 +740,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             logger.warning_once(
                 "moe-megakernel: repli (echelles poids non per-channel)"
             )
+            moe_megakernel_record_call(
+                "repli:echelles", hidden_states.size(0), None)
             return False
 
         M = hidden_states.size(0)
@@ -753,12 +762,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             )
 
         # strategie `pair` : cache3 [M, topk, K] (le moe_sum aval consomme
-        # ce layout — contrat du chemin livre).
+        # ce layout — contrat du chemin livre).  `atomic`/`tree` n'en ont
+        # pas besoin (sortie directe / workspace interne) — allouer cache3
+        # pour rien coûterait M·topk·K·2 B d'HBM par appel.
         from vllm.model_executor.layers.fused_moe.moe_megakernel import (
             moe_megakernel_strategy,
         )
         cache3 = None
-        if moe_megakernel_strategy() != "atomic":
+        if moe_megakernel_strategy() == "pair":
             cache3 = torch.empty(
                 (M, top_k_num, w1.size(2)),
                 device=hidden_states.device,
@@ -780,6 +791,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             expert_ids=expert_ids,
             cache3=cache3,
         )
+        moe_megakernel_record_call(
+            f"bras:{moe_megakernel_strategy()}", M, naive)
         return True
 
     def moe_sum(

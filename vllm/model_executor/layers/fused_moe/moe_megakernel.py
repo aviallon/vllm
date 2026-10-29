@@ -24,7 +24,27 @@ Deux stratégies (gate `VLLM_MOE_MEGAKERNEL_STRATEGY`) :
   (`global_atomic_cmpswap` — mesuré au codegen) : le coût est à MESURER au
   microbench avant armer (piège atomics fine-grained mémoire PAIRE = NOP
   silencieux sur MI200 PCIe : l'accumulateur est local, le piège ne
-  s'applique pas).
+  s'applique pas).  **RÉGRESSÉ au wall (2026-10-29) : +11/+23/+60/+54 % en
+  c1/c8/c32/c128 — la masse CAS O(M·topk·n_chunks·K) est le facteur
+  limitant (M32-M128-EXTENSION.md §6).**
+
+* **``tree`` (v3, ANTIATOM-DESIGN.md — le bras de la campagne
+  anti-atomics)** — **zéro `tl.atomic_add`, zéro memset, zéro finalize** :
+  réduction à deux niveaux sans accumulateur partagé.  pass1 (grille
+  blocs×chunks) : gemm1 chunk → silu fp32 → ``mid_ws [M·topk, I]`` fp32 ;
+  pass2 (grille blocs×tuiles K) : prologue de quant PER-TOKEN (amax sur I
+  entier — contrat livré verbatim) puis UN dot pleine-I → rangées de
+  PAIRES ``ws [M·topk, K]`` bf16 (un seul écrivain par rangée) ; pass3
+  (grille M×tuiles K) : ``out[t] = Σ_s ws[t·topk+s]`` (fp32 → bf16).  Le
+  workspace ``ws`` est le ``cache3`` livré : la réduction des experts reste
+  un aller-retour HBM (le triangle du REPORT §5 — sans atomics c'est le
+  seul plancher, la voie « propriétaire unique par rangée » meurt du
+  parallélisme aux petits M : 1 CTA à c1).  Gain vs ``atomic`` = toute la
+  masse CAS + memset + finalize + le gemm2 chunké (mesuré : ~40 % du pic
+  de bande) remplacé par le dot pleine-I livré.  **Déterminisme bit-exact
+  run-to-run** (ordre de sommation fixe) — contrat testé.  Écart nommé vs
+  le livré : silu en fp32 (le livré arrondit en bf16) ; sinon même contrat
+  de quant (per-token, amax entier).
 
 Le triangle (documenté §5 du REPORT) : la parallélisme de streaming c1 vient
 de découper les colonnes des poids ; une CTA fusionnée couvre soit la largeur
@@ -47,7 +67,7 @@ Identiques : quant de x (expressions de `_per_token_quant_int8`), échelles
 per-channel, poids routé fp32 avant cast, sortie bf16 [M, K].
 
 Gates : `VLLM_MOE_MEGAKERNEL` (défaut OFF = le chemin livré verbatim) ;
-`VLLM_MOE_MEGAKERNEL_STRATEGY` = `pair` | `atomic` (défaut `pair`).
+`VLLM_MOE_MEGAKERNEL_STRATEGY` = `pair` | `atomic` | `tree` (défaut `pair`).
 
 TOUR 2 — incréments 2+3 (spec verbatim :
 `research/moe-megakernel-campaign-2026-10-27/TOUR2-DESIGN.md` §6) :
@@ -100,6 +120,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "qwen3_moe_pair_fusion_kernel",
     "qwen3_moe_megakernel",
+    "qwen3_moe_mk_tree_pass1_kernel",
+    "qwen3_moe_mk_tree_pass2_kernel",
+    "moe_megakernel_reduce_kernel",
     "moe_megakernel_finalize",
     "fused_moe_megakernel",
     "moe_megakernel_enabled",
@@ -107,6 +130,8 @@ __all__ = [
     "moe_megakernel_flags",
     "moe_megakernel_eligible",
     "moe_megakernel_scales_ok",
+    "moe_megakernel_record_call",
+    "moe_megakernel_call_stats",
     "normalize_w_scale",
     "MoeMegakernelComm",
     "FLAG_ELEMS",
@@ -216,6 +241,12 @@ FLAG_ELEMS = 256 // 4
 MK_BM = 16
 MK_CI = 32
 MK_BN2 = 64
+# configs `tree` (sweep moemk_tree_sweep_bench, MI210, shapes réels) :
+# BKO=256 + num_warps=2/num_stages=1 = les configs mesurées ; CI=64 (n_chunks
+# = 4) était la meilleure pour pass1 ; BN2=64 = la tuile de sortie du kernel
+# livré (le dot pleine-I de pass2 en a besoin pour son budget de registres).
+MK_TREE_BKO = 256
+MK_TREE_CI = 64
 
 
 @triton.jit
@@ -814,6 +845,194 @@ def moe_megakernel_finalize_int8_kernel(
     tl.store(s_ptr + pid, s)
 
 
+# stratégie `tree` (v3, ANTIATOM-DESIGN.md) — ZÉRO atomic, zéro memset,
+# zéro finalize : réduction à deux niveaux sans accumulateur partagé.
+#
+# DEUX contrats de quant coexistent — et `tree` choisit le MEILLEUR :
+# `atomic` ne voit qu'un chunk intermédiaire par CTA ⇒ échelle par
+# (rangée, chunk) et gemm2 chunké (4-8 dots séquentiels de contraction
+# CI — mesuré : le gemm2 tombe à ~40 % du pic de bande passante).
+# `tree`, lui, stocke l'intermédiaire post-silu en fp32 (mid_ws) et
+# quantifie au token ENTIER dans le prologue de pass2 — le contrat livré
+# VERBATIM (amax sur I entier, `_round_i8`) — ce qui libère le gemm2 :
+# UN dot pleine-I [16, I] x [I, BN2], exactement le dataflow du kernel
+# livré (mesuré : c'est là que se cachait le gap structurel, PAS dans les
+# atomics — moemk_decomp_bench).
+#
+#   pass1  qwen3_moe_mk_tree_pass1   grid (blocs x chunks)
+#          gemm1 chunk (acc [16, 2CI] fp32) -> silu fp32 (mid) ->
+#          store mid_ws [M·topk, I] fp32   (aucun atomic, aucune échelle)
+#   pass2  qwen3_moe_mk_tree_pass2   grid (blocs x tuiles K)
+#          prologue : amax sur I entier -> q int8 + s_row (contrat livré)
+#          acc2 [16, BN2] = dot(q, w2_tuile) · s_row · s_w2 · w_topk
+#          -> ws [M·topk, K] bf16 (rangées de paires, un seul écrivain)
+#   pass3  moe_megakernel_reduce      grid (M x tuiles K)
+#          out[t] = Σ_s ws[t·topk+s] (fp32 -> bf16) = moe_sum + cast fusionnés
+#
+# Déterminisme bit-exact run-to-run (ordre fixe) ; écarts nommés vs le
+# livré : silu en fp32 (le livré arrondit en bf16 dans cache1) — sinon le
+# contrat de quant est le SIEN.  I doit être une puissance de 2 (tuile
+# pleine-I) — asserté au launcher (fail loud).
+# ---------------------------------------------------------------------------
+@triton.jit
+def qwen3_moe_mk_tree_pass1_kernel(
+    x_ptr,            # [M, K] int8 (quantifié, échelle x_scale)
+    x_scale_ptr,      # [M] fp32 per-token
+    w1_ptr,           # [E, 2I, K] int8, K contiguous
+    w1_scale_ptr,     # [E, 2I] fp32 per-channel (contigu)
+    mid_ws_ptr,       # SORTIE [num_pairs, I] fp32 (post-silu, échelles composées)
+    sorted_token_ids_ptr,  # [EM] int32 (grouped) ; ignoré en NAIVE
+    expert_ids_ptr,        # [n_blocs] int32 ; ignoré en NAIVE
+    num_valid,
+    stride_xm,
+    stride_w1e,
+    stride_w1n,
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    I: tl.constexpr,
+    BM: tl.constexpr,
+    BKO: tl.constexpr,
+    CI: tl.constexpr,
+    N_CHUNKS: tl.constexpr,
+    NAIVE: tl.constexpr,
+):
+    """1 CTA = (bloc de paires, chunk intermédiaire) — gemm1 chunké puis
+    silu fp32 ; sortie = la rangée de paire post-silu écrite une seule fois
+    (store nu, aucun atomic).  Aucune échelle de quant ici : la quant est
+    per-token dans pass2 (contrat livré)."""
+    pid = tl.program_id(0)
+    chunk = tl.program_id(1)
+
+    offs_pair = pid * BM + tl.arange(0, BM)
+    if NAIVE:
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+    else:
+        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+    valid = pairs < num_valid
+    pairs_i64 = pairs.to(tl.int64)
+    tokens = pairs // top_k
+    e = tl.load(expert_ids_ptr + pid)
+    e64 = e.to(tl.int64)
+
+    x_rows = x_ptr + tokens.to(tl.int64) * stride_xm
+    sx = tl.load(x_scale_ptr + tokens.to(tl.int64), mask=valid, other=0.0)
+    offs_i = chunk * CI + tl.arange(0, CI)
+    offs_k = tl.arange(0, BKO)
+
+    acc_g = tl.zeros((BM, CI), dtype=tl.float32)
+    acc_u = tl.zeros((BM, CI), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BKO)):
+        xk = tl.load(x_rows[:, None] + (k * BKO + offs_k)[None, :],
+                     mask=valid[:, None], other=0)
+        wg = tl.load(w1_ptr + e64 * stride_w1e
+                     + offs_i[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        acc_g += tl.dot(xk, wg)
+        wu = tl.load(w1_ptr + e64 * stride_w1e
+                     + (I + offs_i)[None, :] * stride_w1n
+                     + (k * BKO + offs_k)[:, None])
+        acc_u += tl.dot(xk, wu)
+
+    s1g = tl.load(w1_scale_ptr + e64 * (2 * I) + offs_i)
+    s1u = tl.load(w1_scale_ptr + e64 * (2 * I) + I + offs_i)
+    acc_g = acc_g * s1g * sx[:, None]
+    acc_u = acc_u * s1u * sx[:, None]
+
+    mid = (acc_g * tl.sigmoid(acc_g)) * acc_u
+    tl.store(mid_ws_ptr + pairs_i64[:, None] * I + offs_i[None, :], mid,
+             mask=valid[:, None])
+
+
+@triton.jit
+def qwen3_moe_mk_tree_pass2_kernel(
+    mid_ws_ptr,       # [num_pairs, I] fp32 (post-silu)
+    w2_ptr,           # [E, K, I] int8, I contiguous
+    w2_scale_ptr,     # [E, K] fp32 per-channel (contigu)
+    topk_w_ptr,       # [M, top_k] fp32 (poids routés — épilogue)
+    ws_ptr,           # SORTIE [num_pairs, K] bf16 (rangées de paires)
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_valid,
+    stride_w2e,
+    stride_w2k,
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    I: tl.constexpr,
+    BM: tl.constexpr,
+    BN2: tl.constexpr,
+    NAIVE: tl.constexpr,
+):
+    """1 CTA = (bloc de paires, tuile de sortie K) — prologue de quant
+    PER-TOKEN (amax sur I entier — contrat livré verbatim) puis UN dot
+    pleine-I : acc2 [16, BN2] = dot(q [16,I], w2_tuile [I,BN2]) · s_row ·
+    s_w2 · w_topk, et un seul store nu de la rangée de paire.  Le tuilage
+    du dot est celui du kernel livré (BN2=64, contraction I entière) —
+    mesuré : les dots chunkés (contraction CI) tombent à ~40 % du pic."""
+    pid = tl.program_id(0)
+    tile = tl.program_id(1)
+
+    offs_pair = pid * BM + tl.arange(0, BM)
+    if NAIVE:
+        pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
+    else:
+        pairs = tl.load(sorted_token_ids_ptr + offs_pair)
+    valid = pairs < num_valid
+    pairs_i64 = pairs.to(tl.int64)
+    tokens = pairs // top_k
+    wt = tl.load(topk_w_ptr + pairs_i64, mask=valid, other=0.0)
+    e = tl.load(expert_ids_ptr + pid)
+    e64 = e.to(tl.int64)
+
+    # --- quant per-token (contrat `_per_token_quant_int8`, amax sur I) ---
+    offs_i_full = tl.arange(0, I)
+    mid = tl.load(mid_ws_ptr + pairs_i64[:, None] * I + offs_i_full[None, :],
+                  mask=valid[:, None], other=0.0)
+    amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
+    s_row = amax / 127.0
+    q = _round_i8(mid * (127.0 / amax)[:, None])
+
+    offs_o = tile * BN2 + tl.arange(0, BN2)
+    m_o = offs_o < K
+    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
+    w2t = tl.load(w2_ptr + e64 * stride_w2e
+                  + offs_i_full[:, None]
+                  + offs_o[None, :] * stride_w2k)
+    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+    contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
+    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
+             mask=valid[:, None] & m_o[None, :])
+
+
+@triton.jit
+def moe_megakernel_reduce_kernel(
+    ws_ptr,           # [num_pairs, K] bf16 (rangées de paires)
+    out_ptr,          # [M, K] bf16 (ou fp32 si OUT_FP32)
+    top_k: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK: tl.constexpr,
+    OUT_FP32: tl.constexpr,
+):
+    """Réduction topk + cast final FUSIONNÉS (le `moe_sum` + finalize du
+    chemin livré, en un lancement).  1 programme = (token, tuile K) :
+    out[t] = Σ_{s<top_k} ws[t·topk+s] — accumulateur fp32, ordre de
+    sommation FIXE ⇒ déterminisme bit-exact run-to-run.  OUT_FP32 : sortie
+    fp32 (interface INT8_OUT / `moe_megakernel_output_int8`).
+    """
+    t = tl.program_id(0)
+    tile = tl.program_id(1)
+    offs = tile * BLOCK + tl.arange(0, BLOCK)
+    m = offs < K
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for s in range(0, top_k):
+        p = (t * top_k + s) * K
+        v = tl.load(ws_ptr + p + offs, mask=m, other=0.0)
+        acc += v
+    if OUT_FP32:
+        tl.store(out_ptr + t * K + offs, acc, mask=m)
+    else:
+        tl.store(out_ptr + t * K + offs, acc.to(tl.bfloat16), mask=m)
+
+
 # ---------------------------------------------------------------------------
 # API python
 # ---------------------------------------------------------------------------
@@ -824,6 +1043,50 @@ def _log_once(tag: str, msg: str, *args: Any) -> None:
     if tag not in _LOGGED:
         _LOGGED.add(tag)
         logger.info(msg, *args)
+
+
+# ---------------------------------------------------------------------------
+# compteur d'appels bras/repli (travail nommé F1/W1, M32-M128-EXTENSION §8.5)
+# ---------------------------------------------------------------------------
+# `warning_once` est STRUCTURELLEMENT muet après le 1er message : il ne peut
+# pas prouver quel chemin tourne pendant un run.  Ce compteur, lui, journalise
+# la DISTRIBUTION des appels par (issue, M, régime) — les deux falsifiants
+# nommés (compteur d'appels bras/repli + distribution de M).  ⚠ Compte les
+# invocations du SITE python (capture de graphe comprise) — pas les replays
+# du graphe (pas de Python derrière) ; la lecture « appels du site » est la
+# seule honnête.  Une ligne de résumé est émise au 1er appel puis toutes les
+# 200 invocations.
+_CALL_STATS: dict[tuple[str, int, str], int] = {}
+_CALL_TOTAL = 0
+
+
+def moe_megakernel_record_call(outcome: str, M: int,
+                               naive: bool | None) -> None:
+    global _CALL_TOTAL
+    regime = "naive" if naive else ("grouped" if naive is not None else "-")
+    key = (outcome, M, regime)
+    _CALL_STATS[key] = _CALL_STATS.get(key, 0) + 1
+    _CALL_TOTAL += 1
+    if _CALL_TOTAL == 1 or _CALL_TOTAL % 200 == 0:
+        top = sorted(_CALL_STATS.items(), key=lambda kv: -kv[1])[:14]
+        logger.info(
+            "[moe-megakernel] appels-site #%d : %s",
+            _CALL_TOTAL,
+            ", ".join(f"{k[0]}|M={k[1]}|{k[2]}={v}" for k, v in top),
+        )
+
+
+def moe_megakernel_call_stats() -> dict[tuple[str, int, str], int]:
+    """Copie du compteur (surface de test)."""
+    return dict(_CALL_STATS)
+
+
+def moe_megakernel_reset_call_stats() -> None:
+    """Remise à zéro (tests uniquement — le processus moteur ne réinitialise
+    jamais : le compteur est la mémoire du run)."""
+    global _CALL_TOTAL
+    _CALL_STATS.clear()
+    _CALL_TOTAL = 0
 
 
 def moe_megakernel_enabled() -> bool:
@@ -1295,7 +1558,67 @@ def fused_moe_megakernel(
             output.copy_((q_out.float() * s_out).to(output.dtype))
             return
         moe_megakernel_finalize(out_acc, output)
+    elif strategy == "tree":
+        # ANTIATOM-DESIGN.md §2 (révisé par la décomposition) : 3
+        # lancements, ZÉRO atomic / memset / finalize.  Le quant est
+        # PER-TOKEN (contrat livré verbatim) dans le prologue de pass2 —
+        # plus de contrat chunké : le gemm2 est un dot pleine-I (le
+        # dataflow du kernel livré, mesuré 2,4× plus rapide que les dots
+        # chunkés).  BN2=64 = tuile de sortie livrée ; BKO=256/CI=64 =
+        # configs mesurées (sweep moemk_tree_sweep_bench).
+        CI = min(MK_TREE_CI, I)
+        n_chunks = triton.cdiv(I, CI)
+        num_pairs = M * top_k
+        assert output.dtype is torch.bfloat16 and output.is_contiguous(), (
+            "tree: sortie bf16 contiguë requise (contrat moe_sum livré)")
+        assert I & (I - 1) == 0, (
+            f"tree: I={I} doit être une puissance de 2 (tuile pleine-I)")
+        # mid_ws = intermédiaire post-silu fp32 [M·topk, I] (L2-hot, lu par
+        # les tuiles K) ; ws = rangées de paires bf16 (= le cache3 livré,
+        # mais PLEINEMENT écrit par pass2 — aucun memset, invariant : le tri
+        # grouped couvre chaque paire exactement une fois).
+        mid_ws = torch.empty((num_pairs, I), device=output.device,
+                             dtype=torch.float32)
+        ws = torch.empty((num_pairs, K), device=output.device,
+                         dtype=torch.bfloat16)
+        s1 = sorted_token_ids if sorted_token_ids is not None else topk_ids
+        e1 = expert_ids if expert_ids is not None else topk_ids
+        qwen3_moe_mk_tree_pass1_kernel[(n_blocks, n_chunks)](
+            x, x_scale, w1, w1_scale, mid_ws, s1, e1, num_valid,
+            x.stride(0), w1.stride(0), w1.stride(1),
+            top_k=top_k, K=K, I=I, BM=BM, BKO=MK_TREE_BKO, CI=CI,
+            N_CHUNKS=n_chunks, NAIVE=naive,
+            num_warps=2, num_stages=1,
+        )
+        qwen3_moe_mk_tree_pass2_kernel[(n_blocks, triton.cdiv(K, 64))](
+            mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
+            w2.stride(0), w2.stride(1),
+            top_k=top_k, K=K, I=I, BM=BM, BN2=64, NAIVE=naive,
+            num_warps=2, num_stages=1,
+        )
+        if moe_megakernel_int8_out_enabled():
+            # variante interface v2' : le reduce écrit fp32, puis requant
+            # per-token (contrat existant, inchangé).
+            out_acc = torch.empty((M, K), device=output.device,
+                                  dtype=torch.float32)
+            moe_megakernel_reduce_kernel[(M, triton.cdiv(K, 64))](
+                ws, out_acc, top_k=top_k, K=K, BLOCK=64,
+                OUT_FP32=True, num_warps=4,
+            )
+            q_out, s_out = moe_megakernel_output_int8(out_acc, M, K)
+            _log_once(
+                "mk-int8out",
+                "[moe-megakernel] sortie INT8 (interface v2') ACTIVE "
+                "(M=%d K=%d)", M, K,
+            )
+            output.copy_((q_out.float() * s_out).to(output.dtype))
+            return
+        moe_megakernel_reduce_kernel[(M, triton.cdiv(K, 64))](
+            ws, output, top_k=top_k, K=K, BLOCK=64,
+            OUT_FP32=False, num_warps=4,
+        )
     else:
+        assert strategy == "pair", f"stratégie inconnue: {strategy!r}"
         # BN2=64 + num_warps=8 = config mesurée au smoke (shared 32 Ko,
         # VGPR 256) ; BN2=256 déborde la fenêtre LDS (65 536 + 128 B de
         # staging = OutOfResources mesuré sur GPU).
