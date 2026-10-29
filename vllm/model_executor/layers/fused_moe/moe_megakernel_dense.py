@@ -272,9 +272,15 @@ def dense_mfma_gemm(
     * ``K % 16 == 0`` (dim de contraction MFMA ; queue K masquée), N
       quelconque (masque de colonnes).
 
-    ``out`` (optionnel) : tampon bf16 [≥M, ≥N] pré-alloué — les lignes et
-    colonnes hors [M,N] ne sont PAS écrites (masques du kernel).  Retourne
-    le tampon de sortie (alloué ici si absent).
+    ``out`` (optionnel) : tampon bf16 **ou fp32** [≥M, ≥N] pré-alloué — les
+    lignes et colonnes hors [M,N] ne sont PAS écrites (masques du kernel).
+    Le fp32 (INC-C, `moe_megakernel_sampling.mk_lm_head_logits`) est absorbé
+    dans l'épilogue du kernel (``acc_f.to(c_ptr.element_ty)`` = no-op fp32) :
+    la sortie fp32 est directe, sans cast bf16 intermédiaire.  Écart NOMMÉ
+    vs le repli : le repli livré arrondit en bf16 puis cast fp32 (la chaîne
+    livrée), le chemin gate-ON garde le fp32 de l'acc — meilleur d'un arrondi
+    bf16, jamais pire.  Retourne le tampon de sortie (alloué ici si absent,
+    bf16).
 
     Gate ``VLLM_MOE_MEGAKERNEL_DENSE`` : OFF → repli verbatim sur le chemin
     livré (``triton_scaled_mm`` / ``triton_scaled_mm_fused_quant``).
@@ -320,8 +326,8 @@ def dense_mfma_gemm(
             f"a_scale sur {a_scale.device} != A sur {a.device}"
         )
     if out is not None:
-        assert out.dtype == torch.bfloat16 and out.dim() == 2, (
-            f"out doit être bf16 2D : {out.dtype} {tuple(out.shape)}"
+        assert out.dtype in (torch.bfloat16, torch.float32) and out.dim() == 2, (
+            f"out doit être bf16 ou fp32 2D : {out.dtype} {tuple(out.shape)}"
         )
         assert out.shape[0] >= M and out.shape[1] >= N, (
             f"out {tuple(out.shape)} trop petit pour [{M},{N}]"
