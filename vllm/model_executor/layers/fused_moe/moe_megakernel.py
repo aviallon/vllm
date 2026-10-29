@@ -960,16 +960,21 @@ def qwen3_moe_mk_tree_pass2_kernel(
     I: tl.constexpr,
     BM: tl.constexpr,
     BN2: tl.constexpr,
+    LOCAL_TILES: tl.constexpr,
     NAIVE: tl.constexpr,
 ):
-    """1 CTA = (bloc de paires, tuile de sortie K) — prologue de quant
-    PER-TOKEN (amax sur I entier — contrat livré verbatim) puis UN dot
-    pleine-I : acc2 [16, BN2] = dot(q [16,I], w2_tuile [I,BN2]) · s_row ·
-    s_w2 · w_topk, et un seul store nu de la rangée de paire.  Le tuilage
-    du dot est celui du kernel livré (BN2=64, contraction I entière) —
-    mesuré : les dots chunkés (contraction CI) tombent à ~40 % du pic."""
+    """1 CTA = 1 bloc de paires ; `LOCAL_TILES` tuiles de sortie traitées par
+    CTA (régime mesuré : LOCAL_TILES=1 + grille (blocs, tuiles) gagne aux
+    PETITS M — la quant redondante est absorbée, parité mesurée à M=8 ;
+    LOCAL_TILES=K/BN2 + grille (blocs,) gagne aux GRANDS M — le quant est
+    calculé UNE fois par bloc).  Le quant est PER-TOKEN (amax sur I entier —
+    contrat livré verbatim) et chaque tuile fait UN dot pleine-I :
+    acc2 [16, BN2] = dot(q [16,I], w2_tuile [I,BN2]) · s_row · s_w2 ·
+    w_topk, avec un seul store nu de la rangée de paire.  Le tuilage du dot
+    est celui du kernel livré (BN2=64, contraction I entière) — mesuré :
+    les dots chunkés (contraction CI) tombent à ~40 % du pic."""
     pid = tl.program_id(0)
-    tile = tl.program_id(1)
+    tile0 = tl.program_id(1)
 
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
@@ -991,16 +996,18 @@ def qwen3_moe_mk_tree_pass2_kernel(
     s_row = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
 
-    offs_o = tile * BN2 + tl.arange(0, BN2)
-    m_o = offs_o < K
-    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
-    w2t = tl.load(w2_ptr + e64 * stride_w2e
-                  + offs_i_full[:, None]
-                  + offs_o[None, :] * stride_w2k)
-    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
-    contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
-    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
-             mask=valid[:, None] & m_o[None, :])
+    offs_t = tl.arange(0, BN2)
+    for tt in range(0, LOCAL_TILES):
+        o = (tile0 + tt) * BN2 + offs_t
+        m_o = o < K
+        s2 = tl.load(w2_scale_ptr + e64 * K + o, mask=m_o, other=0.0)
+        w2t = tl.load(w2_ptr + e64 * stride_w2e
+                      + offs_i_full[:, None]
+                      + o[None, :] * stride_w2k)
+        acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+        contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
+        tl.store(ws_ptr + pairs_i64[:, None] * K + o[None, :], contrib,
+                 mask=valid[:, None] & m_o[None, :])
 
 
 @triton.jit
@@ -1590,10 +1597,24 @@ def fused_moe_megakernel(
             N_CHUNKS=n_chunks, NAIVE=naive,
             num_warps=2, num_stages=1,
         )
-        qwen3_moe_mk_tree_pass2_kernel[(n_blocks, triton.cdiv(K, 64))](
+        n_tiles = triton.cdiv(K, 64)
+        # régime de lancement mesuré (moemk_decomp_bench, MI210) :
+        #  petits M (naive)  : grille (blocs, tuiles), LOCAL_TILES=1 —
+        #    quant redondante par tuile mais parallélisme ×n_tiles (M=8 :
+        #    parité avec le livré) ;
+        #  grands M (grouped) : grille (blocs,), LOCAL_TILES=n_tiles — le
+        #    quant est fait UNE fois par bloc (M=32 : 274.6 vs 387.7 µs).
+        if naive:
+            grid2 = (n_blocks, n_tiles)
+            local_tiles = 1
+        else:
+            grid2 = (n_blocks,)
+            local_tiles = n_tiles
+        qwen3_moe_mk_tree_pass2_kernel[grid2](
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),
-            top_k=top_k, K=K, I=I, BM=BM, BN2=64, NAIVE=naive,
+            top_k=top_k, K=K, I=I, BM=BM, BN2=64,
+            LOCAL_TILES=local_tiles, NAIVE=naive,
             num_warps=2, num_stages=1,
         )
         if moe_megakernel_int8_out_enabled():

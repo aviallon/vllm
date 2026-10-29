@@ -1487,10 +1487,16 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
         top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
         N_CHUNKS=n_chunks, NAIVE=naive, num_warps=2, num_stages=1)
     p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
-    p2[(n_blocks, triton.cdiv(K, 64))](
+    n_tiles = triton.cdiv(K, 64)
+    if naive:
+        grid2, local_tiles = (n_blocks, n_tiles), 1
+    else:
+        grid2, local_tiles = (n_blocks,), n_tiles
+    p2[grid2](
         mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
         w2.stride(0), w2.stride(1),
-        top_k=top_k, K=K, I=I, BM=BM, BN2=64, NAIVE=naive,
+        top_k=top_k, K=K, I=I, BM=BM, BN2=64,
+        LOCAL_TILES=local_tiles, NAIVE=naive,
         num_warps=2, num_stages=1)
     rd = reduce_fn or moe_megakernel_reduce_kernel
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -1507,12 +1513,13 @@ def _mut_pass2_drop_half_i(
     sorted_token_ids_ptr, expert_ids_ptr, num_valid,
     stride_w2e, stride_w2k,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
-    BM: tl.constexpr, BN2: tl.constexpr, NAIVE: tl.constexpr,
+    BM: tl.constexpr, BN2: tl.constexpr, LOCAL_TILES: tl.constexpr,
+    NAIVE: tl.constexpr,
 ):
     """MUTANT : la moitié haute de l'intermédiaire (I/2:I) est annulée avant
     le quant — si la sortie ne bouge pas, le dot ne consomme pas tout I."""
     pid = tl.program_id(0)
-    tile = tl.program_id(1)
+    tile0 = tl.program_id(1)
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
         pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
@@ -1531,16 +1538,18 @@ def _mut_pass2_drop_half_i(
     amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
     s_row = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
-    offs_o = tile * BN2 + tl.arange(0, BN2)
-    m_o = offs_o < K
-    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
-    w2t = tl.load(w2_ptr + e64 * stride_w2e
-                  + offs_i_full[:, None]
-                  + offs_o[None, :] * stride_w2k)
-    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
-    contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
-    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
-             mask=valid[:, None] & m_o[None, :])
+    offs_t = tl.arange(0, BN2)
+    for tt in range(0, LOCAL_TILES):
+        o = (tile0 + tt) * BN2 + offs_t
+        m_o = o < K
+        s2 = tl.load(w2_scale_ptr + e64 * K + o, mask=m_o, other=0.0)
+        w2t = tl.load(w2_ptr + e64 * stride_w2e
+                      + offs_i_full[:, None]
+                      + o[None, :] * stride_w2k)
+        acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+        contrib = acc2 * (s_row * wt)[:, None] * s2[None, :]
+        tl.store(ws_ptr + pairs_i64[:, None] * K + o[None, :], contrib,
+                 mask=valid[:, None] & m_o[None, :])
 
 
 @triton.jit
@@ -1549,12 +1558,13 @@ def _mut_pass2_scale_squared(
     sorted_token_ids_ptr, expert_ids_ptr, num_valid,
     stride_w2e, stride_w2k,
     top_k: tl.constexpr, K: tl.constexpr, I: tl.constexpr,
-    BM: tl.constexpr, BN2: tl.constexpr, NAIVE: tl.constexpr,
+    BM: tl.constexpr, BN2: tl.constexpr, LOCAL_TILES: tl.constexpr,
+    NAIVE: tl.constexpr,
 ):
     """MUTANT : l'échelle per-token est appliquée DEUX fois (s_row²) — si la
     sortie ne bouge pas, l'échelle de quant n'est pas consommée."""
     pid = tl.program_id(0)
-    tile = tl.program_id(1)
+    tile0 = tl.program_id(1)
     offs_pair = pid * BM + tl.arange(0, BM)
     if NAIVE:
         pairs = tl.where(offs_pair % BM == 0, offs_pair // BM, num_valid)
@@ -1572,16 +1582,18 @@ def _mut_pass2_scale_squared(
     amax = tl.maximum(tl.max(tl.abs(mid), axis=1), 1e-10)
     s_row = amax / 127.0
     q = _round_i8(mid * (127.0 / amax)[:, None])
-    offs_o = tile * BN2 + tl.arange(0, BN2)
-    m_o = offs_o < K
-    s2 = tl.load(w2_scale_ptr + e64 * K + offs_o, mask=m_o, other=0.0)
-    w2t = tl.load(w2_ptr + e64 * stride_w2e
-                  + offs_i_full[:, None]
-                  + offs_o[None, :] * stride_w2k)
-    acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
-    contrib = acc2 * (s_row * s_row * wt)[:, None] * s2[None, :]  # MUTATION
-    tl.store(ws_ptr + pairs_i64[:, None] * K + offs_o[None, :], contrib,
-             mask=valid[:, None] & m_o[None, :])
+    offs_t = tl.arange(0, BN2)
+    for tt in range(0, LOCAL_TILES):
+        o = (tile0 + tt) * BN2 + offs_t
+        m_o = o < K
+        s2 = tl.load(w2_scale_ptr + e64 * K + o, mask=m_o, other=0.0)
+        w2t = tl.load(w2_ptr + e64 * stride_w2e
+                      + offs_i_full[:, None]
+                      + o[None, :] * stride_w2k)
+        acc2 = tl.zeros((BM, BN2), dtype=tl.float32) + tl.dot(q, w2t)
+        contrib = acc2 * (s_row * s_row * wt)[:, None] * s2[None, :]  # MUT
+        tl.store(ws_ptr + pairs_i64[:, None] * K + o[None, :], contrib,
+                 mask=valid[:, None] & m_o[None, :])
 
 
 @triton.jit
@@ -1757,7 +1769,7 @@ def test_tree_isa_no_atomics():
             "expert_ids_ptr": "*i32", "num_valid": "i32",
             "stride_w2e": "i32", "stride_w2k": "i32",
         }, {"top_k": 8, "K": 2048, "I": 256, "BM": MK_BM,
-            "BN2": 64, "NAIVE": True}, 2, 1),
+            "BN2": 64, "LOCAL_TILES": 32, "NAIVE": True}, 2, 1),
         ("tree-reduce", mk.moe_megakernel_reduce_kernel, {
             "ws_ptr": "*bf16", "out_ptr": "*bf16",
         }, {"top_k": 8, "K": 2048, "BLOCK": 64, "OUT_FP32": False},
@@ -1818,3 +1830,43 @@ def test_call_counter_records_distribution(caplog):
     # la ligne de résumé doit être ÉMISE (preuve de consommation du canal)
     assert any("appels-site" in r.message for r in caplog.records), (
         "aucune ligne appels-site loguée — le canal de preuve est muet")
+
+
+def test_tree_int8_out_path_consumed(caplog):
+    """Chaque ligne entrant dans une image tourne UNE fois (règle campagne) —
+    y compris le chemin INT8_OUT de `tree` (log `mk-int8out`, reduce OUT_FP32
+    + requant per-token).  Contrat : la sortie est le tree bf16 passé par un
+    aller-retour int8 per-token (un arrondi de plus) — rel_err < 5 % vs le
+    tree bf16, et le log de branchement DOIT être émis (preuve de
+    consommation du canal)."""
+    import logging
+
+    _tree_set_gates()
+    from vllm import envs
+    M, top_k, E, I, K = 8, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    try:
+        # bras de RÉFÉRENCE : INT8_OUT encore éteint
+        out_plain = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+        fused_moe_megakernel(
+            out_plain, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
+        os.environ["VLLM_MOE_MEGAKERNEL_INT8_OUT"] = "1"
+        envs.VLLM_MOE_MEGAKERNEL_INT8_OUT = True
+        out_q = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+        with caplog.at_level(logging.INFO, logger=(
+                "vllm.model_executor.layers.fused_moe.moe_megakernel")):
+            fused_moe_megakernel(
+                out_q, x, w1, w2, wts, ids, None, w1s, w2s,
+                naive=naive, sorted_token_ids=sd, expert_ids=ed)
+        torch.cuda.synchronize()
+        err = _rel_err(out_q, out_plain)
+        assert err < 0.05, (
+            f"INT8_OUT sort trop loin du tree bf16: rel_err={err:.4f}")
+        assert any("INT8" in r.message for r in caplog.records), (
+            "log mk-int8out jamais émis — le chemin INT8_OUT est muet "
+            "(ou non emprunté) : la ligne de code n'a jamais tourné")
+    finally:
+        os.environ["VLLM_MOE_MEGAKERNEL_INT8_OUT"] = "0"
+        envs.VLLM_MOE_MEGAKERNEL_INT8_OUT = False
