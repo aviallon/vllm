@@ -752,9 +752,17 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             from vllm.model_executor.layers.fused_moe.fused_moe import (
                 _prepare_expert_assignment,
             )
+            from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+                moe_megakernel_align_block_m,
+            )
+            # TABLE indexée par M (2026-10-30) : le BLOCK_SIZE_M du tri doit
+            # être LE MÊME que le BM de la grille tree — sinon les blocs ne
+            # mappent pas les paires (le launcher l'asserte, fail loud).
+            # Non-tree : 16 (comportement r10 inchangé).
             sorted_token_ids, expert_ids, _ = _prepare_expert_assignment(
                 topk_ids,
-                {"BLOCK_SIZE_M": 16},
+                {"BLOCK_SIZE_M": moe_megakernel_align_block_m(
+                    M, naive, w1.size(0), w2.size(2), w1.size(2))},
                 M,
                 top_k_num,
                 w1.size(0),

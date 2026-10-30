@@ -112,9 +112,10 @@ livrée — le raccordement au graphe réel est l'étape nommée restante).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import triton
@@ -264,6 +265,11 @@ MK_TREE_MID_BF16 = False
 # (mesuré : M=128 424->383 µs, M=48 331->312 ; sous le seuil la config
 # historique BN2=64/warps 2/stages 1 est optimale : M=32 246 vs 255).
 MK_TREE_GROUPED_BIGM = 40
+# Forme de RÉFÉRENCE du repli : la config r10 (tree_default_config) n'est
+# mesurée/compilable que sur la forme decode locale TP=2 (I=256).  Toute
+# autre forme exige une entrée de table (sinon : repli chaîne livrée —
+# règle de couverture de moe_megakernel_eligible, 2026-10-30).
+MK_TREE_FALLBACK_I = 256
 
 
 def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
@@ -295,6 +301,185 @@ def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
     if M < MK_TREE_GROUPED_BIGM:
         return 64, None, 2, 1
     return 128, None, 4, 3
+
+
+# ---------------------------------------------------------------------------
+# TABLE INDEXÉE PAR M (2026-10-30) — configs de lancement `tree` par régime
+# ---------------------------------------------------------------------------
+# Miroir du mécanisme des tables MoE LIVRÉES (`get_moe_configs` de
+# `fused_moe.py`) : un JSON par forme LOCALE des poids, nommé à la convention
+# livrée `E={E},N={N},device_name={dev},dtype=int8_w8a8,…`, cherché d'abord
+# dans `VLLM_TUNED_CONFIG_FOLDER` puis dans le dossier `configs/` du paquet.
+# Ici la clé interne est K (comme livré) et la valeur est une LISTE
+# d'entrées de régime indexées par M (bornes `m_max`, première correspondance
+# gagnante — la même sémantique que le croisement mesuré M≈36-40).
+#
+# Champ d'une entrée (TOUS consommés — canari
+# `test_tree_table_entry_fields_consumed`) :
+#   m_max     : borne haute du régime (None = au-delà) ; naive flag filtre
+#   BM        : tuile de rangées (align grouped + grilles pass1/pass2)
+#   BKO/CI    : tuiles pass1 (K/intermédiaire)
+#   nw1/ns1   : pass1 num_warps/num_stages
+#   BN2/LOCAL_TILES : pass2 tuile de sortie / tuiles par CTA
+#               (None = n_tiles entier, grille 1-D ; naive force 1)
+#   nw2/ns2   : pass2 num_warps/num_stages
+#
+# Toute entrée absente/invalide → REPLI = config r10 (`tree_default_config`),
+# logué (fail loud sans casser le service) — la table ne casse jamais le
+# chemin mesuré.
+class TreeTileConfig(NamedTuple):
+    BM: int
+    BKO: int
+    CI: int
+    nw1: int
+    ns1: int
+    BN2: int
+    LOCAL_TILES: int | None
+    nw2: int
+    ns2: int
+    source: str
+
+
+_ENTRY_KEYS = ("m_max", "naive", "BM", "BKO", "CI", "nw1", "ns1",
+               "BN2", "LOCAL_TILES", "nw2", "ns2")
+
+
+def tree_default_config(M: int, naive: bool, source: str) -> TreeTileConfig:
+    """Config COURANTE (r10) — le repli garanti de la table.  Pass1 =
+    constants mesurées (BM=16, BKO=256, CI=64, nw/ns=2/1) ; pass2 = le
+    régime `tree_pass2_config` (fonction partagée launcher/tests r10)."""
+    bn2, lt, nw2, ns2 = tree_pass2_config(M, naive)
+    return TreeTileConfig(MK_BM, MK_TREE_BKO, MK_TREE_CI, 2, 1,
+                          bn2, lt, nw2, ns2, source)
+
+
+def tree_config_file_name(E: int, N: int) -> str:
+    """Nom de table à la convention LIVRÉE (`get_config_file_name`), suffixe
+    `megakernel-tree` pour ne jamais entrer en collision avec la table du
+    kernel fused_moe (même dossier `configs/`)."""
+    from vllm.utils.platform_utils import get_device_name_as_file_name
+    return (f"E={E},N={N},device_name={get_device_name_as_file_name()},"
+            "dtype=int8_w8a8,megakernel-tree.json")
+
+
+_TREE_TABLE_CACHE: dict[tuple[int, int], tuple[dict | None, str]] = {}
+
+
+def tree_config_cache_clear() -> None:
+    """Vide le cache de tables (tests / changement de table à chaud)."""
+    _TREE_TABLE_CACHE.clear()
+
+
+def get_tree_config_table(E: int, N: int) -> tuple[dict | None, str]:
+    """(table K->entrées, chemin source) — lookup identique aux tables
+    livrées : `VLLM_TUNED_CONFIG_FOLDER` d'abord (priorité user), puis le
+    dossier `configs/` du paquet.  (None, chemin) si absente."""
+    key = (E, N)
+    if key in _TREE_TABLE_CACHE:
+        return _TREE_TABLE_CACHE[key]
+    json_file_name = tree_config_file_name(E, N)
+    paths = []
+    user_folder = getattr(envs, "VLLM_TUNED_CONFIG_FOLDER", None)
+    if user_folder:
+        paths.append(os.path.join(user_folder, json_file_name))
+    paths.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                              "configs", json_file_name))
+    table: dict | None = None
+    source = paths[-1]
+    for path in paths:
+        if os.path.exists(path):
+            source = path
+            with open(path) as f:
+                raw = json.load(f)
+            raw.pop("triton_version", None)
+            raw.pop("comment", None)
+            table = {int(k): v for k, v in raw.items()}
+            n_ent = sum(len(v) for v in table.values())
+            _log_once(
+                f"mk-tree-table-{E}-{N}",
+                "[moe-megakernel] tree table chargée (E=%d,I=%d) : %d "
+                "entrée(s) depuis %s (K: %s)",
+                E, N, n_ent, path, sorted(table),
+            )
+            break
+    _TREE_TABLE_CACHE[key] = (table, source)
+    return table, source
+
+
+def _tree_entry_ok(ent: Any) -> bool:
+    """Validation fail loud d'une entrée de table (champs + types)."""
+    if not isinstance(ent, dict):
+        return False
+    if any(k not in ent for k in _ENTRY_KEYS):
+        return False
+    for k in ("BM", "BKO", "CI", "nw1", "ns1", "BN2", "nw2", "ns2"):
+        v = ent[k]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            return False
+    if ent["LOCAL_TILES"] is not None:
+        v = ent["LOCAL_TILES"]
+        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+            return False
+    m_max = ent["m_max"]
+    if m_max is not None and (not isinstance(m_max, int)
+                              or isinstance(m_max, bool) or m_max < 1):
+        return False
+    return isinstance(ent["naive"], bool)
+
+
+def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
+                       ) -> TreeTileConfig:
+    """SÉLECTION de config de lancement `tree` — table indexée par M, clé =
+    forme locale des poids (E, N=I), repli = config r10.  Fonction PURE
+    (M, naive, E, I, K) : le site moteur (align grouped) et le launcher
+    appellent la MÊME sélection — toute désynchronisation est attrapée par
+    l'assert align↔grille du launcher (fail loud).
+
+    Observabilité (leçon gate muette) : la config choisie est portée par la
+    ligne `tree regime` du launcher (src=table|repli:…) et le chargement de
+    la table est logué une fois par forme."""
+    if not _env_flag("VLLM_MOE_MEGAKERNEL_TREE_TABLE"):
+        return tree_default_config(M, naive, "repli:knob-off")
+    table, source = get_tree_config_table(E, I)
+    if table is None:
+        _log_once(
+            f"mk-tree-table-miss-{E}-{I}",
+            "[moe-megakernel] tree table absente (%s) — config r10 (repli)",
+            source,
+        )
+        return tree_default_config(M, naive, "repli:table-absente")
+    entries = table.get(K)
+    if not entries:
+        logger.warning_once(
+            "moe-megakernel: tree table sans entrée K=%d (%s) — config r10 "
+            "(repli)", K, source)
+        return tree_default_config(M, naive, "repli:k-absent")
+    for ent in entries:
+        if not _tree_entry_ok(ent):
+            logger.warning_once(
+                "moe-megakernel: entrée de tree table invalide (%s) — "
+                "config r10 (repli)", source)
+            return tree_default_config(M, naive, "repli:entree-invalide")
+        if bool(ent["naive"]) != naive:
+            continue
+        if ent["m_max"] is not None and M > ent["m_max"]:
+            continue
+        return TreeTileConfig(
+            ent["BM"], ent["BKO"], ent["CI"], ent["nw1"], ent["ns1"],
+            ent["BN2"], ent["LOCAL_TILES"], ent["nw2"], ent["ns2"],
+            "table")
+    return tree_default_config(M, naive, "repli:entree-absente")
+
+
+def moe_megakernel_align_block_m(M: int, naive: bool, E: int, I: int,
+                                 K: int) -> int:
+    """BLOCK_SIZE_M du tri grouped (`_prepare_expert_assignment`) — le site
+    moteur DOIT aligner avec LE MÊME BM que la grille de lancement, sinon
+    les blocs ne mappent pas les paires (garde : assert align↔grille dans le
+    launcher).  Non-tree : MK_BM (comportement r10 inchangé)."""
+    if moe_megakernel_strategy() != "tree":
+        return MK_BM
+    return tree_select_config(M, naive, E, I, K).BM
 
 
 @triton.jit
@@ -1374,6 +1559,22 @@ def moe_megakernel_eligible(
         # code de raison STABLE (mimo W5) — M est déjà dans la clé du
         # compteur ; une raison interpolée fragmente le dictionnaire.
         return "M-above-threshold"
+    if moe_megakernel_strategy() == "tree" and I != MK_TREE_FALLBACK_I:
+        # TABLE indexée par M (2026-10-30) : la config de REPLI (r10) n'est
+        # validée que sur la forme de référence I=256 — à I=512 (prefill-EP)
+        # elle ne compile même PAS (LDS 128 Ko > 64 Ko, mesuré 2026-10-30).
+        # Règle de repli EXPLICITE (choix opérateur 10:23 : « un repli vers
+        # le chemin standard suffit pour le prefill ») : une forme hors table
+        # ET hors forme de référence tombe sur la chaîne livrée, comptée et
+        # loguée — jamais sur une config muette qui casserait au compile.
+        # (APRÈS M-above-threshold : cette raison historique garde son sens.)
+        naive_cov = (expert_map is None
+                     and hidden_states.size(0) * topk_ids.size(1) * 4
+                     <= w1.size(0))
+        sel = tree_select_config(hidden_states.size(0), naive_cov,
+                                 w1.size(0), I, K)
+        if sel.source.startswith("repli:"):
+            return "tree-forme-non-couverte"
     return None
 
 
@@ -1709,8 +1910,13 @@ def fused_moe_megakernel(
         # plus de contrat chunké : le gemm2 est un dot pleine-I (le
         # dataflow du kernel livré, mesuré 2,4× plus rapide que les dots
         # chunkés).  BN2=64 = tuile de sortie livrée ; BKO=256/CI=64 =
-        # configs mesurées (sweep moemk_tree_sweep_bench).
-        CI = min(MK_TREE_CI, I)
+        # configs mesurées (sweep moemk_tree_sweep_bench).  Depuis la passe
+        # TABLE (2026-10-30) : la config de lancement vient de
+        # `tree_select_config` (table indexée par M, clé = forme locale des
+        # poids — comme les tables livrées) avec repli garanti sur la config
+        # r10 (tree_default_config).
+        tcfg = tree_select_config(M, naive, w1.size(0), I, K)
+        CI = min(tcfg.CI, I)
         n_chunks = triton.cdiv(I, CI)
         num_pairs = M * top_k
         assert output.dtype is torch.bfloat16 and output.is_contiguous(), (
@@ -1730,44 +1936,56 @@ def fused_moe_megakernel(
                          dtype=torch.bfloat16)
         s1 = sorted_token_ids if sorted_token_ids is not None else topk_ids
         e1 = expert_ids if expert_ids is not None else topk_ids
-        qwen3_moe_mk_tree_pass1_kernel[(n_blocks, n_chunks)](
+        # align↔grille : le BM du tri grouped DOIT être celui de la sélection
+        # (le site appelle moe_megakernel_align_block_m — même fonction
+        # PURE).  L'égalité expert_ids.numel() == n_blocks est SHARP : le tri
+        # alloue cdiv(sorted.size(0), align_bm) blocs ; toute désync entre
+        # align et grille casse ICI (fail loud), pas en garbage silencieux.
+        grid_blocks = M * top_k if naive else triton.cdiv(
+            sorted_token_ids.size(0), tcfg.BM)
+        assert e1.numel() == grid_blocks, (
+            f"tree: align/grille desynchronises (expert_ids={e1.numel()} "
+            f"blocs vs grille={grid_blocks}, BM={tcfg.BM}) — le tri grouped "
+            "doit utiliser moe_megakernel_align_block_m")
+        qwen3_moe_mk_tree_pass1_kernel[(grid_blocks, n_chunks)](
             x, x_scale, w1, w1_scale, mid_ws, s1, e1, num_valid,
             x.stride(0), w1.stride(0), w1.stride(1),
-            top_k=top_k, K=K, I=I, BM=BM, BKO=MK_TREE_BKO, CI=CI,
+            top_k=top_k, K=K, I=I, BM=tcfg.BM, BKO=tcfg.BKO, CI=CI,
             NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
-            num_warps=2, num_stages=1,
+            num_warps=tcfg.nw1, num_stages=tcfg.ns1,
         )
-        n_tiles_cfg, local_tiles, nw2, ns2 = tree_pass2_config(M, naive)
-        n_tiles = triton.cdiv(K, n_tiles_cfg)
-        # régime de lancement = tree_pass2_config (passe de tuiles
-        # 2026-10-29, PLAFONDS-TUILES §4) : naïf = grille 2-D LT=1 ;
-        # groupé = grille 1-D (blocs) LT=n_tiles (le quant est fait une
-        # fois par bloc — mesuré optimal à TOUS les M, sweep B : le levier
-        # « LT=8 à M=128 » est réfuté, cf. PLAFONDS-TUILES §1).  Le champ
-        # local_tiles est CONSOMMÉ (None = n_tiles entier) — pas un
-        # paramètre mort (revue deepseek m6).
-        if naive:
-            grid2 = (n_blocks, n_tiles)
-        else:
-            local_tiles = n_tiles if local_tiles is None else local_tiles
-            grid2 = (n_blocks,) if local_tiles == n_tiles else (
-                n_blocks, triton.cdiv(n_tiles, local_tiles))
+        n_tiles = triton.cdiv(K, tcfg.BN2)
+        # régime de lancement = table indexée par M (repli r10 =
+        # tree_pass2_config) : le champ LOCAL_TILES est CONSOMMÉ dans les
+        # DEUX régimes (None = n_tiles entier, grille 1-D ; 1 = grille 2-D
+        # (blocs, tuiles) du régime naive r10 ; tout autre = groupes de
+        # tuiles).  Mesures : LT=n_tiles gagne aux grands M groupés
+        # (PLAFONDS-TUILES §1) ; le cas naive 1-D est balayé par la table
+        # (axe du mandat LOCAL_TILES=n_tiles).
+        local_tiles = (n_tiles if tcfg.LOCAL_TILES is None
+                       else tcfg.LOCAL_TILES)
+        grid2 = (grid_blocks,) if local_tiles == n_tiles else (
+            grid_blocks, triton.cdiv(n_tiles, local_tiles))
         # PREUVE DE BRANCHEMENT du régime (revue deepseek M1) : une ligne
-        # par régime exécuté, avec la config RÉELLEMENT lancée — le wall
-        # la lit ; un canari de test vérifie qu'elle porte la config
-        # consommée (test_tree_launch_regime_log_canary).
+        # par régime exécuté, avec la config RÉELLEMENT lancée (BM/CI
+        # compris) et sa SOURCE (table | repli:…) — le wall la lit ; un
+        # canari de test vérifie qu'elle porte la config consommée
+        # (test_tree_launch_regime_log_canary).
         _log_once(
-            f"mk-tree-regime-{n_tiles_cfg}-{local_tiles}-{nw2}-{ns2}",
-            "[moe-megakernel] tree regime M=%d naive=%s BN2=%d "
-            "LOCAL_TILES=%s nw=%d ns=%d",
-            M, naive, n_tiles_cfg, local_tiles, nw2, ns2,
+            f"mk-tree-regime-{tcfg.BM}-{tcfg.CI}-{tcfg.BKO}-{tcfg.BN2}-"
+            f"{local_tiles}-{tcfg.nw1}-{tcfg.ns1}-{tcfg.nw2}-{tcfg.ns2}-"
+            f"{tcfg.source}",
+            "[moe-megakernel] tree regime M=%d naive=%s BM=%d CI=%d BN2=%d "
+            "LOCAL_TILES=%s nw1/ns1=%d/%d nw2/ns2=%d/%d src=%s",
+            M, naive, tcfg.BM, tcfg.CI, tcfg.BN2, local_tiles,
+            tcfg.nw1, tcfg.ns1, tcfg.nw2, tcfg.ns2, tcfg.source,
         )
         qwen3_moe_mk_tree_pass2_kernel[grid2](
             mid_ws, w2, w2_scale, topk_weights, ws, s1, e1, num_valid,
             w2.stride(0), w2.stride(1),
-            top_k=top_k, K=K, I=I, BM=BM, BN2=n_tiles_cfg,
+            top_k=top_k, K=K, I=I, BM=tcfg.BM, BN2=tcfg.BN2,
             LOCAL_TILES=local_tiles, NAIVE=naive, MID_BF16=MK_TREE_MID_BF16,
-            num_warps=nw2, num_stages=ns2,
+            num_warps=tcfg.nw2, num_stages=tcfg.ns2,
         )
         if moe_megakernel_int8_out_enabled():
             # variante interface v2' : le reduce écrit fp32, puis requant

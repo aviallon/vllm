@@ -102,6 +102,7 @@ if TYPE_CHECKING:
     VLLM_MOE_MEGAKERNEL_NORM: bool = False
     VLLM_MOE_MEGAKERNEL_AR: bool = False
     VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS: int = 96
+    VLLM_MOE_MEGAKERNEL_TREE_TABLE: bool = True
     VLLM_ROCM_INT8_SKINNY_N_TILES: bool = False
     VLLM_ROCM_UNIT_OUTPUT_GEMM_REDUCTION: bool = False
     VLLM_ROCM_FLA_PACKED_DECODE_NUM_WARPS: int = 1
@@ -723,6 +724,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS": lambda: int(
         os.getenv("VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS", "96") or 96
+    ),
+    # Table indexée par M des configs de lancement `tree` (2026-10-30).
+    # Défaut ON : la table est consommée dès qu'un fichier existe pour la
+    # forme locale des poids (repli = config r10 sinon).  "0" = repli
+    # explicite sur la config r10 (levier A/B wall + rollback).
+    "VLLM_MOE_MEGAKERNEL_TREE_TABLE": lambda: bool(
+        int(os.getenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "1") or 1)
     ),
     # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
     # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the
