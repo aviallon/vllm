@@ -2034,6 +2034,11 @@ def fused_moe_megakernel(
         # poids — comme les tables livrées) avec repli garanti sur la config
         # r10 (tree_default_config).
         tcfg = tree_select_config(M, naive, w1.size(0), I, K)
+        # compteur d'appels AVEC la source de config (revue deepseek M3 :
+        # un bras placebo « table morte » serait indétectable sans elle).
+        # Émis ICI (et non au site) : le sélecteur est déjà appelé — coût
+        # nul sur le chemin chaud (le double appel coûtait ~1 %, pont r12).
+        moe_megakernel_record_call(f"bras:tree@{tcfg.source}", M, naive)
         CI = min(tcfg.CI, I)
         n_chunks = triton.cdiv(I, CI)
         num_pairs = M * top_k
