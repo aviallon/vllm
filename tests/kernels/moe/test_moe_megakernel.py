@@ -2681,3 +2681,52 @@ def test_tree_table_shipped_tile_coverage_poison(E, I, M, ent, tag):
     assert torch.equal(out_clean, out_poisoned), (
         f"{tag}: sortie différente avec workspaces empoisonnés — garbage "
         "non écrit ou tuile recouverte")
+
+
+def test_tree_forme_non_couverte_repli_standard(monkeypatch, tmp_path):
+    """Règle de COUVERTURE (2026-10-30) : la config de repli r10 n'est
+    validée que sur la forme de référence I=256 — à I=512 elle ne compile
+    même pas (LDS, mesuré).  Toute forme hors table ET hors référence doit
+    tomber sur la CHAÎNE LIVRÉE (choix opérateur : « un repli vers le
+    chemin standard suffit pour le prefill »), pas sur une config qui
+    casserait au compile.  Et la forme de référence reste éligible en repli
+    (le bras r10 = knob off doit tourner)."""
+    from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+        moe_megakernel_eligible,
+    )
+    _tree_set_gates()
+    top_k = 8
+
+    def elig(M, E, I, K):
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        w1 = torch.zeros(E, 2 * I, K, device="cuda", dtype=torch.int8)
+        w2 = torch.zeros(E, K, I, device="cuda", dtype=torch.int8)
+        ids = torch.zeros(M, top_k, device="cuda", dtype=torch.int32)
+        return moe_megakernel_eligible(
+            hidden_states=x, w1=w1, w2=w2, topk_ids=ids,
+            use_int8_w8a8=True, per_act_token_quant=True,
+            block_shape=None, quantization_emulation=False,
+            activation_is_silu=True, clamp_limit_is_none=True,
+            has_lora=False, has_bias=False, expert_map=None,
+            apply_router_weight_on_input=False, a1q_scale=None,
+        )
+
+    # forme NON couverte (I=512 sans table) => chaîne livrée
+    monkeypatch.delenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", raising=False)
+    mkmod.tree_config_cache_clear()
+    r = elig(32, 128, 512, 2048)
+    assert r == "tree-forme-non-couverte", (
+        f"I=512 sans table doit replier sur la chaîne livrée, pas sur une "
+        f"config r10 qui ne compile pas (raison: {r})")
+    # forme de référence (I=256) : éligible même en repli (knob off = bras r10)
+    os.environ["VLLM_MOE_MEGAKERNEL_TREE_TABLE"] = "0"
+    try:
+        assert elig(32, 256, 256, 2048) is None, (
+            "la forme de référence doit rester éligible en repli (bras r10)")
+    finally:
+        del os.environ["VLLM_MOE_MEGAKERNEL_TREE_TABLE"]
+    # I=512 AVEC table couvrant l'appel : éligible (la table est la voie)
+    _write_tree_table(monkeypatch, tmp_path,
+                      {"2048": [dict(_TBL[1])]}, E=128, I=512)
+    assert elig(32, 128, 512, 2048) is None, (
+        "I=512 avec table couvrante doit être éligible")
