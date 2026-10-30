@@ -1472,13 +1472,14 @@ def _tree_problem(M, top_k, E, I, K, scale_3d=True):
 def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
                    expert_ids, *, pass1_fn=None, pass2_fn=None,
                    reduce_fn=None, mid_bf16=False, local_tiles=None,
-                   pass2_cfg=None):
+                   pass2_cfg=None, cfg=None):
     """Les 3 passes `tree` avec kernels remplaçables (harnais de mutation).
     Reproduit EXACTEMENT le launcher — `test_tree_pipeline_matches_launcher`
     le prouve bit-exact ; sans cette preuve les mutants ne diraient rien.
     `mid_bf16` = canal MID_BF16 (stockage bf16 de l'intermédiaire) ;
-    `pass2_cfg` (None = tree_pass2_config du launcher) force un régime de
-    lancement ; `local_tiles` force le groupement de tuiles — la couverture
+    `cfg` = TreeTileConfig forcée (None = sélection table du launcher) ;
+    `pass2_cfg` (None = sélection du launcher) force un régime de lancement
+    pass2 ; `local_tiles` force le groupement de tuiles — la couverture
     (« au moins une fois » : tout trou de couverture = NaN) est jugée par
     le poison NaN.
     """
@@ -1488,7 +1489,9 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     M, K = x.shape
     top_k = ids.size(1)
     I = w2.size(2)
-    CI, BM, BKO = min(MK_TREE_CI, I), MK_BM, MK_TREE_BKO
+    tcfg = (mkmod.tree_select_config(M, naive, w1.size(0), I, K)
+            if cfg is None else cfg)
+    CI, BM, BKO = min(tcfg.CI, I), tcfg.BM, tcfg.BKO
     n_chunks = triton.cdiv(I, CI)
     num_pairs = M * top_k
     w1s2 = normalize_w_scale(w1s)
@@ -1496,7 +1499,10 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
     xq, xs = per_token_quant_int8(x)
     s1 = sorted_ids if sorted_ids is not None else ids
     e1 = expert_ids if expert_ids is not None else ids
-    n_blocks = num_pairs if naive else triton.cdiv(sorted_ids.size(0), 16)
+    n_blocks = num_pairs if naive else triton.cdiv(sorted_ids.size(0), BM)
+    assert e1.numel() == n_blocks, (
+        f"harnais: align/grille desynchronises ({e1.numel()} vs "
+        f"{n_blocks}, BM={BM}) — cf. garde du launcher")
     mid_ws = torch.empty((num_pairs, I), device=x.device,
                          dtype=(torch.bfloat16 if mid_bf16
                                 else torch.float32))
@@ -1506,27 +1512,26 @@ def _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids,
         xq, xs, w1, w1s2, mid_ws, s1, e1, num_pairs,
         xq.stride(0), w1.stride(0), w1.stride(1),
         top_k=top_k, K=K, I=I, BM=BM, BKO=BKO, CI=CI,
-        NAIVE=naive, MID_BF16=mid_bf16, num_warps=2, num_stages=1)
+        NAIVE=naive, MID_BF16=mid_bf16, num_warps=tcfg.nw1,
+        num_stages=tcfg.ns1)
     p2 = pass2_fn or qwen3_moe_mk_tree_pass2_kernel
-    bn2, _lt_cfg, nw2, ns2 = pass2_cfg or mkmod.tree_pass2_config(M, naive)
+    bn2, _lt_cfg, nw2, ns2 = (pass2_cfg
+                              or (tcfg.BN2, tcfg.LOCAL_TILES,
+                                  tcfg.nw2, tcfg.ns2))
     n_tiles = triton.cdiv(K, bn2)
-    if naive:
-        assert local_tiles is None, (
-            "local_tiles forcé non applicable en naive (grille 2-D, LT=1)")
-        assert _lt_cfg == 1, f"LOCAL_TILES naive inattendu: {_lt_cfg}"
-        grid2, lt = (n_blocks, n_tiles), 1
-    elif local_tiles is None:
-        # le champ LOCAL_TILES de la config est CONSOMMÉ (revue deepseek
-        # m6) — None = n_tiles entier ; un renvoi explicite serait appliqué.
-        lt = n_tiles if _lt_cfg is None else _lt_cfg
-        grid2 = ((n_blocks,) if lt == n_tiles
-                 else (n_blocks, triton.cdiv(n_tiles, lt)))
-    else:
+    # LOCAL_TILES consommé dans les DEUX régimes (None = n_tiles entier,
+    # grille 1-D ; 1 = grille 2-D ; sinon groupes) — même résolution que le
+    # launcher (garde anti-harnais-faux).
+    if local_tiles is not None:
         # régime forcé (couverture de tuiles) : groupes de `local_tiles`
         assert n_tiles % local_tiles == 0, (
             f"local_tiles={local_tiles} doit diviser n_tiles={n_tiles}")
         lt = local_tiles
         grid2 = (n_blocks, triton.cdiv(n_tiles, lt))
+    else:
+        lt = n_tiles if _lt_cfg is None else _lt_cfg
+        grid2 = ((n_blocks,) if lt == n_tiles
+                 else (n_blocks, triton.cdiv(n_tiles, lt)))
     p2[grid2](
         mid_ws, w2, w2s2, wts, ws, s1, e1, num_pairs,
         w2.stride(0), w2.stride(1),
@@ -1727,8 +1732,12 @@ def _tree_grouped_ids(M, top_k, E, I, K):
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             _prepare_expert_assignment,
         )
+        # BM = celui de la SÉLECTION (site == launcher — table indexée par
+        # M) : aligner à 16 quand la table dit 32 désynchroniserait le
+        # harnais du launcher (garde align↔grille).
+        bm = mkmod.moe_megakernel_align_block_m(M, naive, E, I, K)
         sorted_ids, expert_ids, _ = _prepare_expert_assignment(
-            ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+            ids, {"BLOCK_SIZE_M": bm}, M, top_k, E, None)
     return x, w1, w2, w1s, w2s, ids, wts, naive, sorted_ids, expert_ids
 
 
@@ -1994,27 +2003,26 @@ def test_tree_bn2_bit_invariance():
         "contrat launcher-match")
 
 
-@pytest.mark.parametrize("M,expect_bn2,expect_ns", [
-    (32, "BN2=64", "ns=1"), (128, "BN2=128", "ns=3")])
-def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
-                                       monkeypatch):
+@pytest.mark.parametrize("M", [32, 128])
+def test_tree_launch_regime_log_canary(M, caplog, monkeypatch):
     """M1 (revue deepseek) — preuve de CONSOMMATION du régime : la ligne
-    de log `tree regime` doit porter la config RÉELLEMENT lancée.  Deux
-    canari distincts : (1) le log (consommation runtime — le wall le lit) ;
-    (2) l'APPEL de tree_pass2_config par le launcher (si quelqu'un
-    re-hardcode la config dans le launcher, l'espion ne voit rien et le
-    test casse — garde anti-réversion silencieuse)."""
+    de log `tree regime` doit porter la config RÉELLEMENT lancée, champ par
+    champ, y compris la SOURCE (table | repli:…) — et le launcher doit
+    appeler le SÉLECTEUR (`tree_select_config`, table indexée par M depuis
+    2026-10-30 ; `tree_pass2_config` n'est plus que le cœur du repli).
+    Si quelqu'un re-hardcode la config dans le launcher, l'espion ne voit
+    rien et le test casse (garde anti-réversion silencieuse)."""
     import logging
 
     _tree_set_gates()
-    calls: list[tuple[int, bool]] = []
-    real = mkmod.tree_pass2_config
+    calls: list[tuple] = []
+    real = mkmod.tree_select_config
 
-    def spy(M_, naive_):
+    def spy(M_, naive_, E_, I_, K_):
         calls.append((M_, naive_))
-        return real(M_, naive_)
+        return real(M_, naive_, E_, I_, K_)
 
-    monkeypatch.setattr(mkmod, "tree_pass2_config", spy)
+    monkeypatch.setattr(mkmod, "tree_select_config", spy)
     # _log_once est dédupliqué PAR PROCESSUS : un test antérieur qui aurait
     # déjà lancé le même régime rendrait la ligne muette ici — on isole le
     # cache de dédup (le canari doit pouvoir observer la ligne).
@@ -2022,7 +2030,12 @@ def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
+    cfg = real(M, naive, E, I, K)   # ce que le launcher DOIT consommer
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    # anti-fixture-partagée : le harnais (_tree_grouped_ids) appelle lui
+    # aussi le sélecteur via moe_megakernel_align_block_m — on ne compte
+    # QUE les appels faits par le LAUNCHER.
+    calls.clear()
     with caplog.at_level(logging.INFO, logger=(
             "vllm.model_executor.layers.fused_moe.moe_megakernel")):
         fused_moe_megakernel(
@@ -2030,18 +2043,30 @@ def test_tree_launch_regime_log_canary(M, expect_bn2, expect_ns, caplog,
             naive=naive, sorted_token_ids=sd, expert_ids=ed)
     torch.cuda.synchronize()
     assert (M, naive) in calls, (
-        "le launcher n'a JAMAIS appelé tree_pass2_config — la config est "
-        "re-hardcodée (ou la fonction contournée) : le régime du wall n'est "
+        "le launcher n'a JAMAIS appelé tree_select_config — la config est "
+        "re-hardcodée (ou le sélecteur contourné) : le régime du wall n'est "
         "plus prouvé")
     regime_lines = [r.getMessage()
                     for r in caplog.records if "tree regime" in r.getMessage()]
     assert regime_lines, (
         "aucune ligne `tree regime` émise — la preuve de branchement du "
         "régime est muette")
-    assert any(expect_bn2 in ln for ln in regime_lines), (
-        f"la ligne de régime ne porte pas {expect_bn2}: {regime_lines}")
-    assert any(expect_ns in ln for ln in regime_lines), (
-        f"la ligne de régime ne porte pas {expect_ns}: {regime_lines}")
+    ln = regime_lines[-1]
+    expect = [
+        f"BM={cfg.BM}", f"CI={cfg.CI}", f"BN2={cfg.BN2}",
+        f"nw1/ns1={cfg.nw1}/{cfg.ns1}",
+        f"nw2/ns2={cfg.nw2}/{cfg.ns2}", f"src={cfg.source}",
+    ]
+    for token in expect:
+        assert token in ln, (
+            f"la ligne de régime ne porte pas {token} (config sélectionnée "
+            f"{cfg}): {ln}")
+    # LOCAL_TILES résolu (None => n_tiles en grouped, 1 en naive)
+    n_tiles = triton.cdiv(K, cfg.BN2)
+    want_lt = 1 if naive else (n_tiles if cfg.LOCAL_TILES is None
+                               else cfg.LOCAL_TILES)
+    assert f"LOCAL_TILES={want_lt}" in ln, (
+        f"LOCAL_TILES résolu {want_lt} absent de la ligne: {ln}")
 
 
 @pytest.mark.parametrize("mut_name,M", [
@@ -2294,3 +2319,365 @@ def test_tree_poisoned_workspaces_no_gaps(monkeypatch):
     assert torch.equal(out_clean, out_poisoned), (
         "sortie différente avec workspaces empoisonnés : du garbage non "
         "écrit s'infiltre dans le résultat")
+
+
+# ===========================================================================
+# TABLE INDEXÉE PAR M (2026-10-30) — sélection par régime de M, clé = forme
+# locale des poids (comme les tables livrées), repli = config r10.
+# Garanties testées : (1) sélection EXHAUSTIVE + repli garanti ; (2) chaque
+# champ de table est CONSOMMÉ jusqu'au lancement (canari par champ) ;
+# (3) garde align↔grille (mutant : align BM≠grille BM => fail loud) ;
+# (4) chaque entrée livrée = contrat + bit-invariance vs r10 + couverture
+# de tuiles (poison NaN, leçon tile0).
+# ===========================================================================
+@pytest.fixture(autouse=True)
+def _tree_table_cache_fresh():
+    """Isolation du cache de tables entre tests (un cache périmé ferait
+    lire la table d'un test précédent — leçon de fixture partagée)."""
+    mkmod.tree_config_cache_clear()
+    yield
+    mkmod.tree_config_cache_clear()
+
+
+def _write_tree_table(monkeypatch, tmp_path, table, E=256, I=256):
+    """Écrit une table JSON dans VLLM_TUNED_CONFIG_FOLDER (lookup user) et
+    branche l'env — le chemin RÉEL du loader est exercé, pas un mock."""
+    import json as _json
+    name = mkmod.tree_config_file_name(E, I)
+    (tmp_path / name).write_text(_json.dumps(table))
+    monkeypatch.setenv("VLLM_TUNED_CONFIG_FOLDER", str(tmp_path))
+    mkmod.tree_config_cache_clear()
+    return tmp_path / name
+
+
+_TBL = [
+    {"m_max": 8, "naive": True, "BM": 16, "BKO": 256, "CI": 64,
+     "nw1": 2, "ns1": 1, "BN2": 64, "LOCAL_TILES": 1, "nw2": 2, "ns2": 1},
+    {"m_max": 40, "naive": False, "BM": 16, "BKO": 256, "CI": 64,
+     "nw1": 2, "ns1": 1, "BN2": 64, "LOCAL_TILES": None, "nw2": 2,
+     "ns2": 1},
+    {"m_max": None, "naive": False, "BM": 16, "BKO": 256, "CI": 64,
+     "nw1": 2, "ns1": 1, "BN2": 128, "LOCAL_TILES": None, "nw2": 4,
+     "ns2": 3},
+]
+
+
+def test_tree_table_selection_and_fallback(monkeypatch, tmp_path):
+    """La sélection est EXHAUSTIVE (tout (M, régime) tombe sur une entrée ou
+    sur le repli r10) et ses bornes sont CONSOMMÉES (M=8/9 naive, 40/41
+    grouped).  Repli garanti dans les 5 cas de panne : knob off, table
+    absente, K absent, entrée invalide, aucune entrée du régime."""
+    _write_tree_table(monkeypatch, tmp_path, {"triton_version": "3.8.0",
+                                              "2048": _TBL})
+    # bornes de régime consommées
+    for M in (1, 4, 8):
+        cfg = mkmod.tree_select_config(M, True, 256, 256, 2048)
+        assert cfg.source == "table" and cfg.BN2 == 64 and cfg.LOCAL_TILES == 1
+    for M in (9, 32, 40):
+        cfg = mkmod.tree_select_config(M, False, 256, 256, 2048)
+        assert cfg.source == "table" and cfg.BN2 == 64 and cfg.nw2 == 2
+    for M in (41, 88, 128, 256):
+        cfg = mkmod.tree_select_config(M, False, 256, 256, 2048)
+        assert cfg.source == "table" and cfg.BN2 == 128 and cfg.ns2 == 3
+    # le naive au-delà de m_max tombe sur le repli (régime non couvert)
+    cfg = mkmod.tree_select_config(16, True, 256, 256, 2048)
+    assert cfg.source == "repli:entree-absente"
+    assert cfg == mkmod.tree_default_config(16, True, cfg.source)
+    # repli 1 : knob off => config r10 EXACTE, même avec table présente
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
+    for M, naive in ((8, True), (32, False), (128, False)):
+        cfg = mkmod.tree_select_config(M, naive, 256, 256, 2048)
+        assert cfg.source == "repli:knob-off"
+        bn2, lt, nw2, ns2 = mkmod.tree_pass2_config(M, naive)
+        assert (cfg.BM, cfg.BKO, cfg.CI, cfg.nw1, cfg.ns1) == (
+            16, 256, 64, 2, 1)
+        assert (cfg.BN2, cfg.LOCAL_TILES, cfg.nw2, cfg.ns2) == (
+            bn2, lt, nw2, ns2)
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "1")
+    # repli 2 : table absente pour cette forme (clé = forme locale des
+    # poids — forme jamais tunée, aucun fichier ne peut exister)
+    mkmod.tree_config_cache_clear()
+    cfg = mkmod.tree_select_config(32, False, 7, 9, 2048)   # E=7,I=9
+    assert cfg.source == "repli:table-absente"
+    assert cfg == mkmod.tree_default_config(32, False, cfg.source)
+    # repli 3 : K absent de la table
+    cfg = mkmod.tree_select_config(32, False, 256, 256, 1024)
+    assert cfg.source == "repli:k-absent"
+    # repli 4 : entrée invalide (champ manquant) => repli + warning
+    bad = [dict(_TBL[0]), dict(_TBL[1])]
+    bad[1].pop("nw2")
+    _write_tree_table(monkeypatch, tmp_path, {"2048": bad})
+    cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert cfg.source == "repli:entree-invalide"
+    # repli 5 : aucune entrée du régime (table que naive, appel grouped)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [dict(_TBL[0])]})
+    cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert cfg.source == "repli:entree-absente"
+    # le repli EST la config courante (r10) — pas une config inventée
+    cfg = mkmod.tree_select_config(128, False, 256, 256, 2048)
+    assert cfg == mkmod.tree_default_config(128, False, cfg.source)
+
+
+def test_tree_table_selection_is_pure(monkeypatch, tmp_path):
+    """La sélection est une fonction PURE de (M, naive, E, I, K) : le site
+    (align grouped) et le launcher l'appellent chacun de leur côté — si elle
+    était impure, les deux tomberaient sur des configs différentes et la
+    garde align↔grille casserait en prod sans que les tests le voient."""
+    _write_tree_table(monkeypatch, tmp_path, {"2048": _TBL})
+    a = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    b = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert a == b
+    # et le canal align donne LE MÊME BM que la sélection
+    assert mkmod.moe_megakernel_align_block_m(32, False, 256, 256, 2048) \
+        == a.BM
+    # non-tree : BM de r10 (comportement livré inchangé)
+    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "atomic"
+    try:
+        assert mkmod.moe_megakernel_align_block_m(32, False, 256, 256, 2048) \
+            == 16
+    finally:
+        os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "tree"
+
+
+class _FakeLaunch:
+    """Enregistre les lancements (grille + kwargs) — le canari par champ
+    lit ce que le launcher a RÉELLEMENT passé au kernel."""
+
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.grid = None
+
+    def __getitem__(self, grid):
+        self.grid = grid
+        return self
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((self.grid, kwargs))
+
+
+def test_tree_table_entry_fields_consumed(monkeypatch, tmp_path, caplog):
+    """CANARI PAR CHAMP (declared-input-coverage) : chaque champ d'une
+    entrée de table doit arriver JUSQU'AUX KWARGS DU LANCEMENT — un champ
+    ignoré par le launcher (« la table est là, rien ne bouge ») casse ce
+    test.  Chaque champ porte une valeur DISTINCTIVE (jamais la valeur
+    r10) pour que le canari ne puisse pas passer par coïncidence ; les
+    mutants ont été tués à la main (champ re-hardcodé => test rouge,
+    voir rapport)."""
+    import logging
+    ent = {"m_max": 64, "naive": False, "BM": 32, "BKO": 128, "CI": 16,
+           "nw1": 4, "ns1": 2, "BN2": 128, "LOCAL_TILES": 8, "nw2": 8,
+           "ns2": 2}
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [ent]})
+    _tree_set_gates()
+    monkeypatch.setattr(mkmod, "_LOGGED", set())
+    p1, p2 = _FakeLaunch(), _FakeLaunch()
+    monkeypatch.setattr(mkmod, "qwen3_moe_mk_tree_pass1_kernel", p1)
+    monkeypatch.setattr(mkmod, "qwen3_moe_mk_tree_pass2_kernel", p2)
+    M, top_k, E, I, K = 32, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    with caplog.at_level(logging.INFO, logger=(
+            "vllm.model_executor.layers.fused_moe.moe_megakernel")):
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
+    torch.cuda.synchronize()
+    assert p1.calls and p2.calls, "kernels tree non lancés"
+    g1, kw1 = p1.calls[0]
+    g2, kw2 = p2.calls[0]
+    # pass1 : BM, BKO, CI, nw1, ns1
+    assert kw1["BM"] == 32 and kw1["BKO"] == 128 and kw1["CI"] == 16
+    assert kw1["num_warps"] == 4 and kw1["num_stages"] == 2
+    # pass2 : BM, BN2, LOCAL_TILES, nw2, ns2
+    assert kw2["BM"] == 32 and kw2["BN2"] == 128
+    assert kw2["LOCAL_TILES"] == 8
+    assert kw2["num_warps"] == 8 and kw2["num_stages"] == 2
+    # la grille consomme LOCAL_TILES : (blocs, n_tiles/8)
+    n_tiles = triton.cdiv(K, 128)
+    assert g2 == (g1[0], triton.cdiv(n_tiles, 8)), (
+        f"grille pass2 {g2} ne consomme pas LOCAL_TILES=8 (n_tiles={n_tiles})")
+    # observabilité : la ligne `tree regime` porte la même config + la source
+    regime = [r.getMessage() for r in caplog.records
+              if "tree regime" in r.getMessage()]
+    assert regime, "ligne `tree regime` absente (preuve de branchement muette)"
+    for token in ("BM=32", "CI=16", "BN2=128", "LOCAL_TILES=8",
+                  "nw1/ns1=4/2", "nw2/ns2=8/2", "src=table"):
+        assert token in regime[-1], f"{token} absent de {regime[-1]}"
+
+
+def test_tree_table_align_grille_guard_mutation(monkeypatch, tmp_path):
+    """MUTANT du double appel (site align ↔ launcher grille) : si le tri
+    grouped n'utilise PAS le BM de la sélection, la grille ne mappe pas les
+    blocs — garbage silencieux.  La garde expert_ids.numel() == n_blocks
+    doit le faire échouer FORT (AssertionError), pas doucement."""
+    ent = dict(_TBL[2], BM=32)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [ent]})
+    _tree_set_gates()
+    M, top_k, E, I, K = 128, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd16, ed16 = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+    # align DEFAUT (16) alors que la sélection dit 32 => la garde casse
+    from vllm.model_executor.layers.fused_moe.fused_moe import (
+        _prepare_expert_assignment,
+    )
+    sd16, ed16, _ = _prepare_expert_assignment(
+        ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="align/grille"):
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd16, expert_ids=ed16)
+    # avec le BM de la sélection : ça tourne (contrôle positif)
+    bm = mkmod.moe_megakernel_align_block_m(M, naive, E, I, K)
+    assert bm == 32
+    sd32, ed32, _ = _prepare_expert_assignment(
+        ids, {"BLOCK_SIZE_M": bm}, M, top_k, E, None)
+    fused_moe_megakernel(
+        out, x, w1, w2, wts, ids, None, w1s, w2s,
+        naive=naive, sorted_token_ids=sd32, expert_ids=ed32)
+    torch.cuda.synchronize()
+
+
+def _shipped_table_params():
+    """Entrées de table LIVRÉES × shapes réelles — les configs retenues du
+    sweep.  Sans table installée, un paramètre synthétique (config r10)
+    garde le test vivant (chemin de repli lui aussi exigible) — sur un M où
+    la config r10 COMPILE : à I=512 le régime M≥40 (BN2=128/ns=3) déborde
+    le LDS (mesuré 2026-10-30), d'où la couverture par repli standard."""
+    params = []
+    for E, I in ((256, 256), (128, 512)):
+        table, _src = mkmod.get_tree_config_table(E, I)
+        entries = ((table or {}).get(2048) or [None])
+        for ent in entries:
+            if ent is None:
+                params.append((E, I, 128 if I == 256 else 32, None,
+                               f"E{E}-I{I}-repli"))
+                continue
+            naive = bool(ent["naive"])
+            m_max = ent["m_max"]
+            if naive:
+                M = min(m_max or 8, max(1, E // (8 * 4)))
+            else:
+                M = m_max if m_max is not None else 192
+                M = max(M, E // (8 * 4) + 1)
+                if m_max is not None and M > m_max:
+                    continue    # entrée non atteignable pour cette forme
+            params.append((E, I, M, ent, f"E{E}-I{I}-{naive}-{m_max}"))
+    return params
+
+
+_TABLE_PARAMS = _shipped_table_params()
+
+
+def _ids_for_bm(M, top_k, E, I, K, bm, prob=None):
+    """(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed) — avec `prob` fourni,
+    RÉUTILISE le MÊME problème (un make_problem par appel = des données
+    aléatoires DIFFÉRENTES : comparer deux runs sur deux problèmes ne prouve
+    rien — leçon de mesure/attribution)."""
+    if prob is None:
+        prob = _tree_problem(M, top_k, E, I, K, True)
+    x, w1, w2, w1s, w2s, ids, wts = prob
+    naive = M * top_k * 4 <= E
+    sd = ed = None
+    if not naive:
+        from vllm.model_executor.layers.fused_moe.fused_moe import (
+            _prepare_expert_assignment,
+        )
+        sd, ed, _ = _prepare_expert_assignment(
+            ids, {"BLOCK_SIZE_M": bm}, M, top_k, E, None)
+    return prob + (naive, sd, ed)
+
+
+def _cfg_from_entry(ent):
+    if ent is None:
+        return None   # repli : sélection du launcher (config r10)
+    return mkmod.TreeTileConfig(
+        ent["BM"], ent["BKO"], ent["CI"], ent["nw1"], ent["ns1"],
+        ent["BN2"], ent["LOCAL_TILES"], ent["nw2"], ent["ns2"], "table")
+
+
+@pytest.mark.parametrize("E,I,M,ent,tag", _TABLE_PARAMS,
+                         ids=[p[4] for p in _TABLE_PARAMS])
+def test_tree_table_shipped_contract_and_bits(E, I, M, ent, tag):
+    """CHAQUE config retenue de la table livrée : (1) contrat numérique
+    (rel_err < 3 % vs la référence sémantique livrée, échelles 3-D
+    [E, N, 1] réelles) ; (2) **bit-identique** à la config r10 — c'est la
+    preuve que la table change la SCHEDULING, pas l'arithmétique (gate
+    AIME25 allégée, rapport §gate).  Si un jour bits=DIFF, le gate AIME25
+    complet redevient NON NÉGOCIABLE."""
+    _tree_set_gates()
+    top_k, K = 8, 2048
+    cfg = _cfg_from_entry(ent)
+    r10 = mkmod.tree_default_config(M, M * top_k * 4 <= E, "repli:test")
+    prob = _tree_problem(M, top_k, E, I, K, True)
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _ids_for_bm(
+        M, top_k, E, I, K, (cfg or r10).BM, prob)
+    out_tab = _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed,
+                             cfg=cfg)
+    x2, w12, w22, w1s2, w2s2, ids2, wts2, naive2, sd2, ed2 = _ids_for_bm(
+        M, top_k, E, I, K, r10.BM, prob)   # MÊME problème (attribution)
+    out_r10 = _tree_pipeline(x2, w12, w22, w1s2, w2s2, ids2, wts2, naive2,
+                             sd2, ed2, cfg=r10)
+    ref = reference_chain(x, w1, w2, normalize_w_scale(w1s),
+                          normalize_w_scale(w2s), ids, wts, naive)
+    err = float((out_tab.float() - ref.float()).abs().max()
+                / ref.float().abs().max().clamp_min(1e-6))
+    assert err < 0.03, f"{tag}: hors contrat rel_err={err}"
+    assert torch.equal(out_tab, out_r10), (
+        f"{tag}: la config de table modifie les BITS vs r10 — scheduling "
+        "pur RÉFUTÉ : re-vérifier le gate de cohérence (AIME25 complet "
+        "redevient non négociable)")
+
+
+@pytest.mark.parametrize("E,I,M,ent,tag", _TABLE_PARAMS,
+                         ids=[p[4] for p in _TABLE_PARAMS])
+def test_tree_table_shipped_tile_coverage_poison(E, I, M, ent, tag):
+    """CHAQUE config retenue : couverture de tuiles prouvée au poison NaN
+    (leçon tile0 — un groupe de tuiles jamais écrit = NaN en sortie ; un
+    recouvrement = divergence vs run propre)."""
+    _tree_set_gates()
+    top_k, K = 8, 2048
+    cfg = _cfg_from_entry(ent)
+    bm = (cfg or mkmod.tree_default_config(M, M * top_k * 4 <= E,
+                                           "repli:test")).BM
+    prob = _tree_problem(M, top_k, E, I, K, True)
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _ids_for_bm(
+        M, top_k, E, I, K, bm, prob)
+    num_pairs = M * top_k
+
+    def run(patched):
+        def _run():
+            return _tree_pipeline(x, w1, w2, w1s, w2s, ids, wts, naive,
+                                  sd, ed, cfg=cfg)
+        if not patched:
+            return _run()
+        real_empty = torch.empty
+        seen: dict[int, bool] = {}
+
+        def poisoned_empty(*args, **kwargs):
+            t = real_empty(*args, **kwargs)
+            if (t.dim() == 2 and t.size(0) == num_pairs
+                    and t.size(1) in (I, K)):
+                t.fill_(float("nan"))
+                seen[t.size(1)] = True
+            return t
+        with pytest.MonkeyPatch.context() as m:
+            m.setattr(mkmod.torch, "empty", poisoned_empty)
+            out = _run()
+        assert seen.get(I) and seen.get(K), (
+            f"{tag}: le poison n'a jamais frappé les workspaces (vu={seen}) "
+            "— le test ne prouve rien")
+        return out
+
+    out_clean = run(False)
+    out_poisoned = run(True)
+    assert out_clean.abs().max() > 0
+    assert not out_poisoned.isnan().any(), (
+        f"{tag}: NaN en sortie — une tuile de sortie n'a jamais été écrite "
+        "(trou de couverture)")
+    assert torch.equal(out_clean, out_poisoned), (
+        f"{tag}: sortie différente avec workspaces empoisonnés — garbage "
+        "non écrit ou tuile recouverte")
