@@ -14,7 +14,7 @@
       "LOCAL_TILES": 1,
       "nw2": 8,
       "ns2": 3,
-      "comment": "naive M<=8 : M=8 -4.9 %, M=7 -3.7, M=5 -2.2, M=6 -1.6, M=4 -0.2, M=1-3 neutre (0.0/-0.6/0.0) => non-regression c1 garantie en théorie, verrouillée au wall"
+      "comment": "naive M<=8 (source: table-confirm-naive.log + table-confirm2-naive.log) : M=8 -4.9 %, M=7 -3.7, M=5 -2.2, M=6 -1.6, M=4 -0.2, M=1-3 neutre (0.0/-0.6/0.0) => non-regression c1 garantie en théorie, verrouillée au wall"
     },
     {
       "m_max": 32,
@@ -28,7 +28,7 @@
       "LOCAL_TILES": null,
       "nw2": 8,
       "ns2": 1,
-      "comment": "grouped 9-32 : M=9 -16.7, 12 -12.4, 16 -11.1, 24 -3.8, 32 -4.0 (A gagne sur C à 24-32 : +0.6..0.9) ; croisement A<->C MESURÉ entre 32 (A -4.0 vs C -3.4) et 33 (C -2.2 vs A -1.7)"
+      "comment": "grouped 9-32 (source: table-confirm-grouped.log + confirm2 + confirm3) : M=9 -16.7, 12 -12.4, 16 -11.1, 24 -3.8, 32 -4.0 (A gagne sur C à 24-32 : +0.6..0.9) ; croisement A<->C MESURÉ entre 32 (A -4.0 vs C -3.4) et 33 (C -2.2 vs A -1.7). ⚠ Regret NOMMÉ (revue deepseek M7) : à M=9 C (-18.65) devance A (-16.71, 1.9 % > bruit) — la borne basse devrait être ~10-12 ; disposition reportée (gain <=0.4 % wall)"
     },
     {
       "m_max": 150,
@@ -56,7 +56,7 @@
       "LOCAL_TILES": null,
       "nw2": 4,
       "ns2": 3,
-      "comment": "grouped >=151 (= config r10) : confirm 160/192/224/256/320/384/512 — toute autre config testee y est +0.2..+7.4 % ; le residu grand M est structurel (pass1)"
+      "comment": "grouped >=151 (= config r10). ⚠ Revue deepseek M6 : le commentaire précédent (« toute autre config y est +0.2..+7.4 ») était FAUX pour 151-256 — l'entrée 3 (C) y reste nominalement devant : M=160 -1.2, 192 -0.4, 224 -0.4, 256 -0.3 (5 paires unilatérales, mais <= bruit ±1 % sauf 160) ; le croisement réel C<->r10 est ≈256-320 (320 +1.1, 384 +3.9, 512 +5.5 — ICI toute autre config est bien pire). Borne 150 = choix conservateur ; disposition proposée : déplacer à 256 (gain <=0.5 % wall, sous MDE — à décider sur le site)"
     }
   ]
 }

@@ -729,9 +729,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Défaut ON : la table est consommée dès qu'un fichier existe pour la
     # forme locale des poids (repli = config r10 sinon).  "0" = repli
     # explicite sur la config r10 (levier A/B wall + rollback).
-    "VLLM_MOE_MEGAKERNEL_TREE_TABLE": lambda: bool(
-        int(os.getenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "1") or 1)
-    ),
+    # Parser tolérant (mimo 2026-10-30) : aligné sur `_env_flag` —
+    # "1"/"true" = ON, tout le reste = OFF, jamais d'exception.
+    "VLLM_MOE_MEGAKERNEL_TREE_TABLE": lambda: (
+        os.getenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "1") or "1"
+    ).strip().lower() in ("1", "true"),
     # N-aware tile selection for the Triton INT8 W8A8 scaled_mm at N<=32
     # (decode GDN in_proj_ba, 32 columns per GPU shard). Default OFF = the
     # M-only heuristic (BN>N pads the tile and collapses the grid to 1-2

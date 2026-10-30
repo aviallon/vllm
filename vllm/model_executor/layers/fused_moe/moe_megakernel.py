@@ -318,15 +318,20 @@ def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
 # `test_tree_table_entry_fields_consumed`) :
 #   m_max     : borne haute du régime (None = au-delà) ; naive flag filtre
 #   BM        : tuile de rangées (align grouped + grilles pass1/pass2)
-#   BKO/CI    : tuiles pass1 (K/intermédiaire)
+#   BKO/CI    : tuiles pass1 (K/intermédiaire) — CI doit DIVISER I
 #   nw1/ns1   : pass1 num_warps/num_stages
 #   BN2/LOCAL_TILES : pass2 tuile de sortie / tuiles par CTA
-#               (None = n_tiles entier, grille 1-D ; naive force 1)
+#               (None = n_tiles entier, grille 1-D ; naive DOIT porter 1 —
+#                le 1-D naive est mesuré +37 % à M=1)
 #   nw2/ns2   : pass2 num_warps/num_stages
 #
-# Toute entrée absente/invalide → REPLI = config r10 (`tree_default_config`),
-# logué (fail loud sans casser le service) — la table ne casse jamais le
-# chemin mesuré.
+# Validation au CHARGEMENT (`_tree_table_validate`) : champs/types,
+# puissances de 2, CI | I (sinon corruption store pass1), naive ⇒ LT=1,
+# budget LDS de compilation, ordre strict des bornes par groupe naive.
+# Entrée invalide : écartée avec un warning nommé (elle ne décide jamais
+# du sort d'un autre régime) ; table structurellement fausse : rejetée.
+# Tout échec → REPLI = config r10 (`tree_default_config`), logué (fail
+# loud sans casser le service) — la table ne casse jamais le chemin mesuré.
 class TreeTileConfig(NamedTuple):
     BM: int
     BKO: int
@@ -373,7 +378,14 @@ def tree_config_cache_clear() -> None:
 def get_tree_config_table(E: int, N: int) -> tuple[dict | None, str]:
     """(table K->entrées, chemin source) — lookup identique aux tables
     livrées : `VLLM_TUNED_CONFIG_FOLDER` d'abord (priorité user), puis le
-    dossier `configs/` du paquet.  (None, chemin) si absente."""
+    dossier `configs/` du paquet.  (None, chemin) si absente.
+
+    Pannes de FICHIER = repli, jamais une exception dans la forward
+    (revues 2026-10-30 : JSON tronqué / clé non-entière / racine non-dict —
+    le contrat « la table ne casse jamais le chemin mesuré » couvre aussi
+    les fichiers, d'autant que ce nœud a un historique d'écriture de zéros).
+    ⚠ Cache négatif assumé : une table absente au 1ᵉʳ appel reste absente
+    (re-démarrage requis pour voir un montage tardif)."""
     key = (E, N)
     if key in _TREE_TABLE_CACHE:
         return _TREE_TABLE_CACHE[key]
@@ -385,46 +397,147 @@ def get_tree_config_table(E: int, N: int) -> tuple[dict | None, str]:
     paths.append(os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               "configs", json_file_name))
     table: dict | None = None
-    source = paths[-1]
+    source = " / ".join(paths)
     for path in paths:
-        if os.path.exists(path):
-            source = path
+        if not os.path.exists(path):
+            continue
+        source = path
+        try:
             with open(path) as f:
                 raw = json.load(f)
+            if not isinstance(raw, dict):
+                raise ValueError(f"racine non-dict: {type(raw)}")
             raw.pop("triton_version", None)
             raw.pop("comment", None)
-            table = {int(k): v for k, v in raw.items()}
-            n_ent = sum(len(v) for v in table.values())
-            _log_once(
-                f"mk-tree-table-{E}-{N}",
-                "[moe-megakernel] tree table chargée (E=%d,I=%d) : %d "
-                "entrée(s) depuis %s (K: %s)",
-                E, N, n_ent, path, sorted(table),
-            )
+            loaded = {}
+            for k, v in raw.items():
+                loaded[int(k)] = _tree_table_validate(v, N, path)
+        except Exception as e:  # noqa: BLE001 — TOUT défaut fichier => repli
+            logger.warning(
+                "moe-megakernel: tree table illisible (%s) — config r10 "
+                "(repli table-illisible): %s", path, e)
+            table = None
+            source = f"repli:table-illisible:{path}"
             break
+        if any(v is None for v in loaded.values()):
+            # problème STRUCTUREL (ordre des bornes / aucune entrée valide)
+            # — les warnings de détail ont déjà nommé les entrées fautives
+            logger.warning(
+                "moe-megakernel: tree table invalide (%s) — config r10 "
+                "(repli table-invalide)", path)
+            table = None
+            source = f"repli:table-invalide:{path}"
+            break
+        table = loaded
+        n_ent = sum(len(v) for v in table.values())
+        _log_once(
+            f"mk-tree-table-{E}-{N}",
+            "[moe-megakernel] tree table chargée (E=%d,I=%d) : %d "
+            "entrée(s) depuis %s (K: %s)",
+            E, N, n_ent, path, sorted(table),
+        )
+        break
     _TREE_TABLE_CACHE[key] = (table, source)
     return table, source
 
 
-def _tree_entry_ok(ent: Any) -> bool:
-    """Validation fail loud d'une entrée de table (champs + types)."""
+def _tree_entry_error(ent: Any, I: int) -> str | None:
+    """Validation fail loud d'une entrée de table — champs, types, et
+    COHÉRENCE DE FORME (revues adversariales 2026-10-30) :
+
+    * champs + types (l'entrée est consommée telle quelle par le launcher) ;
+    * BM/BKO/CI/BN2 puissances de 2 (`tl.arange` l'exige) ;
+    * `I % CI == 0` — CI ∤ I écrit CHAQUE chunk hors de sa rangée de paire
+      (les stores pass1 ne masquent que les rangées) = corruption
+      silencieuse (deepseek M1/mimo MAJEUR-2) ;
+    * naive ⇒ LOCAL_TILES == 1 : le 1-D naive est MESURÉ +37 % à M=1
+      (table-confirm-naive.log) — une entrée naive à LT=None serait une
+      régression c1 silencieuse (mimo) ;
+    * budget LDS de compilation (deepseek M2/mimo MAJEUR-5) — heuristique
+      CALIBRÉE sur les rapports OutOfResources MESURÉS : pass2
+      `(ns2-1)·I·BN2` (I=512/BN2=128/ns=3 → 131072 « Required » ; idem
+      I=512/BN2=256/ns=2 ; I=256/BN2=128/ns=3 → 65536 passe et compile) et
+      pass1 `(ns1-1)·BKO·CI·3` (ns=3/256/64 → 98304 « Required »).
+      Au-delà du budget : entrée écartée (repli logué) — jamais un crash
+      de compile en forward.  Entrée valide mais non compilable à sa forme
+      = cas résiduel nommé dans le rapport (règle opérationnelle : toute
+      table déployée passe les tests GPU par entrée)."""
     if not isinstance(ent, dict):
-        return False
-    if any(k not in ent for k in _ENTRY_KEYS):
-        return False
+        return "entrée non-dict"
+    for k in _ENTRY_KEYS:
+        if k not in ent:
+            return f"champ manquant: {k}"
     for k in ("BM", "BKO", "CI", "nw1", "ns1", "BN2", "nw2", "ns2"):
         v = ent[k]
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-            return False
-    if ent["LOCAL_TILES"] is not None:
-        v = ent["LOCAL_TILES"]
-        if not isinstance(v, int) or isinstance(v, bool) or v < 1:
-            return False
+            return f"{k} doit être un entier >= 1 (got {v!r})"
+    for k in ("BM", "BKO", "CI", "BN2"):
+        v = ent[k]
+        if v & (v - 1):
+            return f"{k}={v} doit être une puissance de 2 (tl.arange)"
+    if ent["CI"] > I or I % ent["CI"] != 0:
+        return f"CI={ent['CI']} ne divise pas I={I} (corruption store pass1)"
+    lt = ent["LOCAL_TILES"]
+    if lt is not None:
+        if not isinstance(lt, int) or isinstance(lt, bool) or lt < 1:
+            return f"LOCAL_TILES doit être None ou entier >= 1 (got {lt!r})"
+    if ent["naive"] is True and lt != 1:
+        return (f"entrée naive: LOCAL_TILES doit être 1 (grille 2-D r10) — "
+                f"le 1-D naive est mesuré +37 % à M=1 (got {lt!r})")
+    if not isinstance(ent["naive"], bool):
+        return f"naive doit être un booléen (got {ent['naive']!r})"
     m_max = ent["m_max"]
     if m_max is not None and (not isinstance(m_max, int)
                               or isinstance(m_max, bool) or m_max < 1):
-        return False
-    return isinstance(ent["naive"], bool)
+        return f"m_max doit être None ou entier >= 1 (got {m_max!r})"
+    budget_p2 = (ent["ns2"] - 1) * I * ent["BN2"]
+    if budget_p2 > 65536:
+        return (f"budget LDS pass2: (ns2-1)*I*BN2={budget_p2} > 65536 "
+                "(OutOfResources au compile)")
+    budget_p1 = (ent["ns1"] - 1) * ent["BKO"] * ent["CI"] * 3
+    if budget_p1 > 65536:
+        return (f"budget LDS pass1: (ns1-1)*BKO*CI*3={budget_p1} > 65536 "
+                "(OutOfResources au compile)")
+    return None
+
+
+def _tree_table_validate(entries: Any, I: int, source: str) -> list | None:
+    """Valide TOUTE la table au chargement (revues 2026-10-30 : une entrée
+    invalide ne doit jamais décider du sort d'un AUTRE régime — deepseek M8
+    « entrée invalide empoisonne tout »).  Entrées invalides : écartées UNE
+    PAR UNE avec un warning nommant l'index et le champ fautif.  Ordre :
+    `m_max` strictement croissant PAR GROUPE naive, `null` en dernier —
+    violation = table non fiable (ordre = sémantique de sélection) ⇒ table
+    entière rejetée (repli logué).  Retourne les entrées valides, ou None."""
+    if not isinstance(entries, list):
+        logger.warning("moe-megakernel: tree table %s — K doit porter une "
+                       "liste d'entrées (got %s)", source, type(entries))
+        return None
+    good = []
+    seen: dict[bool, int] = {}
+    for idx, ent in enumerate(entries):
+        err = _tree_entry_error(ent, I)
+        if err is not None:
+            logger.warning("moe-megakernel: tree table %s — entrée #%d "
+                           "écartée (%s)", source, idx, err)
+            continue
+        m_max = ent["m_max"]
+        bound = 1 << 30 if m_max is None else m_max
+        prev = seen.get(bool(ent["naive"]), -1)
+        if bound <= prev:
+            logger.warning(
+                "moe-megakernel: tree table %s — ordre des bornes violé "
+                "(entrée #%d m_max=%s après %d, même régime naive=%s) — "
+                "table entière rejetée (l'ordre EST la sémantique)",
+                source, idx, m_max, prev, ent["naive"])
+            return None
+        seen[bool(ent["naive"])] = bound
+        good.append(ent)
+    if entries and not good:
+        logger.warning("moe-megakernel: tree table %s — aucune entrée valide",
+                       source)
+        return None
+    return good
 
 
 def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
@@ -442,12 +555,17 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
         return tree_default_config(M, naive, "repli:knob-off")
     table, source = get_tree_config_table(E, I)
     if table is None:
-        _log_once(
-            f"mk-tree-table-miss-{E}-{I}",
-            "[moe-megakernel] tree table absente (%s) — config r10 (repli)",
-            source,
-        )
-        return tree_default_config(M, naive, "repli:table-absente")
+        if not source.startswith("repli:"):
+            _log_once(
+                f"mk-tree-table-miss-{E}-{I}",
+                "[moe-megakernel] tree table absente (%s) — config r10 "
+                "(repli)",
+                source,
+            )
+            return tree_default_config(M, naive, "repli:table-absente")
+        # déjà logué par le chargeur (table-illisible/invalide) — la source
+        # porte déjà le préfixe repli: et le chemin fautif
+        return tree_default_config(M, naive, source)
     entries = table.get(K)
     if not entries:
         logger.warning_once(
@@ -455,11 +573,8 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
             "(repli)", K, source)
         return tree_default_config(M, naive, "repli:k-absent")
     for ent in entries:
-        if not _tree_entry_ok(ent):
-            logger.warning_once(
-                "moe-megakernel: entrée de tree table invalide (%s) — "
-                "config r10 (repli)", source)
-            return tree_default_config(M, naive, "repli:entree-invalide")
+        # entrées VALIDÉES au chargement (revue 2026-10-30 : une entrée
+        # invalide d'un autre régime ne doit pas décider de celui-ci)
         if bool(ent["naive"]) != naive:
             continue
         if ent["m_max"] is not None and M > ent["m_max"]:
@@ -468,6 +583,9 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
             ent["BM"], ent["BKO"], ent["CI"], ent["nw1"], ent["ns1"],
             ent["BN2"], ent["LOCAL_TILES"], ent["nw2"], ent["ns2"],
             "table")
+    logger.warning_once(
+        "moe-megakernel: tree table sans entrée pour M=%d naive=%s (%s) — "
+        "config r10 (repli entree-absente)", M, naive, source)
     return tree_default_config(M, naive, "repli:entree-absente")
 
 
@@ -1923,6 +2041,11 @@ def fused_moe_megakernel(
             "tree: sortie bf16 contiguë requise (contrat moe_sum livré)")
         assert I & (I - 1) == 0, (
             f"tree: I={I} doit être une puissance de 2 (tuile pleine-I)")
+        # CI ∤ I = corruption silencieuse (stores pass1 hors rangée —
+        # revues 2026-10-30) ; la sélection le refuse déjà, c'est la garde
+        # en profondeur pour tout appel direct du launcher.
+        assert I % CI == 0, (
+            f"tree: CI={CI} doit diviser I={I} (garde table/sélection)")
         # mid_ws = intermédiaire post-silu [M·topk, I] (L2-hot, lu par
         # les tuiles K) — fp32, ou bf16 si MK_TREE_MID_BF16 (même contrat
         # de quant per-token, arrondi bf16 post-silu) ; ws = rangées de
@@ -1968,16 +2091,18 @@ def fused_moe_megakernel(
             grid_blocks, triton.cdiv(n_tiles, local_tiles))
         # PREUVE DE BRANCHEMENT du régime (revue deepseek M1) : une ligne
         # par régime exécuté, avec la config RÉELLEMENT lancée (BM/CI
-        # compris) et sa SOURCE (table | repli:…) — le wall la lit ; un
-        # canari de test vérifie qu'elle porte la config consommée
-        # (test_tree_launch_regime_log_canary).
+        # EFFECTIF compris — pas la valeur brute de la table) et sa SOURCE
+        # (table | repli:…) — le wall la lit ; un canari de test vérifie
+        # qu'elle porte la config consommée (test_tree_launch_regime_log_canary).
+        # La clé porte M ET naive (revue mimo : deux régimes résolvant vers
+        # la même config ne doivent produire qu'UNE ligne par régime).
         _log_once(
-            f"mk-tree-regime-{tcfg.BM}-{tcfg.CI}-{tcfg.BKO}-{tcfg.BN2}-"
-            f"{local_tiles}-{tcfg.nw1}-{tcfg.ns1}-{tcfg.nw2}-{tcfg.ns2}-"
-            f"{tcfg.source}",
+            f"mk-tree-regime-{M}-{int(naive)}-{tcfg.BM}-{CI}-{tcfg.BKO}-"
+            f"{tcfg.BN2}-{local_tiles}-{tcfg.nw1}-{tcfg.ns1}-{tcfg.nw2}-"
+            f"{tcfg.ns2}-{tcfg.source}",
             "[moe-megakernel] tree regime M=%d naive=%s BM=%d CI=%d BN2=%d "
             "LOCAL_TILES=%s nw1/ns1=%d/%d nw2/ns2=%d/%d src=%s",
-            M, naive, tcfg.BM, tcfg.CI, tcfg.BN2, local_tiles,
+            M, naive, tcfg.BM, CI, tcfg.BN2, local_tiles,
             tcfg.nw1, tcfg.ns1, tcfg.nw2, tcfg.ns2, tcfg.source,
         )
         qwen3_moe_mk_tree_pass2_kernel[grid2](

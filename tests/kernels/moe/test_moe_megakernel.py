@@ -198,8 +198,15 @@ def test_determinism_run_to_run(strategy):
     assert float(diff / scale) < 2e-3, f"run-to-run drift {diff}"
 
 
-def test_fallback_reasons():
-    """Chaque condition d'inéligibilité renvoie une raison (repli explicite)."""
+def test_fallback_reasons(monkeypatch):
+    """Chaque condition d'inéligibilité renvoie une raison (repli explicite).
+    ⚠ Contexte épinglé (revue deepseek M5, 2026-10-30) : ce test juge les
+    raisons GÉNÉRIQUES ; la stratégie fuieuse d'un test précédent (classe
+    « fuites d'env ») activait la règle de couverture tree (forme hors
+    référence) — qui juge une autre couche et avait changé la raison
+    d'échec de ce test sans que le classcheck ne le voie."""
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_STRATEGY", "atomic")
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     M, top_k, E, I, K = 2, 8, 16, 32, 512
     x, w1, w2, w1s, w2s, ids, _ = make_problem(M, top_k, E, I, K)
     xq = x.to(torch.int8)
@@ -289,8 +296,14 @@ def test_grouped_contract_real_shapes(M, strategy):
     from vllm.model_executor.layers.fused_moe.fused_moe import (
         _prepare_expert_assignment,
     )
+    # BM = celui de la SÉLECTION (revue mimo N9 : un 16 en dur casserait en
+    # faux positif le jour où une entrée de table porterait BM≠16)
+    from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+        moe_megakernel_align_block_m,
+    )
     sorted_ids, expert_ids, _ = _prepare_expert_assignment(
-        ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
+        ids, {"BLOCK_SIZE_M": moe_megakernel_align_block_m(
+            M, naive, E, I, K)}, M, top_k, E, None)
     ref = reference_chain(x, w1, w2, w1s, w2s, ids, wts, naive=False)
 
     out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
@@ -1444,9 +1457,15 @@ def _tree_set_gates(strategy="tree", max_tokens="128"):
     # y compris les gates de prologue qui fuient depuis les tests INC 1-3
     # (ROUTING/NORM/AR laissées à 1 par un test précédent = le site entre en
     # mode routing et demande router_w — pollution d'ordre de suite).
+    # ⚠ TREE_TABLE est épinglé à 1 : les tests tournent DANS le pod, dont
+    # l'environnement de processus porte l'ENV DU BRAS (mesuré 2026-10-30 :
+    # le bras B4r porte TREE_TABLE=0, qui faisait tout le suite basculer en
+    # repli:knob-off — classe « fuites d'env » à l'envers).  Contexte de
+    # test = table activée ; les tests de knob posent 0 explicitement.
     os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
     os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = strategy
     os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = max_tokens
+    os.environ["VLLM_MOE_MEGAKERNEL_TREE_TABLE"] = "1"
     for name in ("VLLM_MOE_MEGAKERNEL_ROUTING", "VLLM_MOE_MEGAKERNEL_NORM",
                  "VLLM_MOE_MEGAKERNEL_AR"):
         os.environ[name] = "0"
@@ -1454,6 +1473,7 @@ def _tree_set_gates(strategy="tree", max_tokens="128"):
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_STRATEGY = strategy
     envs.VLLM_MOE_MEGAKERNEL_MAX_TOKENS = int(max_tokens)
+    envs.VLLM_MOE_MEGAKERNEL_TREE_TABLE = True
     envs.VLLM_MOE_MEGAKERNEL_ROUTING = False
     envs.VLLM_MOE_MEGAKERNEL_NORM = False
     envs.VLLM_MOE_MEGAKERNEL_AR = False
@@ -2331,9 +2351,14 @@ def test_tree_poisoned_workspaces_no_gaps(monkeypatch):
 # de tuiles (poison NaN, leçon tile0).
 # ===========================================================================
 @pytest.fixture(autouse=True)
-def _tree_table_cache_fresh():
-    """Isolation du cache de tables entre tests (un cache périmé ferait
-    lire la table d'un test précédent — leçon de fixture partagée)."""
+def _tree_table_cache_fresh(monkeypatch):
+    """Isolation du cache de tables ET du contexte d'env entre tests (un
+    cache périmé ferait lire la table d'un test précédent — leçon de
+    fixture partagée).  ⚠ Le knob est ÉPINGLÉ à 1 : les tests tournent dans
+    le pod, dont l'env de processus porte l'ENV DU BRAS (mesuré 2026-10-30 :
+    bras B4r = TREE_TABLE=0 → tout le suite basculait en repli:knob-off).
+    Les tests de knob posent 0 explicitement par-dessus."""
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "1")
     mkmod.tree_config_cache_clear()
     yield
     mkmod.tree_config_cache_clear()
@@ -2403,12 +2428,29 @@ def test_tree_table_selection_and_fallback(monkeypatch, tmp_path):
     # repli 3 : K absent de la table
     cfg = mkmod.tree_select_config(32, False, 256, 256, 1024)
     assert cfg.source == "repli:k-absent"
-    # repli 4 : entrée invalide (champ manquant) => repli + warning
+    # repli 4 : entrée invalide (champ manquant) — écartée À L'ENTRÉE avec
+    # un warning nommant index + champ, SANS décider du sort des autres
+    # régimes (revue mimo : « une entrée non concernée ne doit jamais
+    # décider du sort d'un régime ») : ici l'entrée NAIVE est cassée, le
+    # GROUPED survit ; le régime cassé tombe sur le repli r10.
     bad = [dict(_TBL[0]), dict(_TBL[1])]
-    bad[1].pop("nw2")
+    bad[0].pop("nw2")       # entrée naive cassée
     _write_tree_table(monkeypatch, tmp_path, {"2048": bad})
     cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
-    assert cfg.source == "repli:entree-invalide"
+    assert cfg.source == "table", (
+        f"l'entrée invalide naive a empoisonné le régime grouped: "
+        f"{cfg.source}")
+    cfg = mkmod.tree_select_config(8, True, 256, 256, 2048)
+    assert cfg.source == "repli:entree-absente", (
+        f"le régime de l'entrée cassée doit replier: {cfg.source}")
+    # repli 4b : table où TOUTES les entrées sont invalides => table
+    # rejetée (repli table-invalide) — jamais une table vide prétendue saine
+    both_bad = [dict(_TBL[0]), dict(_TBL[1])]
+    both_bad[0].pop("nw2")
+    both_bad[1].pop("ns2")
+    _write_tree_table(monkeypatch, tmp_path, {"2048": both_bad})
+    cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert cfg.source.startswith("repli:table-invalide"), cfg.source
     # repli 5 : aucune entrée du régime (table que naive, appel grouped)
     _write_tree_table(monkeypatch, tmp_path, {"2048": [dict(_TBL[0])]})
     cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
@@ -2543,14 +2585,24 @@ def test_tree_table_align_grille_guard_mutation(monkeypatch, tmp_path):
 
 def _shipped_table_params():
     """Entrées de table LIVRÉES × shapes réelles — les configs retenues du
-    sweep.  Sans table installée, un paramètre synthétique (config r10)
-    garde le test vivant (chemin de repli lui aussi exigible) — sur un M où
-    la config r10 COMPILE : à I=512 le régime M≥40 (BN2=128/ns=3) déborde
-    le LDS (mesuré 2026-10-30), d'où la couverture par repli standard."""
+    sweep, testées aux DEUX EXTRÉMITÉS de chaque régime (revue mimo : un
+    seul M par entrée sous-estime la couverture).  La table livrée doit
+    EXISTER avec ses 4 entrées attendues — sinon le test dériverait des
+    paramètres synthétiques et comparerait r10 à lui-même (revue deepseek
+    M10 : une tautologie verte ne prouve rien).  Sans table pour la forme
+    secondaire (E=128,I=512 — repli chaîne standard, choix opérateur), le
+    paramètre synthétique garde le chemin de repli vivant, sur un M où la
+    config r10 COMPILE (à I=512 le régime M≥40 déborde le LDS)."""
     params = []
     for E, I in ((256, 256), (128, 512)):
         table, _src = mkmod.get_tree_config_table(E, I)
+        if I == 256:
+            assert table is not None and len(table.get(2048, [])) == 4, (
+                f"table livrée attendue (4 entrées K=2048) absente pour "
+                f"E={E},I={I} — le test deviendrait tautologique: "
+                f"{None if table is None else list(table)}")
         entries = ((table or {}).get(2048) or [None])
+        prev: dict[bool, int] = {}
         for ent in entries:
             if ent is None:
                 params.append((E, I, 128 if I == 256 else 32, None,
@@ -2558,14 +2610,18 @@ def _shipped_table_params():
                 continue
             naive = bool(ent["naive"])
             m_max = ent["m_max"]
+            low = max(prev.get(naive, 0) + 1, 1 if naive else E // (8 * 4) + 1)
+            high = m_max if m_max is not None else (256 if I == 256 else 128)
             if naive:
-                M = min(m_max or 8, max(1, E // (8 * 4)))
+                high = min(high, max(1, E // (8 * 4)))
             else:
-                M = m_max if m_max is not None else 192
-                M = max(M, E // (8 * 4) + 1)
-                if m_max is not None and M > m_max:
-                    continue    # entrée non atteignable pour cette forme
-            params.append((E, I, M, ent, f"E{E}-I{I}-{naive}-{m_max}"))
+                low = max(low, E // (8 * 4) + 1)
+            prev[naive] = m_max if m_max is not None else high
+            if low > high:
+                continue    # entrée non atteignable pour cette forme
+            for M in dict.fromkeys((low, high)):
+                params.append((E, I, M, ent,
+                               f"E{E}-I{I}-{naive}-{m_max}-{M}"))
     return params
 
 
@@ -2730,3 +2786,82 @@ def test_tree_forme_non_couverte_repli_standard(monkeypatch, tmp_path):
                       {"2048": [dict(_TBL[1])]}, E=128, I=512)
     assert elig(32, 128, 512, 2048) is None, (
         "I=512 avec table couvrante doit être éligible")
+
+
+def test_tree_table_entry_validation_classes(monkeypatch, tmp_path):
+    """Validation de table au CHARGEMENT (revues adversariales 2026-10-30) :
+    chaque classe de défaut refuse l'entrée (warning nommant index + champ)
+    sans empoisonner les autres régimes, et les défauts STRUCTURELS rejettent
+    la table entière.  Mutants : chaque défaut ci-dessous est une table qui
+    passerait sans la validation — CI∤I corrompait silencieusement, le
+    budget LDS cassait au compile, le 1-D naive régressait c1 de +37 %."""
+    good = dict(_TBL[1])          # grouped, m_max=40
+
+    def sel():
+        mkmod.tree_config_cache_clear()
+        return mkmod.tree_select_config(32, False, 256, 256, 2048)
+
+    def sel_naive():
+        mkmod.tree_config_cache_clear()
+        return mkmod.tree_select_config(8, True, 256, 256, 2048)
+
+    # 1. CI non puissance de 2 (≠ diviseur de I) => entrée écartée ; table
+    # d'une SEULE entrée invalide => table rejetée (aucune entrée valide)
+    e = dict(good, CI=48)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 2. naive avec LOCAL_TILES != 1 => écartée (piège 1-D naive, +37 % M=1)
+    e = dict(_TBL[0], LOCAL_TILES=None)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel_naive().source.startswith("repli:table-invalide")
+    # 3. non puissance de 2 (BM=48) => écartée (tl.arange l'exige)
+    e = dict(good, BM=48)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 4. budget LDS pass2 dépassé => écartée (OutOfResources au compile)
+    e = dict(good, BN2=256, ns2=3)   # (3-1)*256*256 = 131072 > 65536
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 5. budget LDS pass1 dépassé => écartée (ns1=3 = « Required 98304 »)
+    e = dict(good, ns1=3)            # (3-1)*256*64*3 = 98304 > 65536
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 6. entrée valide + entrée cassée : la valide SURVIT (isolation de
+    # régime — revue mimo « une entrée non concernée ne décide de rien »),
+    # le régime cassé tombe sur repli:entree-absente
+    e = dict(good, CI=48)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [dict(_TBL[0]), e]})
+    cfg = sel_naive()
+    assert cfg.source == "table", (
+        f"l'entrée naive valide a été empoisonnée: {cfg.source}")
+    assert sel().source == "repli:entree-absente"   # grouped cassé => repli
+    # 7. ordre des bornes violé => table entière rejetée (l'ordre EST la
+    # sémantique de sélection)
+    inv = [dict(_TBL[1], m_max=100), dict(_TBL[2], m_max=50)]
+    _write_tree_table(monkeypatch, tmp_path, {"2048": inv})
+    assert sel().source.startswith("repli:table-invalide")
+    # 8. m_max=null en tête masque tout => rejeté (même garde d'ordre)
+    inv = [dict(_TBL[2]), dict(_TBL[1])]
+    _write_tree_table(monkeypatch, tmp_path, {"2048": inv})
+    assert sel().source.startswith("repli:table-invalide")
+
+
+def test_tree_table_corrupt_file_falls_back(monkeypatch, tmp_path):
+    """Pannes de FICHIER = repli logué, jamais une exception dans la
+    forward (revues deepseek M4/mimo : le contrat « la table ne casse jamais
+    le chemin mesuré » couvre les fichiers — JSON tronqué sur ce nœud est un
+    scénario réel, pas théorique).  Mutant : sans le try/except, chaque cas
+    ci-dessous tue la première forward."""
+    name = mkmod.tree_config_file_name(256, 256)
+    monkeypatch.setenv("VLLM_TUNED_CONFIG_FOLDER", str(tmp_path))
+    for label, content in (
+            ("json tronqué", '{"2048": [{"m_max"'),
+            ("clé non-entière", '{"version": 2, "2048": []}'),
+            ("racine non-dict", '[1, 2, 3]'),
+            ("entrée non-dict", '{"2048": [42]}')):
+        (tmp_path / name).write_text(content)
+        mkmod.tree_config_cache_clear()
+        cfg = mkmod.tree_select_config(32, False, 256, 256, 2048)
+        assert cfg.source.startswith("repli:"), f"{label}: {cfg.source}"
+        assert cfg == mkmod.tree_default_config(32, False, cfg.source), (
+            f"{label}: le repli doit être la config r10 exacte")

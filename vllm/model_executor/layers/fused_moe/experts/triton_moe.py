@@ -677,6 +677,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             moe_megakernel_enabled,
             moe_megakernel_flags,
             moe_megakernel_record_call,
+            tree_select_config,
         )
 
         if not moe_megakernel_enabled():
@@ -800,7 +801,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             cache3=cache3,
         )
         moe_megakernel_record_call(
-            f"bras:{moe_megakernel_strategy()}", M, naive)
+            f"bras:{moe_megakernel_strategy()}"
+            + (f"@{tree_select_config(M, naive, w1.size(0), w2.size(2), w1.size(2)).source}"
+               if moe_megakernel_strategy() == "tree" else ""),
+            M, naive)
         return True
 
     def moe_sum(
