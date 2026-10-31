@@ -198,7 +198,7 @@ def test_determinism_run_to_run(strategy):
     assert float(diff / scale) < 2e-3, f"run-to-run drift {diff}"
 
 
-def test_fallback_reasons(monkeypatch):
+def test_fallback_reasons(monkeypatch, clean_megakernel_env):
     """Chaque condition d'inéligibilité renvoie une raison (repli explicite).
     ⚠ Contexte épinglé (revue deepseek M5, 2026-10-30) : ce test juge les
     raisons GÉNÉRIQUES ; la stratégie fuieuse d'un test précédent (classe
@@ -362,18 +362,25 @@ def test_eligibility_max_tokens_env(monkeypatch):
     os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "8"
 
 
-def test_scale_layout_3d_contract():
+def test_scale_layout_3d_contract(monkeypatch, clean_megakernel_env):
     """Layout réel du checkpoint quark int8 MoE : échelles per-channel en
     3-D [E, N, 1] (« 2D -> 3D for the int8 MoE kernel », quark_moe.py).
 
     ⚠ Leçon 2026-10-29 (gate muette n°2) : le bras entier repliait
     silencieusement sur ce décalage — les tests utilisaient des échelles
     2-D synthétiques et le checkpoint réel n'avait JAMAIS été exercé.  Ce
-    test exige la SORTIE IDENTIQUE aux deux layouts (la normalisation est
-    un changement de vue, pas de valeur).
+    test exige que la normalisation ne change pas la VALEUR.
+
+    ⚠ Leçon 2026-10-31 (flaky 2/3 rouge mesuré) : la stratégie `atomic`
+    accumule par CAS — l'ordre est NON DÉTERMINISTE run-to-run, donc un
+    « bit-identique entre deux runs » est inexécutable par construction
+    (deux runs du MÊME layout divergent déjà d'1 ULP).  Le contrat se juge
+    donc contre le BRUIT run-to-run du même layout (borné ici), pas bit à
+    bit entre deux runs non déterministes — la mutation (normalisation qui
+    change la valeur) sort du bruit et reste rouge.
     """
-    os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
-    os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = "atomic"
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL", "1")
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_STRATEGY", "atomic")
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_STRATEGY = "atomic"
@@ -391,19 +398,31 @@ def test_scale_layout_3d_contract():
             ids, {"BLOCK_SIZE_M": 16}, M, top_k, E, None)
 
     outs = []
+    noise = {}
     for scales3d in (False, True):
         w1s_i = w1s.unsqueeze(-1).contiguous() if scales3d else w1s
         w2s_i = w2s.unsqueeze(-1).contiguous() if scales3d else w2s
         assert (w1s_i.dim() == 3) == scales3d
-        out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
-        fused_moe_megakernel(
-            out, x, w1, w2, wts, ids, None, w1s_i, w2s_i,
-            naive=naive, sorted_token_ids=sorted_ids, expert_ids=expert_ids)
-        torch.cuda.synchronize()
-        outs.append(out)
-    # normalisation = vue, pas valeur : sorties BIT-identiques
-    diff = (outs[0].float() - outs[1].float()).abs().max()
-    assert float(diff) == 0.0, f"3-D layout diverge de 2-D : {diff}"
+        runs = []
+        for _ in range(2):   # 2 runs/layout = le bruit run-to-run (CAS)
+            out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+            fused_moe_megakernel(
+                out, x, w1, w2, wts, ids, None, w1s_i, w2s_i,
+                naive=naive, sorted_token_ids=sorted_ids,
+                expert_ids=expert_ids)
+            torch.cuda.synchronize()
+            runs.append(out)
+        noise[scales3d] = float(
+            (runs[0].float() - runs[1].float()).abs().max())
+        outs.append(runs[0])
+    # normalisation = vue, pas valeur : l'écart layout doit rester DANS le
+    # bruit run-to-run du même layout (stratégie atomic non déterministe)
+    layout = float((outs[0].float() - outs[1].float()).abs().max())
+    bound = max(noise[False], noise[True])
+    assert layout <= bound, (
+        f"3-D layout diverge AU-DELÀ du bruit run-to-run : layout={layout} "
+        f"bruit 2-D={noise[False]} 3-D={noise[True]} — la normalisation "
+        "changerait la VALEUR, pas seulement la vue")
     assert outs[0].abs().max() > 0
 
 
@@ -430,7 +449,7 @@ def test_scales_ok_predicate():
     assert n.shape == w1s.shape and n.is_contiguous()
 
 
-def test_fallback_is_shipped_path(monkeypatch):
+def test_fallback_is_shipped_path(monkeypatch, clean_megakernel_env):
     """Gate OFF : TritonExperts.apply ne doit PAS toucher le megakernel."""
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = False
@@ -528,7 +547,8 @@ def _torch_softmax_topk(x_bf16, router_w, top_k):
     (1, 8, 256, 256, 2048),   # c1 réel TP=2
     (4, 8, 64, 64, 512),
 ])
-def test_increment1_routing_vs_shipped(M, top_k, E, I, K):
+def test_increment1_routing_vs_shipped(M, top_k, E, I, K,
+                                       clean_megakernel_env):
     """Incrément 1 : le kernel calcule router+topk lui-même.
 
     Deux contrats vérifiés séparément (pour ne pas confondre un basculement
@@ -939,7 +959,7 @@ def test_increment2_res_out_must_not_alias():
         )
 
 
-def test_gate_stacking_requires_routing_and_norm():
+def test_gate_stacking_requires_routing_and_norm(clean_megakernel_env):
     """Empilement des gates (spec §6.2 : ROUTING → NORM → AR) — fail loud."""
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
@@ -977,7 +997,7 @@ def test_gate_stacking_requires_routing_and_norm():
             naive=True, router_w=rw, top_k_override=top_k, **common)
 
 
-def test_increment3_grid_bound_fails_loud():
+def test_increment3_grid_bound_fails_loud(clean_megakernel_env):
     """Plafond de co-résidence AR : au-delà de AR_MAX_CTAS le spin peut
     deadlock entre rangs (scheduling) — fail loud, l'appelant replie."""
     from vllm import envs
@@ -1009,7 +1029,8 @@ def test_increment3_grid_bound_fails_loud():
     assert _ar_max_ctas() <= 104  # résidence mesurée (borne dure)
 
 
-def test_engine_site_fallback_without_prologue_inputs(monkeypatch):
+def test_engine_site_fallback_without_prologue_inputs(
+        monkeypatch, clean_megakernel_env):
     """Le site d'appel moteur (TritonExperts.apply) n'a ni residual, ni
     poids de norm, ni poids de router, ni handles IPC : gates NORM/AR/
     ROUTING demandées => repli sur la chaîne livrée, ligne de log INCLUSE
@@ -1477,6 +1498,29 @@ def _tree_set_gates(strategy="tree", max_tokens="128"):
     envs.VLLM_MOE_MEGAKERNEL_ROUTING = False
     envs.VLLM_MOE_MEGAKERNEL_NORM = False
     envs.VLLM_MOE_MEGAKERNEL_AR = False
+
+
+@pytest.fixture()
+def clean_megakernel_env(monkeypatch):
+    """HERMÉTISME AU POD (leçon mesurée 2026-10-31, suite c128) :
+    `_env_flag/_env_str/_env_int` lisent ``os.environ`` EN PREMIER, et
+    l'env du processus du POD porte l'ENV DU BRAS
+    (``VLLM_MOE_MEGAKERNEL_STRATEGY=tree``, ``MAX_TOKENS=256`` — mesuré sur
+    le pod pdtesta).  Les tests qui posent les gates dans le canal de test
+    (``envs``) ne sont donc JAMAIS lus tant que ces clés existent dans
+    os.environ — 8 tests basculaient de chemin sans le savoir (classe
+    « fuites d'env », déjà rencontrée à l'envers le 2026-10-30).
+
+    Ce fixture RETIRE les clés du bras (monkeypatch = revertible) pour que
+    le canal ``envs`` de chaque test soit effectivement lu.  Les tests qui
+    pilotent os.environ explicitement (``_tree_set_gates``) n'ont pas besoin
+    de ce fixture et restent inchangés."""
+    for k in ("VLLM_MOE_MEGAKERNEL", "VLLM_MOE_MEGAKERNEL_STRATEGY",
+              "VLLM_MOE_MEGAKERNEL_MAX_TOKENS",
+              "VLLM_MOE_MEGAKERNEL_TREE_TABLE",
+              "VLLM_MOE_MEGAKERNEL_ROUTING", "VLLM_MOE_MEGAKERNEL_NORM",
+              "VLLM_MOE_MEGAKERNEL_AR", "VLLM_MOE_MEGAKERNEL_INT8_OUT"):
+        monkeypatch.delenv(k, raising=False)
 
 
 def _tree_problem(M, top_k, E, I, K, scale_3d=True):
@@ -2549,6 +2593,58 @@ def test_tree_table_entry_fields_consumed(monkeypatch, tmp_path, caplog):
         assert token in regime[-1], f"{token} absent de {regime[-1]}"
 
 
+def test_tree_table_chain_dispatch_consumed(monkeypatch, tmp_path):
+    """DISPATCH MIXTE (campagne c128 2026-10-31) — canari de CONSOMMATION
+    du champ `chain` : une entrée `chain=standard` doit faire replier
+    `moe_megakernel_eligible` sur la chaîne livrée (raison STABLE
+    `table:chaine-livree`) ; une entrée que la gate ignorerait relancerait
+    le tree silencieusement (le résidu c128 +2,2 % reviendrait sans signe).
+    Les BORNES de l'entrée sont consommées aussi (M=32 tree / M=128
+    dispatch).  Garde des champs morts : une entrée standard qui porterait
+    de la config est REJETÉE au chargement (champ non consommé = piège
+    muet — l'invariant « tout champ présent est consommé » tient)."""
+    cfg_ent = {"m_max": 32, "naive": False, "BM": 16, "BKO": 256, "CI": 64,
+               "nw1": 2, "ns1": 1, "BN2": 64, "LOCAL_TILES": None,
+               "nw2": 2, "ns2": 1}
+    std_ent = {"m_max": None, "naive": False, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path,
+                      {"2048": [dict(cfg_ent), dict(std_ent)]})
+    _tree_set_gates()
+
+    def elig(M):
+        x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+            M, 8, 256, 256, 2048)
+        return mkmod.moe_megakernel_eligible(
+            x, w1, w2, ids,
+            use_int8_w8a8=True, per_act_token_quant=True,
+            block_shape=None, quantization_emulation=False,
+            activation_is_silu=True, clamp_limit_is_none=True,
+            has_lora=False, has_bias=False, expert_map=None,
+            apply_router_weight_on_input=False, a1q_scale=None)
+
+    # borne de l'entrée consommée : M=32 (entrée tree) => tree éligible
+    assert elig(32) is None, "l'entrée tree M<=32 doit rester éligible"
+    # M=128 => l'entrée standard DISPATCHE (chain consommé par la gate)
+    assert elig(128) == "table:chaine-livree", (
+        "le champ chain=standard n'est pas consommé par la gate — le tree "
+        "relancerait silencieusement sur le régime dispatché")
+    # sélection : la config porte bien chain (les deux côtés)
+    sel = mkmod.tree_select_config(128, False, 256, 256, 2048)
+    assert sel.chain == "standard" and sel.source == "table"
+    sel = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert sel.chain == "tree" and sel.source == "table"
+    # garde des champs morts : chain=standard + config => entrée écartée
+    bad = dict(std_ent, BM=16)
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [dict(cfg_ent), bad]})
+    mkmod.tree_config_cache_clear()
+    sel = mkmod.tree_select_config(128, False, 256, 256, 2048)
+    assert sel.source == "repli:entree-absente", (
+        f"une entrée standard à config morte aurait dû être écartée: {sel}")
+    # l'entrée valide n'est pas empoisonnée (isolation de régime)
+    sel = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert sel.source == "table" and sel.chain == "tree"
+
+
 def test_tree_table_align_grille_guard_mutation(monkeypatch, tmp_path):
     """MUTANT du double appel (site align ↔ launcher grille) : si le tri
     grouped n'utilise PAS le BM de la sélection, la grille ne mappe pas les
@@ -2650,6 +2746,8 @@ def _ids_for_bm(M, top_k, E, I, K, bm, prob=None):
 def _cfg_from_entry(ent):
     if ent is None:
         return None   # repli : sélection du launcher (config r10)
+    if ent.get("chain", "tree") == "standard":
+        return "standard"   # entrée de DISPATCH — pas de config tree
     return mkmod.TreeTileConfig(
         ent["BM"], ent["BKO"], ent["CI"], ent["nw1"], ent["ns1"],
         ent["BN2"], ent["LOCAL_TILES"], ent["nw2"], ent["ns2"], "table")
@@ -2667,6 +2765,16 @@ def test_tree_table_shipped_contract_and_bits(E, I, M, ent, tag):
     _tree_set_gates()
     top_k, K = 8, 2048
     cfg = _cfg_from_entry(ent)
+    if cfg == "standard":
+        # CONTRAT d'une entrée de DISPATCH (campagne c128 2026-10-31) : pas
+        # de pipeline tree — la sélection porte chain=standard et la gate
+        # replie la chaîne livrée (consommation prouvée par
+        # test_tree_table_chain_dispatch_consumed).  Ici : la table LIVRÉE
+        # porte bien le dispatch à ce M (pas de config morte déguisée).
+        sel = mkmod.tree_select_config(M, M * top_k * 4 <= E, E, I, K)
+        assert sel.chain == "standard" and sel.source == "table", (
+            f"{tag}: entrée de dispatch non sélectionnée à M={M}: {sel}")
+        return
     r10 = mkmod.tree_default_config(M, M * top_k * 4 <= E, "repli:test")
     prob = _tree_problem(M, top_k, E, I, K, True)
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _ids_for_bm(
@@ -2697,6 +2805,10 @@ def test_tree_table_shipped_tile_coverage_poison(E, I, M, ent, tag):
     _tree_set_gates()
     top_k, K = 8, 2048
     cfg = _cfg_from_entry(ent)
+    if cfg == "standard":
+        # entrée de DISPATCH : pas de tuiles tree à couvrir (le chemin tree
+        # n'est pas lancé — cf. test_tree_table_chain_dispatch_consumed)
+        return
     bm = (cfg or mkmod.tree_default_config(M, M * top_k * 4 <= E,
                                            "repli:test")).BM
     prob = _tree_problem(M, top_k, E, I, K, True)
@@ -2844,6 +2956,26 @@ def test_tree_table_entry_validation_classes(monkeypatch, tmp_path):
     inv = [dict(_TBL[2]), dict(_TBL[1])]
     _write_tree_table(monkeypatch, tmp_path, {"2048": inv})
     assert sel().source.startswith("repli:table-invalide")
+    # 9. chain invalide => écartée
+    e = dict(good, chain="bogus")
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 10. chain=standard QUI PORTE de la config => écartée (champ mort :
+    # la chaîne livrée ne consomme pas BM/BN2/… — l'invariant « tout champ
+    # présent est consommé » interdit les deux à la fois)
+    e = dict(good, chain="standard")
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    assert sel().source.startswith("repli:table-invalide")
+    # 11. chain=standard SANS config => sélectionné (dispatch)
+    e = {"m_max": 40, "naive": False, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [e]})
+    cfg = sel()
+    assert cfg.source == "table" and cfg.chain == "standard"
+    # 12. entrée standard invalide n'empoisonne pas une entrée tree valide
+    e = {"m_max": 40, "naive": False, "chain": "standard", "BM": 16}
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [dict(_TBL[0]), e]})
+    cfg = sel_naive()
+    assert cfg.source == "table" and cfg.chain == "tree"
 
 
 def test_tree_table_corrupt_file_falls_back(monkeypatch, tmp_path):
