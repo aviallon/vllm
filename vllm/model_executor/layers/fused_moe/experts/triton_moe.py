@@ -723,11 +723,23 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             a1q_scale=a1q_scale,
         )
         if reason is not None:
-            logger.warning_once(
-                "moe-megakernel: repli sur la chain livree (%s)", reason
-            )
-            moe_megakernel_record_call(
-                f"repli:{reason}", hidden_states.size(0), None)
+            if reason == "table:chaine-livree":
+                # DISPATCH VOULU (table chain=standard) — pas un repli de
+                # panne : log dédié + compteur d'ATTRIBUTION de bras
+                # (revue mimo Q7, 2026-10-31 : « repli: » déformait
+                # l'attribution d'arm du wall et mettait une politique
+                # intentionnelle dans l'espace d'alerte des replis).
+                logger.warning_once(
+                    "moe-megakernel: dispatch table (table:chaine-livree) "
+                    "— chaine livree, M=%d", hidden_states.size(0))
+                moe_megakernel_record_call(
+                    "bras:standard@table", hidden_states.size(0), None)
+            else:
+                logger.warning_once(
+                    "moe-megakernel: repli sur la chain livree (%s)", reason
+                )
+                moe_megakernel_record_call(
+                    f"repli:{reason}", hidden_states.size(0), None)
             return False
         # echelles de poids per-channel exigees par le kernel (le contrat
         # per-channel est celui du chemin int8 per-token livre).  Layout

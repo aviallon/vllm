@@ -382,11 +382,20 @@ def tree_config_file_name(E: int, N: int) -> str:
 
 
 _TREE_TABLE_CACHE: dict[tuple[int, int], tuple[dict | None, str]] = {}
+# Mémo de SÉLECTION (revue deepseek Q7a, 2026-10-31) : la gate appelle
+# tree_select_config à CHAQUE site MoE (40/step) — le pont r12 a mesuré
+# ~1 % de wall sur un double appel sur ce chemin chaud.  La sélection est
+# documentée PURE (M, naive, E, I, K) : mémoïsée ici, clé = ses entrées +
+# la valeur RÉSOLUE du knob (un basculement de knob doit changer le
+# résultat — sinon le bras r10/knob-off serait empoisonné par le cache).
+# Invalidé par tree_config_cache_clear (tests / table changée à chaud).
+_SELECT_MEMO: dict[tuple, TreeTileConfig] = {}
 
 
 def tree_config_cache_clear() -> None:
     """Vide le cache de tables (tests / changement de table à chaud)."""
     _TREE_TABLE_CACHE.clear()
+    _SELECT_MEMO.clear()
 
 
 def get_tree_config_table(E: int, N: int) -> tuple[dict | None, str]:
@@ -478,6 +487,10 @@ def _tree_entry_error(ent: Any, I: int) -> str | None:
       table déployée passe les tests GPU par entrée)."""
     if not isinstance(ent, dict):
         return "entrée non-dict"
+    for k in ent:
+        if k not in _ENTRY_KEYS and k != "comment":
+            return (f"clé inconnue: {k!r} (allowlist = _ENTRY_KEYS + "
+                    "comment — une typo deviendrait un champ muet)")
     for k in ("m_max", "naive"):
         if k not in ent:
             return f"champ manquant: {k}"
@@ -495,9 +508,11 @@ def _tree_entry_error(ent: Any, I: int) -> str | None:
         for k in _CFG_KEYS:
             if k not in ent:
                 return f"champ manquant: {k}"
-    for k in ("BM", "BKO", "CI", "nw1", "ns1", "BN2", "nw2", "ns2"):
+    for k in _CFG_KEYS:
         if k not in ent:
             continue    # entrée chain=standard (déjà validée ci-dessus)
+        if k == "LOCAL_TILES":
+            continue    # typé plus bas (None autorisé)
         v = ent[k]
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             return f"{k} doit être un entier >= 1 (got {v!r})"
@@ -536,25 +551,45 @@ def _tree_entry_error(ent: Any, I: int) -> str | None:
 
 
 def _tree_table_validate(entries: Any, I: int, source: str) -> list | None:
-    """Valide TOUTE la table au chargement (revues 2026-10-30 : une entrée
-    invalide ne doit jamais décider du sort d'un AUTRE régime — deepseek M8
-    « entrée invalide empoisonne tout »).  Entrées invalides : écartées UNE
-    PAR UNE avec un warning nommant l'index et le champ fautif.  Ordre :
-    `m_max` strictement croissant PAR GROUPE naive, `null` en dernier —
-    violation = table non fiable (ordre = sémantique de sélection) ⇒ table
-    entière rejetée (repli logué).  Retourne les entrées valides, ou None."""
+    """Valide TOUTE la table au chargement (revues adversariales
+    2026-10-30/31).  Entrées invalides : remplacées par une PIERRE
+    TOMBANTE conservant leur borne (`_tombstone`) — revue mimo BLOQUANT
+    2026-10-31 : sans elle, une entrée écartée fait HÉRITER sa plage à
+    l'entrée suivante (régime dispatché en silence, gain c32 perdu sans
+    signe).  La tombe occupe la plage : la sélection y tombe en repli r10
+    (chain=tree) au lieu de traverser.  Borne illisible = table entière
+    rejetée (l'ordre des bornes EST la sémantique).  Ordre : `m_max`
+    strictement croissant PAR GROUPE naive (y compris tombantes), `null`
+    en dernier.  Retourne les entrées (valides + tombantes), ou None."""
     if not isinstance(entries, list):
         logger.warning("moe-megakernel: tree table %s — K doit porter une "
                        "liste d'entrées (got %s)", source, type(entries))
         return None
     good = []
+    n_valid = 0
     seen: dict[bool, int] = {}
     for idx, ent in enumerate(entries):
         err = _tree_entry_error(ent, I)
         if err is not None:
             logger.warning("moe-megakernel: tree table %s — entrée #%d "
                            "écartée (%s)", source, idx, err)
-            continue
+            # pierre tombante : la plage de l'entrée écartée reste un TROU
+            # (repli r10) et n'hérite jamais à l'entrée suivante.
+            readable = (isinstance(ent, dict)
+                        and isinstance(ent.get("naive"), bool)
+                        and (ent.get("m_max") is None
+                             or (isinstance(ent.get("m_max"), int)
+                                 and not isinstance(ent.get("m_max"), bool)
+                                 and ent["m_max"] >= 1)))
+            if not readable:
+                logger.warning(
+                    "moe-megakernel: tree table %s — entrée #%d : borne "
+                    "m_max/naive illisible — table entière rejetée (une "
+                    "plage inconnue ne peut pas rester couverte)",
+                    source, idx)
+                return None
+            ent = {"m_max": ent["m_max"], "naive": ent["naive"],
+                   "_tombstone": True}
         m_max = ent["m_max"]
         bound = 1 << 30 if m_max is None else m_max
         prev = seen.get(bool(ent["naive"]), -1)
@@ -567,7 +602,9 @@ def _tree_table_validate(entries: Any, I: int, source: str) -> list | None:
             return None
         seen[bool(ent["naive"])] = bound
         good.append(ent)
-    if entries and not good:
+        if not ent.get("_tombstone"):
+            n_valid += 1
+    if entries and not n_valid:
         logger.warning("moe-megakernel: tree table %s — aucune entrée valide",
                        source)
         return None
@@ -584,8 +621,23 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
 
     Observabilité (leçon gate muette) : la config choisie est portée par la
     ligne `tree regime` du launcher (src=table|repli:…) et le chargement de
-    la table est logué une fois par forme."""
-    if not _env_flag("VLLM_MOE_MEGAKERNEL_TREE_TABLE"):
+    la table est logué une fois par forme.
+
+    Mémoïsée (revue deepseek Q7a) : appelée sur le chemin chaud (gate +
+    align + launcher = 3×/site MoE) — la pureté documentée de la fonction
+    rend le mémo sémantiquement neutre ; `tree_config_cache_clear` l'invalide."""
+    knob = _env_flag("VLLM_MOE_MEGAKERNEL_TREE_TABLE")
+    key = (M, naive, E, I, K, knob)
+    hit = _SELECT_MEMO.get(key)
+    if hit is None:
+        hit = _tree_select_config_impl(M, naive, E, I, K, knob)
+        _SELECT_MEMO[key] = hit
+    return hit
+
+
+def _tree_select_config_impl(M: int, naive: bool, E: int, I: int, K: int,
+                             knob: bool) -> TreeTileConfig:
+    if not knob:
         return tree_default_config(M, naive, "repli:knob-off")
     table, source = get_tree_config_table(E, I)
     if table is None:
@@ -613,6 +665,17 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
             continue
         if ent["m_max"] is not None and M > ent["m_max"]:
             continue
+        if ent.get("_tombstone"):
+            # PIERRE TOMBANTE (revue mimo BLOQUANT 2026-10-31) : l'entrée
+            # de cette plage a été écartée à la validation — la plage reste
+            # un TROU et tombe sur le repli r10 (chain=tree), jamais sur
+            # l'entrée suivante (un régime dispatché en silence tuerait le
+            # gain c32 sans aucun signe).
+            logger.warning_once(
+                "moe-megakernel: tree table sans entrée pour M=%d naive=%s "
+                "(plage d'une entrée écartée — trou, %s) — config r10 "
+                "(repli entree-absente)", M, naive, source)
+            return tree_default_config(M, naive, "repli:entree-absente")
         if ent.get("chain", "tree") == "standard":
             # entrée de DISPATCH : pas de config (non consommée — le chemin
             # tree est refusé par moe_megakernel_eligible AVANT tout
@@ -2081,6 +2144,14 @@ def fused_moe_megakernel(
         # poids — comme les tables livrées) avec repli garanti sur la config
         # r10 (tree_default_config).
         tcfg = tree_select_config(M, naive, w1.size(0), I, K)
+        # garde DISPATCH (revue deepseek Q2, 2026-10-31) : chain=standard est
+        # consommé par moe_megakernel_eligible AVANT tout lancement ; le
+        # launcher ne doit JAMAIS tourner pour un régime dispatché — un
+        # appel direct qui contournerait la gate relancerait le tree
+        # silencieusement là où le dispatch choisit la chaîne livrée.
+        assert tcfg.chain == "tree", (
+            f"tree: chain={tcfg.chain!r} — le launcher refuse un régime "
+            "dispatché vers la chaîne livrée (garde dispatch)")
         # compteur d'appels AVEC la source de config (revue deepseek M3 :
         # un bras placebo « table morte » serait indétectable sans elle).
         # Émis ICI (et non au site) : le sélecteur est déjà appelé — coût
