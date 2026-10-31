@@ -273,7 +273,7 @@ def test_grouped_mode():
 
 @pytest.mark.parametrize("strategy", ["pair", "atomic", "tree"])
 @pytest.mark.parametrize("M", [32, 128])
-def test_grouped_contract_real_shapes(M, strategy):
+def test_grouped_contract_real_shapes(M, strategy, monkeypatch):
     """Extension c32/c128 (mandat 2026-10-29) : régime grouped aux shapes
     locaux RÉELS TP=2 (E=256, I=256, K=2048, topk=8) — M=32 et M=128 tokens.
 
@@ -284,6 +284,9 @@ def test_grouped_contract_real_shapes(M, strategy):
     os.environ["VLLM_MOE_MEGAKERNEL"] = "1"
     os.environ["VLLM_MOE_MEGAKERNEL_STRATEGY"] = strategy
     os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "128"
+    # knob-off : la table LIVRÉE dispatche M=128 (chain=standard) depuis r14
+    # — ce test vise les KERNELS à ces M (config r10, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     from vllm import envs
     envs.VLLM_MOE_MEGAKERNEL = True
     envs.VLLM_MOE_MEGAKERNEL_STRATEGY = strategy
@@ -351,15 +354,21 @@ def test_eligibility_max_tokens_env(monkeypatch):
     envs.VLLM_MOE_MEGAKERNEL = True
     # retire l'ombre d'éventuels tests précédents (assignation d'attribut) :
     # le processus moteur, lui, n'assigne jamais — il lit via le getter.
-    monkeypatch.delattr(envs, "VLLM_MOE_MEGAKERNEL_MAX_TOKENS",
-                        raising=False)
+    # (pop direct : monkeypatch.delattr lève AttributeError quand la valeur
+    # vient du getter paresseux du module — mesuré 2026-10-31)
+    envs.__dict__.pop("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", None)
+    monkeypatch.delenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", raising=False)
+    # knob-off : la table LIVRÉE dispatche M=128 (chain=standard) depuis
+    # r14 — ce canari vise la lecture de l'ENV MAX_TOKENS, pas la table
+    # (sinon la raison observable serait le dispatch).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     # plafond historique 8 (défaut getter) : M=128 refusé
-    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "8"
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "8")
     assert elig() is not None
     # extension campagne : env 128 -> M=128 éligible (getter os.environ)
-    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "128"
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "128")
     assert elig() is None
-    os.environ["VLLM_MOE_MEGAKERNEL_MAX_TOKENS"] = "8"
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_MAX_TOKENS", "8")
 
 
 def test_scale_layout_3d_contract(monkeypatch, clean_megakernel_env):
@@ -404,7 +413,7 @@ def test_scale_layout_3d_contract(monkeypatch, clean_megakernel_env):
         w2s_i = w2s.unsqueeze(-1).contiguous() if scales3d else w2s
         assert (w1s_i.dim() == 3) == scales3d
         runs = []
-        for _ in range(2):   # 2 runs/layout = le bruit run-to-run (CAS)
+        for _ in range(3):   # 3 runs/layout = le bruit run-to-run (CAS)
             out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
             fused_moe_megakernel(
                 out, x, w1, w2, wts, ids, None, w1s_i, w2s_i,
@@ -1519,7 +1528,8 @@ def clean_megakernel_env(monkeypatch):
               "VLLM_MOE_MEGAKERNEL_MAX_TOKENS",
               "VLLM_MOE_MEGAKERNEL_TREE_TABLE",
               "VLLM_MOE_MEGAKERNEL_ROUTING", "VLLM_MOE_MEGAKERNEL_NORM",
-              "VLLM_MOE_MEGAKERNEL_AR", "VLLM_MOE_MEGAKERNEL_INT8_OUT"):
+              "VLLM_MOE_MEGAKERNEL_AR", "VLLM_MOE_MEGAKERNEL_INT8_OUT",
+              "VLLM_MOE_MEGAKERNEL_AR_MAX_CTAS"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -1817,6 +1827,16 @@ def test_tree_pipeline_matches_launcher(M, mid_bf16, monkeypatch):
     (monkeypatch) : si le launcher ignore la constante, ce test casse."""
     monkeypatch.setattr(mkmod, "MK_TREE_MID_BF16", mid_bf16)
     _tree_set_gates()
+
+    # knob-off : ces tests lancent le TREE à M>=33 avec la table LIVRÉE
+    # (qui dispatche chain=standard depuis r14) — ils visent les
+    # KERNELS, pas la table : config r10 (chain=tree, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
+
+    # knob-off : ces tests lancent le TREE à M>=33 avec la table LIVRÉE
+    # (qui dispatche chain=standard depuis r14) — ils visent les
+    # KERNELS, pas la table : config r10 (chain=tree, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
@@ -1833,7 +1853,7 @@ def test_tree_pipeline_matches_launcher(M, mid_bf16, monkeypatch):
 
 
 @pytest.mark.parametrize("M", [8, 32, 128])
-def test_tree_contract_real_shapes_and_3d_scales(M):
+def test_tree_contract_real_shapes_and_3d_scales(M, monkeypatch):
     """Contrat `tree` aux shapes RÉELS TP=2 (E=256, I=256, K=2048, topk=8)
     avec les échelles poids au LAYOUT RÉEL du checkpoint quark **[E, N, 1]
     3-D** — la forme qui a rendu le bras muet en 2026-10-29.  Deux
@@ -1841,6 +1861,11 @@ def test_tree_contract_real_shapes_and_3d_scales(M):
     (2) sortie BIT-IDENTIQUE 2-D vs 3-D (normalize_w_scale = vue, pas
     valeurs).  M=8 = régime naive, M=32/128 = grouped."""
     _tree_set_gates()
+
+    # knob-off : ces tests lancent le TREE à M>=33 avec la table LIVRÉE
+    # (qui dispatche chain=standard depuis r14) — ils visent les
+    # KERNELS, pas la table : config r10 (chain=tree, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s3, w2s3, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
@@ -1872,12 +1897,17 @@ def test_tree_contract_real_shapes_and_3d_scales(M):
 
 
 @pytest.mark.parametrize("M", [8, 32, 128])
-def test_tree_determinism_bit_exact(M):
+def test_tree_determinism_bit_exact(M, monkeypatch):
     """`tree` a un ordre de sommation FIXE : deux runs sont bit-identiques
     (strict — pas de tolérance ULP).  C'est un contrat NOMMÉ de `tree` que
     `atomic` ne peut pas tenir (somme flottante non-associative par
     atomiques)."""
     _tree_set_gates()
+
+    # knob-off : ces tests lancent le TREE à M>=33 avec la table LIVRÉE
+    # (qui dispatche chain=standard depuis r14) — ils visent les
+    # KERNELS, pas la table : config r10 (chain=tree, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     top_k, E, I, K = 8, 256, 256, 2048
     x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
         M, top_k, E, I, K)
@@ -2079,6 +2109,11 @@ def test_tree_launch_regime_log_canary(M, caplog, monkeypatch):
     import logging
 
     _tree_set_gates()
+
+    # knob-off : ces tests lancent le TREE à M>=33 avec la table LIVRÉE
+    # (qui dispatche chain=standard depuis r14) — ils visent les
+    # KERNELS, pas la table : config r10 (chain=tree, garde launcher).
+    monkeypatch.setenv("VLLM_MOE_MEGAKERNEL_TREE_TABLE", "0")
     calls: list[tuple] = []
     real = mkmod.tree_select_config
 
@@ -2643,6 +2678,156 @@ def test_tree_table_chain_dispatch_consumed(monkeypatch, tmp_path):
     # l'entrée valide n'est pas empoisonnée (isolation de régime)
     sel = mkmod.tree_select_config(32, False, 256, 256, 2048)
     assert sel.source == "table" and sel.chain == "tree"
+
+    # BORNES de régime consommées AU NIVEAU DE LA GATE (revue deepseek Q5c)
+    # : table façon livrée (tree ≤32 / standard 33-150 / standard ≥151)
+    std150_ent = {"m_max": 150, "naive": False, "chain": "standard"}
+    std2_ent = {"m_max": None, "naive": False, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path,
+                      {"2048": [dict(cfg_ent), std150_ent, std2_ent]})
+    mkmod.tree_config_cache_clear()
+    _tree_set_gates(max_tokens="256")   # enveloppe du wall (c256)
+    assert elig(32) is None
+    for m_edge in (33, 150, 151, 256):
+        assert elig(m_edge) == "table:chaine-livree", (
+            f"M={m_edge} devrait dispatcher (borne d'entrée non consommée)")
+    # entrée standard NAIVE : le régime naive dispatche lui aussi
+    naive_std = {"m_max": None, "naive": True, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [naive_std]})
+    mkmod.tree_config_cache_clear()
+    x_n, w1_n, w2_n, w1s_n, w2s_n, ids_n, wts_n, naive_n, sd_n, ed_n = (
+        _tree_grouped_ids(8, 8, 256, 256, 2048))
+    assert naive_n
+    assert mkmod.moe_megakernel_eligible(
+        x_n, w1_n, w2_n, ids_n,
+        use_int8_w8a8=True, per_act_token_quant=True,
+        block_shape=None, quantization_emulation=False,
+        activation_is_silu=True, clamp_limit_is_none=True,
+        has_lora=False, has_bias=False, expert_map=None,
+        apply_router_weight_on_input=False, a1q_scale=None,
+    ) == "table:chaine-livree"
+
+    # SITE-LEVEL (revue deepseek Q5b) : le canari ne s'arrête PAS à la gate
+    # — le site moteur doit réellement REMPLIR (le launcher n'est JAMAIS
+    # appelé) et loguer la raison de dispatch ; au-dessus de la borne, le
+    # même site lance bien le launcher (contrepoids positif).
+    import vllm.model_executor.layers.fused_moe.experts.triton_moe as tm
+    _write_tree_table(monkeypatch, tmp_path,
+                      {"2048": [dict(cfg_ent), std150_ent, std2_ent]})
+    mkmod.tree_config_cache_clear()
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tm.logger, "warning_once",
+        lambda msg, *a: seen.append(msg % a if a else msg))
+    launched = {"n": 0}
+    monkeypatch.setattr(
+        mkmod, "fused_moe_megakernel",
+        lambda *a, **k: launched.__setitem__("n", launched["n"] + 1))
+    exp = object.__new__(TritonExperts)
+    exp._lora_context = None
+    exp.quant_config = type("Q", (), {"use_int8_w8a8": True})()
+    monkeypatch.setattr(TritonExperts, "per_act_token_quant", True,
+                        raising=False)
+    monkeypatch.setattr(TritonExperts, "block_shape", None, raising=False)
+    monkeypatch.setattr(TritonExperts, "w1_bias", None, raising=False)
+    monkeypatch.setattr(TritonExperts, "w2_bias", None, raising=False)
+    exp.quantization_emulation = False
+    exp.activation_config = type("A", (), {"clamp_limit": None})()
+
+    def site(M_):
+        from vllm.model_executor.layers.fused_moe.activation import (
+            MoEActivation,
+        )
+        xs = torch.zeros(M_, 2048, device="cuda", dtype=torch.bfloat16)
+        w1s = torch.zeros(256, 512, 2048, device="cuda", dtype=torch.int8)
+        w2s = torch.zeros(256, 2048, 256, device="cuda", dtype=torch.int8)
+        idss = torch.zeros(M_, 8, device="cuda", dtype=torch.int32)
+        return exp._maybe_moe_megakernel(
+            None, xs, w1s, w2s, None, idss,
+            torch.ones(M_, 1, device="cuda"), None, False,
+            MoEActivation.SILU)
+
+    assert site(128) is False, (
+        "le site moteur doit replier sur la chaîne livrée à M=128")
+    assert launched["n"] == 0, (
+        "le launcher tree a tourné sur un régime dispatché — le dispatch "
+        "est une gate muette")
+    assert any("table:chaine-livree" in s for s in seen), (
+        f"la raison de dispatch n'a pas été loguée par le site: {seen}")
+    # (contrôle positif du launcher = le canari de champ + l'assert de garde
+    # dispatch dans le launcher ; le chemin site complet positif est couvert
+    # par test_fallback_is_shipped_path / test_tree_table_entry_fields_consumed)
+
+
+def test_tree_table_tombstone_hole_no_fallthrough(monkeypatch, tmp_path):
+    """BLOQUANT mimo (2026-10-31) : une entrée tree ÉCARTÉE à la validation
+    ne doit PAS faire hériter sa plage à l'entrée suivante — sinon c32
+    (M=9-32 grouped) bascule silencieusement sur chain=standard et le gain
+    −1,2 % disparaît sans aucun signe.  La pierre tombante garde la plage
+    en TROU : repli r10 (chain=tree) — et au-dessus du trou, le dispatch
+    fonctionne toujours."""
+    cfg_ent = {"m_max": 32, "naive": False, "BM": 16, "BKO": 256, "CI": 64,
+               "nw1": 2, "ns1": 1, "BN2": 64, "LOCAL_TILES": None,
+               "nw2": 2, "ns2": 1}
+    broken = dict(cfg_ent, m_max=150, CI=48)      # CI∤I => écartée
+    std_ent = {"m_max": None, "naive": False, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path,
+                      {"2048": [dict(cfg_ent), broken, std_ent]})
+    _tree_set_gates()
+    # dans la plage de l'entrée écartée (M=48..150) : TROU -> repli r10,
+    # JAMAIS chain=standard (le scénario BLOQUANT)
+    for M_hole in (48, 100, 150):
+        sel = mkmod.tree_select_config(M_hole, False, 256, 256, 2048)
+        assert sel.chain == "tree", (
+            f"M={M_hole} hérite chain=standard d'une entrée écartée — "
+            f"c32/le régime tree serait dispatché en silence: {sel}")
+        assert sel.source == "repli:entree-absente", (
+            f"M={M_hole} devrait tomber sur le repli r10 (trou): {sel}")
+    # au-dessus du trou : le dispatch fonctionne toujours
+    sel = mkmod.tree_select_config(200, False, 256, 256, 2048)
+    assert sel.chain == "standard" and sel.source == "table"
+    # le régime tree d'avant le trou n'est pas touché
+    sel = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert sel.chain == "tree" and sel.source == "table"
+
+
+def test_tree_table_unknown_key_rejected(monkeypatch, tmp_path):
+    """Allowlist de clés (revue mimo Q3) : une typo de clé (chn=, bm=)
+    devient un champ MUET — accepter les clés inconnues transformerait la
+    table en surface de bugs silencieux (une entrée « chain » typoïsée
+    n'est dispatchée par personne)."""
+    good = {"m_max": 40, "naive": False, "BM": 16, "BKO": 256, "CI": 64,
+            "nw1": 2, "ns1": 1, "BN2": 64, "LOCAL_TILES": None,
+            "nw2": 2, "ns2": 1}
+    typo = dict(good, m_max=80, chn="standard")     # « chain » typoïsé
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [good, typo]})
+    _tree_set_gates()
+    mkmod.tree_config_cache_clear()
+    # l'entrée typoïsée est écartée (allowlist) et sa plage reste un trou
+    sel = mkmod.tree_select_config(60, False, 256, 256, 2048)
+    assert sel.source == "repli:entree-absente", (
+        f"clé inconnue acceptée (ou traversée): {sel}")
+    sel = mkmod.tree_select_config(32, False, 256, 256, 2048)
+    assert sel.source == "table" and sel.chain == "tree"
+
+
+def test_tree_launcher_refuses_dispatched_regime(monkeypatch, tmp_path):
+    """Garde dispatch du LAUNCHER (revue deepseek Q2/mimo Q2) : un appel
+    direct à fused_moe_megakernel sur un régime dispatché doit ÉCHOUER
+    FORT (AssertionError) — sinon un futur site qui contournerait la gate
+    relancerait le tree silencieusement avec la config r10 inerte."""
+    std_ent = {"m_max": None, "naive": False, "chain": "standard"}
+    _write_tree_table(monkeypatch, tmp_path, {"2048": [std_ent]})
+    _tree_set_gates()
+    M, top_k, E, I, K = 128, 8, 256, 256, 2048
+    x, w1, w2, w1s, w2s, ids, wts, naive, sd, ed = _tree_grouped_ids(
+        M, top_k, E, I, K)
+    assert not naive
+    out = torch.zeros(M, K, device=x.device, dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="garde dispatch"):
+        fused_moe_megakernel(
+            out, x, w1, w2, wts, ids, None, w1s, w2s,
+            naive=naive, sorted_token_ids=sd, expert_ids=ed)
 
 
 def test_tree_table_align_grille_guard_mutation(monkeypatch, tmp_path):
