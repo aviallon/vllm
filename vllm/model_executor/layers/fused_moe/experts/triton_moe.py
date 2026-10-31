@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
     apply_moe_activation_supported,
@@ -63,6 +64,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+
+logger = init_logger(__name__)
 
 
 class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
@@ -300,6 +303,25 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 self.block_shape,
                 quantization_emulation=self.quantization_emulation,
             )
+
+        # --- Qwen3MoEMegakernel (campagne MEGAKERNEL MoE INT8 2026-10-27) ---
+        # Gate VLLM_MOE_MEGAKERNEL (defaut OFF). Si eligible : toute la
+        # forward passee du bloc MoE route (gemm1 -> silu -> quant -> gemm2 ->
+        # somme ponderee) dans UN kernel + un finalize, intermediaires en
+        # registres. Sinon repli = la chain livree ci-dessous, verbatim.
+        if self._maybe_moe_megakernel(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            a1q_scale,
+            expert_map,
+            apply_router_weight_on_input,
+            activation,
+        ):
+            return
 
         E, num_tokens, N, K, top_k_num = self.moe_problem_size(
             hidden_states, w1, w2, topk_ids
@@ -630,6 +652,173 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         # separate function is required for MoE + LoRA
         self.moe_sum(intermediate_cache3, output, topk_ids, expert_map)
+
+    def _maybe_moe_megakernel(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        a1q_scale: torch.Tensor | None,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        activation: MoEActivation,
+    ) -> bool:
+        """Qwen3MoEMegakernel (campagne MoE int8 2026-10-27).
+
+        Retourne True si la forward du bloc MoE a ete executee par le
+        megakernel ; False = repli sur la chain livree (verbatim).
+        """
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            fused_moe_megakernel,
+            moe_megakernel_eligible,
+            moe_megakernel_enabled,
+            moe_megakernel_flags,
+            moe_megakernel_record_call,
+        )
+
+        if not moe_megakernel_enabled():
+            return False
+        # Tour 2 (incréments 2+3) : les gates de prologue (ROUTING/NORM/AR)
+        # exigent des entrées que CE site d'appel n'a pas (residual, poids de
+        # norm, poids de router, handles IPC) — repli sur la chaîne livrée,
+        # compté et logué (fail loud).  Le raccordement au graphe réel est
+        # l'étape nommée restante (TOUR2-DESIGN §6 ; ETAPE-F §11 motif v2').
+        _routing, _norm, _ar = moe_megakernel_flags()
+        if _norm or _ar:
+            logger.warning_once(
+                "moe-megakernel: NORM/AR demandes mais non cables au site "
+                "d'appel (pas de res/norm_w/handles IPC) — repli sur la "
+                "chain livre"
+            )
+            moe_megakernel_record_call(
+                "repli:norm/ar-non-cables", hidden_states.size(0), None)
+            return False
+        if _routing:
+            logger.warning_once(
+                "moe-megakernel: routage in-kernel demande mais le site "
+                "d'appel n'a pas de poids de router — repli sur la chain "
+                "livre"
+            )
+            moe_megakernel_record_call(
+                "repli:routing-non-cable", hidden_states.size(0), None)
+            return False
+        reason = moe_megakernel_eligible(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            per_act_token_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            quantization_emulation=self.quantization_emulation,
+            activation_is_silu=activation == MoEActivation.SILU,
+            clamp_limit_is_none=self.activation_config.clamp_limit is None,
+            has_lora=self._lora_context is not None,
+            has_bias=self.w1_bias is not None or self.w2_bias is not None,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            a1q_scale=a1q_scale,
+        )
+        if reason is not None:
+            if reason == "table:chaine-livree":
+                # DISPATCH VOULU (table chain=standard) — pas un repli de
+                # panne : log dédié + compteur d'ATTRIBUTION de bras
+                # (revue mimo Q7, 2026-10-31 : « repli: » déformait
+                # l'attribution d'arm du wall et mettait une politique
+                # intentionnelle dans l'espace d'alerte des replis).
+                logger.warning_once(
+                    "moe-megakernel: dispatch table (table:chaine-livree) "
+                    "— chaine livree, M=%d", hidden_states.size(0))
+                moe_megakernel_record_call(
+                    "bras:standard@table", hidden_states.size(0), None)
+            else:
+                logger.warning_once(
+                    "moe-megakernel: repli sur la chain livree (%s)", reason
+                )
+                moe_megakernel_record_call(
+                    f"repli:{reason}", hidden_states.size(0), None)
+            return False
+        # echelles de poids per-channel exigees par le kernel (le contrat
+        # per-channel est celui du chemin int8 per-token livre).  Layout
+        # accepté : [E, N] OU [E, N, 1] (quark int8 MoE stocke le 2e) —
+        # `moe_megakernel_scales_ok` normalise puis vérifie (fail loud).
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            moe_megakernel_scales_ok,
+        )
+        if not moe_megakernel_scales_ok(w1, w2, self.w1_scale, self.w2_scale):
+            logger.warning_once(
+                "moe-megakernel: repli (echelles poids non per-channel)"
+            )
+            moe_megakernel_record_call(
+                "repli:echelles", hidden_states.size(0), None)
+            return False
+
+        M = hidden_states.size(0)
+        top_k_num = topk_ids.size(1)
+        naive = expert_map is None and M * top_k_num * 4 <= w1.size(0)
+        sorted_token_ids = expert_ids = None
+        if not naive:
+            from vllm.model_executor.layers.fused_moe.fused_moe import (
+                _prepare_expert_assignment,
+            )
+            from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+                moe_megakernel_align_block_m,
+            )
+            # TABLE indexée par M (2026-10-30) : le BLOCK_SIZE_M du tri doit
+            # être LE MÊME que le BM de la grille tree — sinon les blocs ne
+            # mappent pas les paires (le launcher l'asserte, fail loud).
+            # Non-tree : 16 (comportement r10 inchangé).
+            sorted_token_ids, expert_ids, _ = _prepare_expert_assignment(
+                topk_ids,
+                {"BLOCK_SIZE_M": moe_megakernel_align_block_m(
+                    M, naive, w1.size(0), w2.size(2), w1.size(2))},
+                M,
+                top_k_num,
+                w1.size(0),
+                expert_map,
+            )
+
+        # strategie `pair` : cache3 [M, topk, K] (le moe_sum aval consomme
+        # ce layout — contrat du chemin livre).  `atomic`/`tree` n'en ont
+        # pas besoin (sortie directe / workspace interne) — allouer cache3
+        # pour rien coûterait M·topk·K·2 B d'HBM par appel.
+        from vllm.model_executor.layers.fused_moe.moe_megakernel import (
+            moe_megakernel_strategy,
+        )
+        cache3 = None
+        if moe_megakernel_strategy() == "pair":
+            cache3 = torch.empty(
+                (M, top_k_num, w1.size(2)),
+                device=hidden_states.device,
+                dtype=output.dtype,
+            )
+
+        fused_moe_megakernel(
+            output,
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            a1q_scale,
+            self.w1_scale,
+            self.w2_scale,
+            naive=naive,
+            sorted_token_ids=sorted_token_ids,
+            expert_ids=expert_ids,
+            cache3=cache3,
+        )
+        if moe_megakernel_strategy() != "tree":
+            # tree : le compteur est émis par le LAUNCHER (il connaît déjà
+            # cfg.source — zéro appel supplémentaire sur le chemin chaud ;
+            # le double appel site+sélecteur coûtait ~1 % mesuré au pont
+            # r12, bridge 2026-10-30).  Les autres stratégies restent ici.
+            moe_megakernel_record_call(
+                f"bras:{moe_megakernel_strategy()}", M, naive)
+        return True
 
     def moe_sum(
         self,
