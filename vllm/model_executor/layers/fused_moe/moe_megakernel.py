@@ -317,6 +317,15 @@ def tree_pass2_config(M: int, naive: bool) -> tuple[int, int | None, int, int]:
 # Champ d'une entrée (TOUS consommés — canari
 # `test_tree_table_entry_fields_consumed`) :
 #   m_max     : borne haute du régime (None = au-delà) ; naive flag filtre
+#   chain     : OPTIONNEL (défaut "tree") — "tree" = lance les kernels tree
+#               avec la config ci-dessous ; "standard" = REPLI CHAÎNE LIVRÉE
+#               pour ce régime (dispatch mixte, campagne c128 2026-10-31 :
+#               le résidu tree/livré est structurel à M≥33 et tous les axes
+#               de config sont épuisés — PLAFONDS-TABLE + sweep BM).  Une
+#               entrée "standard" ne porte AUCUNE config : ses champs ne
+#               seraient pas consommés (champ mort = piège muet) — la
+#               validation les REFUSE.  Consommateur du champ chain :
+#               `moe_megakernel_eligible` (raison `table:chaine-livree`).
 #   BM        : tuile de rangées (align grouped + grilles pass1/pass2)
 #   BKO/CI    : tuiles pass1 (K/intermédiaire) — CI doit DIVISER I
 #   nw1/ns1   : pass1 num_warps/num_stages
@@ -343,10 +352,15 @@ class TreeTileConfig(NamedTuple):
     nw2: int
     ns2: int
     source: str
+    chain: str = "tree"   # "tree" | "standard" (dispatch mixte, cf. supra)
 
 
-_ENTRY_KEYS = ("m_max", "naive", "BM", "BKO", "CI", "nw1", "ns1",
+_ENTRY_KEYS = ("m_max", "naive", "chain", "BM", "BKO", "CI", "nw1", "ns1",
                "BN2", "LOCAL_TILES", "nw2", "ns2")
+_CHAIN_VALUES = ("tree", "standard")
+# champs de config : requis pour chain=tree, REFUSÉS pour chain=standard
+_CFG_KEYS = ("BM", "BKO", "CI", "nw1", "ns1",
+             "BN2", "LOCAL_TILES", "nw2", "ns2")
 
 
 def tree_default_config(M: int, naive: bool, source: str) -> TreeTileConfig:
@@ -464,24 +478,42 @@ def _tree_entry_error(ent: Any, I: int) -> str | None:
       table déployée passe les tests GPU par entrée)."""
     if not isinstance(ent, dict):
         return "entrée non-dict"
-    for k in _ENTRY_KEYS:
+    for k in ("m_max", "naive"):
         if k not in ent:
             return f"champ manquant: {k}"
+    chain = ent.get("chain", "tree")
+    if chain not in _CHAIN_VALUES:
+        return f"chain doit être {_CHAIN_VALUES} (got {chain!r})"
+    if chain == "standard":
+        # entrée de DISPATCH : aucune config (elle ne serait pas consommée —
+        # champ mort = piège muet) ; consommateur = moe_megakernel_eligible.
+        for k in _CFG_KEYS:
+            if k in ent:
+                return (f"entrée chain=standard: {k} non consommé par la "
+                        "chaîne livrée (champ mort — à retirer)")
+    else:
+        for k in _CFG_KEYS:
+            if k not in ent:
+                return f"champ manquant: {k}"
     for k in ("BM", "BKO", "CI", "nw1", "ns1", "BN2", "nw2", "ns2"):
+        if k not in ent:
+            continue    # entrée chain=standard (déjà validée ci-dessus)
         v = ent[k]
         if not isinstance(v, int) or isinstance(v, bool) or v < 1:
             return f"{k} doit être un entier >= 1 (got {v!r})"
     for k in ("BM", "BKO", "CI", "BN2"):
+        if k not in ent:
+            continue
         v = ent[k]
         if v & (v - 1):
             return f"{k}={v} doit être une puissance de 2 (tl.arange)"
-    if ent["CI"] > I or I % ent["CI"] != 0:
+    if "CI" in ent and (ent["CI"] > I or I % ent["CI"] != 0):
         return f"CI={ent['CI']} ne divise pas I={I} (corruption store pass1)"
-    lt = ent["LOCAL_TILES"]
+    lt = ent.get("LOCAL_TILES")
     if lt is not None:
         if not isinstance(lt, int) or isinstance(lt, bool) or lt < 1:
             return f"LOCAL_TILES doit être None ou entier >= 1 (got {lt!r})"
-    if ent["naive"] is True and lt != 1:
+    if ent["naive"] is True and "BM" in ent and lt != 1:
         return (f"entrée naive: LOCAL_TILES doit être 1 (grille 2-D r10) — "
                 f"le 1-D naive est mesuré +37 % à M=1 (got {lt!r})")
     if not isinstance(ent["naive"], bool):
@@ -490,6 +522,8 @@ def _tree_entry_error(ent: Any, I: int) -> str | None:
     if m_max is not None and (not isinstance(m_max, int)
                               or isinstance(m_max, bool) or m_max < 1):
         return f"m_max doit être None ou entier >= 1 (got {m_max!r})"
+    if chain == "standard":
+        return None
     budget_p2 = (ent["ns2"] - 1) * I * ent["BN2"]
     if budget_p2 > 65536:
         return (f"budget LDS pass2: (ns2-1)*I*BN2={budget_p2} > 65536 "
@@ -579,10 +613,20 @@ def tree_select_config(M: int, naive: bool, E: int, I: int, K: int
             continue
         if ent["m_max"] is not None and M > ent["m_max"]:
             continue
+        if ent.get("chain", "tree") == "standard":
+            # entrée de DISPATCH : pas de config (non consommée — le chemin
+            # tree est refusé par moe_megakernel_eligible AVANT tout
+            # lancement).  Champs INERTS = config r10 (valeurs de repli
+            # non significatives, portées par chain="standard" seul).
+            bn2, lt, nw2, ns2 = tree_pass2_config(M, naive)
+            return TreeTileConfig(
+                MK_BM, MK_TREE_BKO, MK_TREE_CI, 2, 1,
+                bn2, lt, nw2, ns2,
+                "table", "standard")
         return TreeTileConfig(
             ent["BM"], ent["BKO"], ent["CI"], ent["nw1"], ent["ns1"],
             ent["BN2"], ent["LOCAL_TILES"], ent["nw2"], ent["ns2"],
-            "table")
+            "table", ent.get("chain", "tree"))
     logger.warning_once(
         "moe-megakernel: tree table sans entrée pour M=%d naive=%s (%s) — "
         "config r10 (repli entree-absente)", M, naive, source)
@@ -1677,21 +1721,24 @@ def moe_megakernel_eligible(
         # code de raison STABLE (mimo W5) — M est déjà dans la clé du
         # compteur ; une raison interpolée fragmente le dictionnaire.
         return "M-above-threshold"
-    if moe_megakernel_strategy() == "tree" and I != MK_TREE_FALLBACK_I:
-        # TABLE indexée par M (2026-10-30) : la config de REPLI (r10) n'est
-        # validée que sur la forme de référence I=256 — à I=512 (prefill-EP)
-        # elle ne compile même PAS (LDS 128 Ko > 64 Ko, mesuré 2026-10-30).
-        # Règle de repli EXPLICITE (choix opérateur 10:23 : « un repli vers
-        # le chemin standard suffit pour le prefill ») : une forme hors table
-        # ET hors forme de référence tombe sur la chaîne livrée, comptée et
-        # loguée — jamais sur une config muette qui casserait au compile.
-        # (APRÈS M-above-threshold : cette raison historique garde son sens.)
+    if moe_megakernel_strategy() == "tree":
+        # TABLE indexée par M : la sélection est consommée ICI pour DEUX
+        # décisions de dispatch (toutes deux = repli chaîne livrée) :
+        #   1. chain="standard" — dispatch mixte (campagne c128 2026-10-31,
+        #      entrée de table = le mécanisme de politique par M) ;
+        #   2. forme non couverte ET hors forme de référence — règle
+        #      2026-10-30 (la config de repli r10 n'est validée que sur
+        #      I=256 ; à I=512 elle ne compile même PAS — LDS 128 Ko >
+        #      64 Ko, mesuré 2026-10-30).  Choix opérateur 10:23 : « un
+        #      repli vers le chemin standard suffit pour le prefill ».
         naive_cov = (expert_map is None
                      and hidden_states.size(0) * topk_ids.size(1) * 4
                      <= w1.size(0))
         sel = tree_select_config(hidden_states.size(0), naive_cov,
                                  w1.size(0), I, K)
-        if sel.source.startswith("repli:"):
+        if sel.chain == "standard":
+            return "table:chaine-livree"
+        if I != MK_TREE_FALLBACK_I and sel.source.startswith("repli:"):
             return "tree-forme-non-couverte"
     return None
 

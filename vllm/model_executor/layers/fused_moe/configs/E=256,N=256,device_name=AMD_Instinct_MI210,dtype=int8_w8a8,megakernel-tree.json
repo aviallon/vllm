@@ -1,62 +1,46 @@
 {
-  "triton_version": "3.8.0",
-  "comment": "megakernel tree — configs de lancement indexées par M, forme LOCALE des poids decode TP=2 (E=256, N=I=256, K=2048). Sweep + confirmations APPARIÉES 2026-10-30 (research/moe-megakernel-campaign-2026-10-27/evidence/table-sweep/). Pass1 = constantes r10 partout (BM=16, BKO=256, CI=64, nw1/ns1=2/1 — balayées, jamais meilleures ailleurs). Δ = confirm apparié vs config r10 du même M ; bruit de mesure ≈ ±1 % (points de contrôle cand==ref). Toutes les configs sont BIT-IDENTIQUES à r10 (scheduling pur, pas d'arithmétique) — test_tree_table_shipped_contract_and_bits.",
-  "2048": [
-    {
-      "m_max": 8,
-      "naive": true,
-      "BM": 16,
-      "BKO": 256,
-      "CI": 64,
-      "nw1": 2,
-      "ns1": 1,
-      "BN2": 128,
-      "LOCAL_TILES": 1,
-      "nw2": 8,
-      "ns2": 3,
-      "comment": "naive M<=8 (source: table-confirm-naive.log + table-confirm2-naive.log) : M=8 -4.9 %, M=7 -3.7, M=5 -2.2, M=6 -1.6, M=4 -0.2, M=1-3 neutre (0.0/-0.6/0.0) => non-regression c1 garantie en théorie, verrouillée au wall"
-    },
-    {
-      "m_max": 32,
-      "naive": false,
-      "BM": 16,
-      "BKO": 256,
-      "CI": 64,
-      "nw1": 2,
-      "ns1": 1,
-      "BN2": 128,
-      "LOCAL_TILES": null,
-      "nw2": 8,
-      "ns2": 1,
-      "comment": "grouped 9-32 (source: table-confirm-grouped.log + confirm2 + confirm3) : M=9 -16.7, 12 -12.4, 16 -11.1, 24 -3.8, 32 -4.0 (A gagne sur C à 24-32 : +0.6..0.9) ; croisement A<->C MESURÉ entre 32 (A -4.0 vs C -3.4) et 33 (C -2.2 vs A -1.7). ⚠ Regret NOMMÉ (revue deepseek M7) : à M=9 C (-18.65) devance A (-16.71, 1.9 % > bruit) — la borne basse devrait être ~10-12 ; disposition reportée (gain <=0.4 % wall)"
-    },
-    {
-      "m_max": 150,
-      "naive": false,
-      "BM": 16,
-      "BKO": 256,
-      "CI": 64,
-      "nw1": 2,
-      "ns1": 1,
-      "BN2": 256,
-      "LOCAL_TILES": 2,
-      "nw2": 8,
-      "ns2": 2,
-      "comment": "grouped 33-150 : M=33 -2.2, 34 -3.5, 35 -2.5, 36 -3.2, 39 -2.8, 40/48 -2.8, 64 -6.5, 72 -4.7, 76 -4.5, 80 -2.9, 88 -2.9, 96 -2.6, 104 -2.7, 112/120 -1.7, 128 -1.4, 136 -1.0, 144 -0.8 (regret vs optimum par M <= 1.1 % = bruit)"
-    },
-    {
-      "m_max": null,
-      "naive": false,
-      "BM": 16,
-      "BKO": 256,
-      "CI": 64,
-      "nw1": 2,
-      "ns1": 1,
-      "BN2": 128,
-      "LOCAL_TILES": null,
-      "nw2": 4,
-      "ns2": 3,
-      "comment": "grouped >=151 (= config r10). ⚠ Revue deepseek M6 : le commentaire précédent (« toute autre config y est +0.2..+7.4 ») était FAUX pour 151-256 — l'entrée 3 (C) y reste nominalement devant : M=160 -1.2, 192 -0.4, 224 -0.4, 256 -0.3 (5 paires unilatérales, mais <= bruit ±1 % sauf 160) ; le croisement réel C<->r10 est ≈256-320 (320 +1.1, 384 +3.9, 512 +5.5 — ICI toute autre config est bien pire). Borne 150 = choix conservateur ; disposition proposée : déplacer à 256 (gain <=0.5 % wall, sous MDE — à décider sur le site)"
-    }
-  ]
+    "triton_version": "3.8.0",
+    "comment": "megakernel tree — configs de lancement indexées par M, forme LOCALE des poids decode TP=2 (E=256, N=I=256, K=2048). Sweep + confirmations APPARIÉES 2026-10-30 (research/moe-megakernel-campaign-2026-10-27/evidence/table-sweep/). Pass1 = constantes r10 partout (BM=16, BKO=256, CI=64, nw1/ns1=2/1 — balayées, jamais meilleures ailleurs). Δ = confirm apparié vs config r10 du même M ; bruit de mesure ≈ ±1 % (points de contrôle cand==ref). Toutes les configs sont BIT-IDENTIQUES à r10 (scheduling pur, pas d'arithmétique) — test_tree_table_shipped_contract_and_bits.",
+    "2048": [
+        {
+            "m_max": 8,
+            "naive": true,
+            "BM": 16,
+            "BKO": 256,
+            "CI": 64,
+            "nw1": 2,
+            "ns1": 1,
+            "BN2": 128,
+            "LOCAL_TILES": 1,
+            "nw2": 8,
+            "ns2": 3,
+            "comment": "naive M<=8 (source: table-confirm-naive.log + table-confirm2-naive.log) : M=8 -4.9 %, M=7 -3.7, M=5 -2.2, M=6 -1.6, M=4 -0.2, M=1-3 neutre (0.0/-0.6/0.0) => non-regression c1 garantie en théorie, verrouillée au wall"
+        },
+        {
+            "m_max": 32,
+            "naive": false,
+            "BM": 16,
+            "BKO": 256,
+            "CI": 64,
+            "nw1": 2,
+            "ns1": 1,
+            "BN2": 128,
+            "LOCAL_TILES": null,
+            "nw2": 8,
+            "ns2": 1,
+            "comment": "grouped 9-32 (source: table-confirm-grouped.log + confirm2 + confirm3) : M=9 -16.7, 12 -12.4, 16 -11.1, 24 -3.8, 32 -4.0 (A gagne sur C à 24-32 : +0.6..0.9) ; croisement A<->C MESURÉ entre 32 (A -4.0 vs C -3.4) et 33 (C -2.2 vs A -1.7). ⚠ Regret NOMMÉ (revue deepseek M7) : à M=9 C (-18.65) devance A (-16.71, 1.9 % > bruit) — la borne basse devrait être ~10-12 ; disposition reportée (gain <=0.4 % wall)"
+        },
+        {
+            "m_max": 150,
+            "naive": false,
+            "chain": "standard",
+            "comment": "DISPATCH MIXTE (campagne residu c128, 2026-10-31) — repli chaine livree pour grouped M=33..150. Mesures : residu tree/livre STRUCTUREL a M>=33 (decomposition in-composite M=128 : +24.3 us/site = pass1 +13.4 / pass2 +8.1 / quant+reduce +2.2 - fill 4.9 ; wall r13 c128 +2.2 %) et TOUS les axes de config epuises (BM/CI/BKO/nw/ns/BN2/LOCAL_TILES/MID_BF16/reduce — sweep BM apparie 2026-10-31 : BM=32 +6..+12 % malgre -36..-84 Mo de trafic). Spilling RÉFUTÉ (scr=0 runtime partout). Meilleure config tree connue pour ce regime (conservée en archive, non consommée) : {BM: 16, BKO: 256, CI: 64, nw1: 2, ns1: 1, BN2: 256, LOCAL_TILES: 2, nw2: 8, ns2: 2} — 372.8 us vs 377.6 ref r10 (table-confirm)."
+        },
+        {
+            "m_max": null,
+            "naive": false,
+            "chain": "standard",
+            "comment": "DISPATCH MIXTE (2026-10-31) — repli chaine livree pour grouped M>=151. Le wall r13 mesurait +0.5 % (parite) avec la config tree r10 ici ; la chaine livree rend le point a 0 %. Meilleure config tree connue (archive, non consommée) : {BM: 16, BKO: 256, CI: 64, nw1: 2, ns1: 1, BN2: 128, LOCAL_TILES: null, nw2: 4, ns2: 3}."
+        }
+    ]
 }
